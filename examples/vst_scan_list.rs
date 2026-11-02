@@ -3,7 +3,7 @@
 //! ```powershell
 //! cargo run --example vst_scan_list
 //! # include a folder that is not in the standard locations:
-//! $env:SURF_VST_SCAN="C:\Users\Kevin\Music\Native Instruments\Kontakt 8\x64"
+//! $env:SURF_VST_SCAN="D:\Plugins\Kontakt 8\x64"
 //! cargo run --example vst_scan_list
 //! ```
 

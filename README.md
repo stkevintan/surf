@@ -244,7 +244,7 @@ cargo clean -p ring
    想扫别的目录（例如解压在别处的 Kontakt），用 `SURF_VST_SCAN` 追加，`;` 或 `,` 分隔：
 
    ```powershell
-   $env:SURF_VST_SCAN="C:\Users\Kevin\Music\Native Instruments\Kontakt 8\x64"
+   $env:SURF_VST_SCAN="D:\Plugins\Kontakt 8\x64"
    ```
 
 2. **`LOAD VST`**：选一个文件夹。里面只有 1 个插件就直接加载，有多个就弹出清单让你选。
@@ -436,6 +436,15 @@ vst = { path = "vendor/vst" }               # fork of 0.4.0
 
 ## License
 
-代码：MIT OR Apache-2.0。
+本项目代码：**MIT OR Apache-2.0**（见 [LICENSE-MIT](LICENSE-MIT) /
+[LICENSE-APACHE](LICENSE-APACHE)，二者任选其一）。
 
-Kontakt、Native Instruments、SeeMusic 等名称/商标归各自所有者；本项目不包含、不分发任何 Kontakt 或商业音色库。使用 Kontakt 需要你自行拥有有效授权。
+`vendor/` 下是两个第三方 crate 的 fork，各自保留原许可与版权声明：
+
+- `vendor/vst3-host` — fork of [`vst3-host`](https://github.com/HelgeSverre/rust-vst3-host)
+  0.10.0，MIT，© Helge Sverre（见 `vendor/vst3-host/LICENSE`）
+- `vendor/vst` — fork of [`vst-rs`](https://github.com/RustAudio/vst-rs) 0.4.0，MIT
+  （见 `vendor/vst/LICENSE`）
+
+Kontakt、Native Instruments、SeeMusic 等名称/商标归各自所有者；本项目不包含、不分发任何
+Kontakt 或商业音色库。使用 Kontakt 需要你自行拥有有效授权。
