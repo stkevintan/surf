@@ -1,0 +1,18 @@
+/target
+/.cache
+/.cargo-home
+/.surf
+*.pdb
+*.wav
+
+# Machine-local tool state, not project configuration.
+/.claude/settings.local.json
+/.vscode
+
+# Kontakt writes its database and lock file into the host's working directory.
+# The helper now runs from the plugin folder, but a stray run can still drop
+# these in the repo root.
+/komplete.db3
+/komplete.db3-shm
+/komplete.db3-wal
+/lock.lck

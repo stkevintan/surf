@@ -1,0 +1,9 @@
+# Cargo settings for this workspace.
+#
+# Large crates (`windows`, gpui's dependency tree) can exceed cargo's default
+# 30s-per-crate download timeout on a slow link, which surfaces as
+# "spurious network error ... Timeout was reached". More retries is the fix;
+# an earlier revision of this repo misdiagnosed it as a broken Schannel
+# certificate chain and shipped a local HTTP mirror to work around it.
+[net]
+retry = 10

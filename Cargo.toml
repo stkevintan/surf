@@ -1,0 +1,57 @@
+[package]
+name = "surf"
+version = "0.1.0"
+edition = "2024"
+default-run = "surf"
+description = "A GPUI piano visualizer with live MIDI, MIDI playback and VST3 instruments"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+gpui = { version = "0.2.2", default-features = false, features = ["windows-manifest"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+vst = "0.4"
+cpal = "0.18"
+crossbeam-channel = "0.5"
+hound = "3.5"
+midly = "0.5"
+parking_lot = "0.12"
+rfd = "0.17"
+vst3-host = { version = "0.10", default-features = false }
+
+# Local patches, 63 lines over upstream 0.10.0 (see README "vendor 补丁"):
+#  - open_editor treats a pre-attach getSize() failure as fatal; Kontakt's QML
+#    editor fails it legitimately, so it is non-fatal with an 800x600 default.
+#  - PluginWindow::open pre-queries the editor size, which burns a throw-away
+#    IPlugView; Kontakt tolerates only one, so the real view then fails.
+#  - module_info.rs fails the whole load when IPluginCompatibility metadata is
+#    unusable; Kontakt 8 returns kResultFalse there. The data is optional.
+# All three are upstreamable; the last overlaps upstream PR #16.
+[patch.crates-io]
+vst3-host = { path = "vendor/vst3-host" }
+vst = { path = "vendor/vst" }
+
+[[bin]]
+name = "surf-vst-host"
+path = "src/bin/vst_helper.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    # MultiByteToWideChar, to decode the helper log's ANSI/GBK plugin output.
+    "Win32_Globalization",
+    "Win32_Media",
+    "Win32_Media_Audio",
+    "Win32_Media_Multimedia",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    # AvSetMmThreadCharacteristics: register the helper's render thread with MMCSS
+    # so Windows schedules it like audio instead of parking it for milliseconds.
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
