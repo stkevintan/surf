@@ -261,14 +261,37 @@ fn main() -> Result<()> {
         .context("could not spawn helper control thread")?;
 
     let mut editor: Option<EditorWindow> = None;
+    // Debug hook for the `editor_reopen` probe: simulate the user closing the
+    // editor with its title-bar button this many milliseconds after it opens.
+    #[cfg(target_os = "macos")]
+    let test_close_after = std::env::var("SURF_TEST_CLOSE_EDITOR_AFTER_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis);
+    #[cfg(target_os = "macos")]
+    let mut editor_opened_at: Option<std::time::Instant> = None;
     let mut running = true;
     while running {
         pump_messages();
+        #[cfg(target_os = "macos")]
+        if let (Some(after), Some(at)) = (test_close_after, editor_opened_at)
+            && at.elapsed() >= after
+        {
+            editor_opened_at = None;
+            appkit::perform_close_all();
+        }
         match &mut editor {
             Some(EditorWindow::Vst2(window)) => window.idle(),
-            // Applies plugin-initiated resizes (Kontakt sizes itself after attach).
             Some(EditorWindow::Vst3(window)) => {
-                if let Err(err) = window.service_platform_events() {
+                // The title-bar close button hides the window but tells neither the
+                // plugin nor us. Drop it so the plugin's view is detached; otherwise
+                // the next OpenEditor fails with "Editor already open".
+                if window.closed_by_user() {
+                    editor = None;
+                    eprintln!("helper: editor closed by the user");
+                    send_event(&mut out, &HelperEvent::EditorClosed)?;
+                } else if let Err(err) = window.service_platform_events() {
+                    // Applies plugin-initiated resizes (Kontakt sizes itself after attach).
                     eprintln!("helper: editor event servicing failed: {err}");
                 }
             }
@@ -276,11 +299,20 @@ fn main() -> Result<()> {
         }
         while let Ok(request) = rx.try_recv() {
             match request {
-                HelperRequest::OpenEditor => match backend.open_editor() {
+                HelperRequest::OpenEditor => match {
+                    // A plugin allows one editor view at a time: release the
+                    // previous one before asking for another.
+                    editor = None;
+                    backend.open_editor()
+                } {
                     Ok(window) => {
                         #[cfg(target_os = "macos")]
                         appkit::activate();
                         editor = Some(window);
+                        #[cfg(target_os = "macos")]
+                        {
+                            editor_opened_at = Some(std::time::Instant::now());
+                        }
                         send_event(&mut out, &HelperEvent::EditorOpened)?;
                     }
                     Err(err) => send_error(&mut out, format!("{err:#}"))?,
@@ -461,6 +493,20 @@ mod appkit {
         if let Some(mtm) = MainThreadMarker::new() {
             #[allow(deprecated)] // `activate` needs macOS 14; this works on all versions.
             NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+        }
+    }
+
+    /// Test hook: press the close button of every visible window, exactly as a
+    /// user clicking the title bar would (`performClose:`). Used by the
+    /// `editor_reopen` probe through `SURF_TEST_CLOSE_EDITOR_AFTER_MS`.
+    pub fn perform_close_all() {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        for window in NSApplication::sharedApplication(mtm).windows().iter() {
+            if window.isVisible() {
+                window.performClose(None);
+            }
         }
     }
 

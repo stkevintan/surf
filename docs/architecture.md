@@ -486,6 +486,7 @@ Each of these comes from a reproduced failure; details are in [troubleshooting.m
 | `SURF_HELPER_LOG` | host log path (default `data_dir()/surf-vst-host.log`) |
 | `SURF_AUDIO_CUSHION` | host ring target depth in frames (128–16384, default 512) |
 | `SURF_STATE_DIR` | override `data_dir()` |
+| `SURF_TEST_CLOSE_EDITOR_AFTER_MS` | test only (macOS): the host presses its editor's close button this long after opening; used by `editor_reopen` |
 
 *Target:* persist user settings (last plugin, audio device, window size) in `data_dir()/settings.json`; keep the environment variables as debug overrides.
 
