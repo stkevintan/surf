@@ -14,13 +14,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use surf_audio::Instrument;
-#[cfg(windows)]
-use surf_audio::render::render_with_instrument;
-use surf_audio::render::RenderOptions;
+use surf_audio::render::{RenderOptions, render_with_instrument};
 use surf_core::song::{TimedNote, Timeline};
 use surf_plugin::backends::vst3::{VstPlugin, render_vst_to_wav};
-#[cfg(windows)]
 use surf_plugin::backends::vst2::{Vst2EditorWindow, Vst2Plugin};
+use surf_plugin::format::{self, Format};
 use surf_plugin::protocol::{HelperEvent, HelperRequest, RenderNote};
 use surf_plugin::shm::{MidiKind, SharedMap};
 use vst3_host::window::PluginWindow;
@@ -68,7 +66,6 @@ fn init_com() -> bool {
 
 enum Backend {
     Vst3(VstPlugin),
-    #[cfg(windows)]
     Vst2(Vst2Plugin),
 }
 
@@ -96,7 +93,6 @@ fn install_panic_log() {
 #[allow(dead_code)]
 enum EditorWindow {
     Vst3(PluginWindow),
-    #[cfg(windows)]
     Vst2(Vst2EditorWindow),
 }
 
@@ -122,7 +118,6 @@ impl Backend {
     fn name(&self) -> &str {
         match self {
             Self::Vst3(v) => &v.name,
-            #[cfg(windows)]
             Self::Vst2(v) => &v.name,
         }
     }
@@ -130,7 +125,6 @@ impl Backend {
     fn instrument(&self) -> Box<dyn Instrument> {
         match self {
             Self::Vst3(v) => Box::new(v.instrument()),
-            #[cfg(windows)]
             Self::Vst2(v) => Box::new(v.instrument()),
         }
     }
@@ -138,7 +132,6 @@ impl Backend {
     fn open_editor(&self) -> Result<EditorWindow> {
         match self {
             Self::Vst3(v) => Ok(EditorWindow::Vst3(v.open_editor()?)),
-            #[cfg(windows)]
             Self::Vst2(v) => Ok(EditorWindow::Vst2(v.open_editor()?)),
         }
     }
@@ -146,7 +139,6 @@ impl Backend {
     fn state(&self) -> Result<Vec<u8>> {
         match self {
             Self::Vst3(v) => v.state(),
-            #[cfg(windows)]
             Self::Vst2(v) => v.state(),
         }
     }
@@ -154,7 +146,6 @@ impl Backend {
     fn load_state(&self, bytes: &[u8]) -> Result<()> {
         match self {
             Self::Vst3(v) => v.load_state(bytes),
-            #[cfg(windows)]
             Self::Vst2(v) => v.load_state(bytes),
         }
     }
@@ -206,33 +197,16 @@ fn main() -> Result<()> {
     }
 
     eprintln!("helper: loading plugin {}", args.plugin.display());
-    let is_vst2 = args
-        .plugin
-        .extension()
-        .and_then(|s| s.to_str())
-        .is_some_and(|s| s.eq_ignore_ascii_case("dll"));
-    #[cfg(not(windows))]
-    if is_vst2 {
-        anyhow::bail!("VST2 plugins are only supported on Windows");
-    }
-    #[cfg(windows)]
-    let vst2 = if is_vst2 {
-        Some(Backend::Vst2(
+    let backend = match format::detect(&args.plugin) {
+        Some(Format::Vst2) => Backend::Vst2(
             Vst2Plugin::load_with_state(&args.plugin, args.sample_rate, state.as_deref())
                 .context("helper failed to load VST2 plugin")?,
-        ))
-    } else {
-        None
-    };
-    #[cfg(not(windows))]
-    let vst2: Option<Backend> = None;
-    let backend = if let Some(backend) = vst2 {
-        backend
-    } else {
-        Backend::Vst3(
+        ),
+        // VST3 is the default: a `.vst3` path, or anything vst3-host can open.
+        _ => Backend::Vst3(
             VstPlugin::load_with_state(&args.plugin, args.sample_rate, state.as_deref())
                 .context("helper failed to load VST3 plugin")?,
-        )
+        ),
     };
     eprintln!("helper: plugin loaded: {}", backend.name());
     let name = backend.name().to_string();
@@ -288,7 +262,6 @@ fn main() -> Result<()> {
     let mut running = true;
     while running {
         pump_messages();
-        #[cfg(windows)]
         if let Some(EditorWindow::Vst2(window)) = &mut editor {
             window.idle();
         }
@@ -343,7 +316,6 @@ fn main() -> Result<()> {
                             sample_rate,
                             tail_secs,
                         ),
-                        #[cfg(windows)]
                         Backend::Vst2(_) => render_vst2_to_wav(
                             &args.plugin,
                             state.as_deref(),
@@ -567,7 +539,6 @@ fn render_to_wav(
     Ok((stats.path, stats.duration, stats.peak))
 }
 
-#[cfg(windows)]
 fn render_vst2_to_wav(
     plugin: &std::path::Path,
     state: Option<&[u8]>,

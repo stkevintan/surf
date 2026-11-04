@@ -115,7 +115,8 @@ Platform differences are pushed down to a few narrow traits; everything above th
 | MIDI in | WinMM | CoreMIDI (`coremidi` 0.8) | ALSA sequencer (`alsa` 0.11) |
 | Shared memory | `CreateFileMapping` | `shm_open` + `mmap` | `shm_open` + `mmap` |
 | RT priority (host audio) | MMCSS "Pro Audio" + `timeBeginPeriod(1)` | `thread_policy_set` (time-constraint) | `SCHED_FIFO` via rtkit (optional) |
-| Plugin formats | VST3, VST2, CLAP | VST3 (bundles), CLAP | VST3, CLAP |
+| Plugin formats | VST3, VST2 (`.dll`) | VST3, VST2 (`.vst` bundle); editors not yet | VST3, VST2 (`.so`); editors not yet |
+| Format rules | `surf-plugin::format` maps a path to a format and, for a macOS bundle, to its Mach-O binary (via `Info.plist`) | | |
 | Editor parent window | HWND | NSView | X11 window |
 | Data dir | `%APPDATA%\Surf` | `~/Library/Application Support/Surf` | `$XDG_DATA_HOME/surf` |
 | Scan roots | `Common Files\VST3`, `VSTPlugins` | `/Library/Audio/Plug-Ins/VST3`, `~/Library/…` | `~/.vst3`, `/usr/lib/vst3` |
@@ -271,7 +272,8 @@ pub trait Instrument: Send {          // src/audio/mod.rs
 
 | Part | Current file | Role |
 |---|---|---|
-| `scan` | `vst_scan.rs` | Walk standard roots (+ `SURF_VST_SCAN`) for `.vst3` (recursive, depth ≤ 6) and `.dll` (top level of VST2 roots). Never loads anything. Max 400 results, sorted, deduplicated. |
+| `scan` | `vst_scan.rs` | Walk the standard roots (+ `SURF_VST_SCAN`) recursively, up to depth 6, for `.vst3` and this OS's VST2 type (from VST2 roots only). Never loads anything. Max 400 results, sorted, deduplicated. |
+| `format` | — | Format detection by extension, VST2 bundle → binary resolution, and `Format::has_editor`. |
 | `shm` | `ipc.rs` | Shared region layout and SPSC rings (L3 §3.3). |
 | `protocol` | `vst_client.rs` (`HelperRequest`/`HelperEvent`) | serde-tagged JSON enums (L3 §3.4). |
 | `client` | `vst_client.rs` (`VstClient`) | Spawn the host, handshake, request/response with timeouts, health check, log capture. |
@@ -296,7 +298,7 @@ Startup order matters, because each step fixes a real Kontakt failure:
 2. Initialize COM (STA) on Windows. The guard outlives the plugin.
 3. Open the shared map **before** loading the plugin.
 4. `chdir` + `SetDllDirectoryW` to the plugin's parent folder (opt out with `SURF_NO_CHDIR`).
-5. Pick the backend by extension: `.dll` is VST2, everything else is VST3. Load it with the optional state blob.
+5. Pick the backend with `format::detect`: this OS's VST2 type goes to the VST2 backend, everything else to VST3. Load it with the optional state blob.
 6. Set `helper_alive`, spawn the audio thread, send `Ready`.
 7. Spawn the control thread (reads stdin lines into an `mpsc` channel). When stdin closes, it sends `Shutdown`.
 8. Main loop, every 2 ms: pump OS messages (the editor window needs it), idle the VST2 editor, handle requests, exit if `main_alive` is false.
@@ -465,7 +467,7 @@ Each of these comes from a reproduced failure; details are in [troubleshooting.m
 ### 3.11 Plugin discovery
 
 - VST3 roots are scanned recursively up to depth 6. A `.vst3` file or bundle directory is one entry, named by its file stem. Stub files are skipped.
-- VST2 roots are scanned for `.dll` at the top level only, and those entries are flagged `vst2`.
+- VST2 roots are scanned recursively for this OS's VST2 type (`.dll`, `.vst` bundle, `.so`), and those entries are flagged `vst2`. On macOS the loader opens `Contents/MacOS/<CFBundleExecutable>` inside the bundle.
 - Extensions are matched case-insensitively. Results are capped at 400, sorted, and deduplicated.
 - `scan_folder(dir)` backs `LOAD VST`: if the folder holds one plugin it loads it directly; if it holds several, it opens the picker.
 

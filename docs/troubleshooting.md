@@ -104,6 +104,8 @@ Each probe in `examples/` isolates one step of the plugin pipeline:
 | `vst_render <plugin.vst3> <out.wav>` | offline render in-process |
 | `helper_audio <plugin>` | full plugin host + shared-memory real-time path |
 | `helper_render <plugin> <out.wav>` | offline render inside the plugin host |
+| `vst2_session <plugin>` | load through the plugin host, play a note, save and restore state, request the editor |
+| `vst_state_render <plugin> <state> <out.wav>` | load with a saved state file and render, to check the state changes the sound |
 | `raw_load_probe <plugin>` | only `LoadLibrary` → `InitDll` → `GetPluginFactory` |
 | `crash_probe <plugin>` | prints the faulting module via a vectored exception handler |
 | `fdpair_probe` | whether the process can create the socket pair libzmq needs |

@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "apps/surf-plugin-host"]
+# Patched forks are path dependencies, not members; excluding them lets each be
+# built or tested on its own (e.g. vendor/vst examples).
+exclude = ["vendor/vst", "vendor/vst3-host"]
 default-members = [".", "apps/surf-plugin-host"]
 
 [workspace.package]

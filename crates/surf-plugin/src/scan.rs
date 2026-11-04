@@ -2,15 +2,18 @@
 //!
 //! This only walks the filesystem — no plugin is loaded, so a scan is cheap
 //! enough to run synchronously on the UI thread. Loading (and the crash risk
-//! that comes with it) still happens in `surf-vst-host.exe`.
+//! that comes with it) still happens in `surf-vst-host`.
 //!
-//! Standard VST3 folders are scanned recursively; the classic VST2 folders are
-//! scanned for `.dll` at the top level only. Extra folders can be added with
+//! Standard VST3 and VST2 folders are scanned recursively. VST2 plugins (see
+//! [`crate::format`] for what that means on each OS) are only collected from
+//! the VST2 folders. Extra folders can be added with
 //! `SURF_VST_SCAN` (`;`- or `,`-separated), which is how you reach a plugin
 //! installed somewhere unusual (e.g. a portable Kontakt unpacked in your
 //! Music folder).
 
 use std::path::{Path, PathBuf};
+
+use crate::format::{self, Format};
 
 /// Extra scan roots, separated by `;` or `,`.
 pub const EXTRA_ROOTS_ENV: &str = "SURF_VST_SCAN";
@@ -23,7 +26,7 @@ pub struct PluginEntry {
     pub path: PathBuf,
     /// Display name, i.e. the file stem: `Kontakt 8`, `OmnivocalBeta`.
     pub name: String,
-    /// `true` for a VST2 `.dll`, `false` for VST3.
+    /// `true` for a VST2 plugin, `false` for VST3.
     pub vst2: bool,
 }
 
@@ -44,9 +47,9 @@ impl PluginEntry {
 /// Sorted by display name, de-duplicated by path, capped at [`MAX_RESULTS`].
 pub fn scan_plugin_paths() -> Vec<PluginEntry> {
     let mut found = Vec::new();
-    for Root { path, accept_dll } in scan_roots() {
+    for Root { path, accept_vst2 } in scan_roots() {
         if path.is_dir() {
-            walk(&path, 0, accept_dll, &mut found);
+            walk(&path, 0, accept_vst2, &mut found);
         }
     }
     finish(found)
@@ -80,8 +83,9 @@ fn finish(mut found: Vec<PluginEntry>) -> Vec<PluginEntry> {
 
 struct Root {
     path: PathBuf,
-    /// VST2 `.dll` files are only collected from dedicated VST2 folders.
-    accept_dll: bool,
+    /// VST2 plugins are only collected from dedicated VST2 folders. On Windows a
+    /// stray `.dll` in a VST3 folder is a support library, not a plugin.
+    accept_vst2: bool,
 }
 
 fn scan_roots() -> Vec<Root> {
@@ -96,15 +100,15 @@ fn scan_roots() -> Vec<Root> {
             let base = PathBuf::from(base);
             roots.push(Root {
                 path: base.join("Common Files").join("VST3"),
-                accept_dll: false,
+                accept_vst2: false,
             });
             roots.push(Root {
                 path: base.join("VSTPlugins"),
-                accept_dll: true,
+                accept_vst2: true,
             });
             roots.push(Root {
                 path: base.join("Steinberg").join("VSTPlugins"),
-                accept_dll: true,
+                accept_vst2: true,
             });
         }
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
@@ -113,38 +117,41 @@ fn scan_roots() -> Vec<Root> {
                     .join("Programs")
                     .join("Common")
                     .join("VST3"),
-                accept_dll: false,
+                accept_vst2: false,
             });
         }
     }
 
     #[cfg(target_os = "macos")]
     {
-        roots.push(Root {
-            path: PathBuf::from("/Library/Audio/Plug-Ins/VST3"),
-            accept_dll: false,
-        });
-        if let Ok(home) = std::env::var("HOME") {
+        let home = std::env::var("HOME").ok().map(PathBuf::from);
+        for (dir, accept_vst2) in [("VST3", false), ("VST", true)] {
             roots.push(Root {
-                path: PathBuf::from(home).join("Library/Audio/Plug-Ins/VST3"),
-                accept_dll: false,
+                path: PathBuf::from("/Library/Audio/Plug-Ins").join(dir),
+                accept_vst2,
             });
+            if let Some(home) = &home {
+                roots.push(Root {
+                    path: home.join("Library/Audio/Plug-Ins").join(dir),
+                    accept_vst2,
+                });
+            }
         }
     }
 
     #[cfg(target_os = "linux")]
     {
+        let mut push = |path: PathBuf, accept_vst2| roots.push(Root { path, accept_vst2 });
         for path in ["/usr/lib/vst3", "/usr/local/lib/vst3"] {
-            roots.push(Root {
-                path: PathBuf::from(path),
-                accept_dll: false,
-            });
+            push(PathBuf::from(path), false);
+        }
+        for path in ["/usr/lib/vst", "/usr/local/lib/vst"] {
+            push(PathBuf::from(path), true);
         }
         if let Ok(home) = std::env::var("HOME") {
-            roots.push(Root {
-                path: PathBuf::from(home).join(".vst3"),
-                accept_dll: false,
-            });
+            let home = PathBuf::from(home);
+            push(home.join(".vst3"), false);
+            push(home.join(".vst"), true);
         }
     }
 
@@ -156,8 +163,8 @@ fn scan_roots() -> Vec<Root> {
             }
             let path = PathBuf::from(part);
             roots.push(Root {
-                // A user-supplied folder may hold VST2 `.dll` as well as VST3.
-                accept_dll: true,
+                // A user-supplied folder may hold VST2 plugins as well as VST3.
+                accept_vst2: true,
                 path,
             });
         }
@@ -166,7 +173,7 @@ fn scan_roots() -> Vec<Root> {
     roots
 }
 
-fn walk(dir: &Path, depth: usize, accept_dll: bool, out: &mut Vec<PluginEntry>) {
+fn walk(dir: &Path, depth: usize, accept_vst2: bool, out: &mut Vec<PluginEntry>) {
     if depth > MAX_DEPTH || out.len() >= MAX_RESULTS {
         return;
     }
@@ -187,15 +194,17 @@ fn walk(dir: &Path, depth: usize, accept_dll: bool, out: &mut Vec<PluginEntry>) 
 
         let path = entry.path();
         let is_dir = meta.is_dir();
-        match extension(&path).as_deref() {
+        match format::detect(&path) {
             // A `.vst3` is either a bundle directory or a single-file module;
             // both are plugins, and neither needs recursing into.
-            Some("vst3") => {
+            Some(Format::Vst3) => {
                 if let Some(plugin) = PluginEntry::new(path, false) {
                     out.push(plugin);
                 }
             }
-            Some("dll") if accept_dll && !is_dir => {
+            // A VST2 plugin is a file on Windows and Linux and a bundle
+            // directory on macOS, so accept either shape.
+            Some(Format::Vst2) if accept_vst2 => {
                 if let Some(plugin) = PluginEntry::new(path, true) {
                     out.push(plugin);
                 }
@@ -211,17 +220,13 @@ fn walk(dir: &Path, depth: usize, accept_dll: bool, out: &mut Vec<PluginEntry>) 
     // Breadth-first would be nicer for very deep trees, but plugin folders are
     // shallow; depth-first keeps the code simple.
     for subdir in subdirs {
-        walk(&subdir, depth + 1, accept_dll, out);
+        walk(&subdir, depth + 1, accept_vst2, out);
         if out.len() >= MAX_RESULTS {
             return;
         }
     }
 }
 
-fn extension(path: &Path) -> Option<String> {
-    path.extension()
-        .map(|ext| ext.to_string_lossy().to_lowercase())
-}
 
 #[cfg(test)]
 mod tests {
@@ -249,7 +254,8 @@ mod tests {
 
     #[test]
     fn vst2_entries_are_flagged() {
-        let entry = PluginEntry::new(plugin("VST", "TruePianos.dll"), true).unwrap();
+        let file = format!("TruePianos.{}", format::VST2_EXTENSION);
+        let entry = PluginEntry::new(plugin("VST", &file), true).unwrap();
         assert!(entry.vst2);
         assert_eq!(entry.name, "TruePianos");
     }
@@ -263,12 +269,15 @@ mod tests {
     }
 
     #[test]
-    fn extensions_are_matched_case_insensitively() {
-        assert_eq!(
-            extension(&plugin("VST3", "Foo.VST3")).as_deref(),
-            Some("vst3")
-        );
-        assert_eq!(extension(&plugin("VST", "Bar.DLL")).as_deref(), Some("dll"));
-        assert_eq!(extension(&plugin("VST3", "VST3")), None);
+    fn walk_finds_both_formats_in_a_folder() {
+        let root = std::env::temp_dir().join(format!("surf-scan-{}", std::process::id()));
+        let vst2 = root.join(format!("Old Synth.{}", format::VST2_EXTENSION));
+        std::fs::create_dir_all(root.join("Vendor").join("New Synth.vst3")).unwrap();
+        std::fs::write(&vst2, b"").unwrap();
+        std::fs::write(root.join("notes.txt"), b"").unwrap();
+        let found = scan_folder(&root);
+        let names: Vec<_> = found.iter().map(|p| (p.name.as_str(), p.vst2)).collect();
+        assert_eq!(names, vec![("New Synth", false), ("Old Synth", true)]);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

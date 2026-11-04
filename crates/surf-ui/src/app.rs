@@ -411,8 +411,9 @@ impl SurfApp {
     }
 
     fn load_vst_dialog(&mut self) {
+        let vst2 = surf_plugin::format::VST2_EXTENSION;
         let Some(folder) = FileDialog::new()
-            .set_title("Pick a folder containing a .vst3 bundle or a VST2 .dll")
+            .set_title(format!("Pick a folder containing a .vst3 or .{vst2} plugin"))
             .pick_folder()
         else {
             return;
@@ -421,7 +422,7 @@ impl SurfApp {
         match found.len() {
             0 => {
                 self.status = format!(
-                    "No .vst3 or .dll plugin in {} — press SCAN to search the standard folders",
+                    "No .vst3 or .{vst2} plugin in {} — press SCAN to search the standard folders",
                     folder.display()
                 );
             }
@@ -503,7 +504,11 @@ impl SurfApp {
                 };
                 self.vst = Some(vst);
                 drop(old);
-                if std::env::var_os("SURF_NO_EDITOR").is_none() {
+                let has_editor = surf_plugin::format::detect(&path)
+                    .is_none_or(surf_plugin::format::Format::has_editor);
+                if !has_editor {
+                    self.status.push_str(" · no editor on this platform yet");
+                } else if std::env::var_os("SURF_NO_EDITOR").is_none() {
                     self.open_vst_editor();
                 }
             }
@@ -1475,7 +1480,7 @@ impl SurfApp {
 
     /// Modal list of the plugins found by `SCAN` or by the folder picker.
     ///
-    /// Clicking a row loads it through `surf-vst-host.exe`, exactly like
+    /// Clicking a row loads it through `surf-vst-host`, exactly like
     /// `LOAD VST` does; `Esc` or `CLOSE` dismisses the list.
     fn plugin_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut rows: Vec<AnyElement> = Vec::new();
