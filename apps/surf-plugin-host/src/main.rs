@@ -5,7 +5,9 @@
 //! survives.  Audio/MIDI travel through shared memory; control/state/render
 //! travel over stdin/stdout JSON lines.
 
-use std::io::{BufRead, BufWriter, Write};
+mod protocol_out;
+
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
@@ -165,6 +167,9 @@ fn main() -> Result<()> {
     let _com = ComGuard(init_com());
     #[cfg(target_os = "macos")]
     appkit::init();
+    // Before any plugin is loaded: plugins print to stdout, which must not
+    // mix with protocol messages (see protocol_out).
+    let mut out = protocol_out::take();
     let args = parse_args()?;
     eprintln!("helper: opening shared memory {}", args.shm);
     let map = Arc::new(SharedMap::open(&args.shm)?);
@@ -224,7 +229,6 @@ fn main() -> Result<()> {
         .spawn(move || audio_loop(instrument, audio_map, audio_stop))
         .context("could not spawn helper audio thread")?;
 
-    let mut out = BufWriter::new(std::io::stdout());
     send_event(
         &mut out,
         &HelperEvent::Ready {
@@ -299,24 +303,24 @@ fn main() -> Result<()> {
         }
         while let Ok(request) = rx.try_recv() {
             match request {
-                HelperRequest::OpenEditor => match {
+                HelperRequest::OpenEditor => {
                     // A plugin allows one editor view at a time: release the
                     // previous one before asking for another.
                     editor = None;
-                    backend.open_editor()
-                } {
-                    Ok(window) => {
-                        #[cfg(target_os = "macos")]
-                        appkit::activate();
-                        editor = Some(window);
-                        #[cfg(target_os = "macos")]
-                        {
-                            editor_opened_at = Some(std::time::Instant::now());
+                    match backend.open_editor() {
+                        Ok(window) => {
+                            #[cfg(target_os = "macos")]
+                            appkit::activate();
+                            editor = Some(window);
+                            #[cfg(target_os = "macos")]
+                            {
+                                editor_opened_at = Some(std::time::Instant::now());
+                            }
+                            send_event(&mut out, &HelperEvent::EditorOpened)?;
                         }
-                        send_event(&mut out, &HelperEvent::EditorOpened)?;
+                        Err(err) => send_error(&mut out, format!("{err:#}"))?,
                     }
-                    Err(err) => send_error(&mut out, format!("{err:#}"))?,
-                },
+                }
                 HelperRequest::CloseEditor => {
                     editor = None;
                     send_event(&mut out, &HelperEvent::EditorClosed)?;
@@ -439,14 +443,12 @@ fn parse_args() -> Result<Args> {
     })
 }
 
-fn send_event(out: &mut BufWriter<std::io::Stdout>, event: &HelperEvent) -> Result<()> {
-    serde_json::to_writer(&mut *out, event)?;
-    out.write_all(b"\n")?;
-    out.flush()?;
+fn send_event(out: &mut protocol_out::Out, event: &HelperEvent) -> Result<()> {
+    protocol_out::send(out, &serde_json::to_vec(event)?)?;
     Ok(())
 }
 
-fn send_error(out: &mut BufWriter<std::io::Stdout>, message: String) -> Result<()> {
+fn send_error(out: &mut protocol_out::Out, message: String) -> Result<()> {
     eprintln!("helper error: {message}");
     send_event(out, &HelperEvent::Error { message })
 }

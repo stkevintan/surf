@@ -63,6 +63,15 @@ fn open_seq() -> Result<Seq> {
     Ok(seq)
 }
 
+/// Port changes are announced on the sequencer's `System:Announce` port;
+/// subscribing to it is a follow-up. Until then `MidiHub::poll` re-enumerates
+/// on its fallback timer.
+pub(crate) struct Watcher;
+
+pub(crate) fn watch(_dirty: Arc<AtomicBool>) -> Option<Watcher> {
+    None
+}
+
 pub(crate) fn list_ports() -> Result<Vec<String>> {
     let seq = open_seq()?;
     Ok(sources(&seq).into_iter().map(|(_, name)| name).collect())

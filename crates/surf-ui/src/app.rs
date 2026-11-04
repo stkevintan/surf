@@ -12,10 +12,10 @@ use gpui::{
 use rfd::FileDialog;
 
 use surf_audio::render::{RenderOptions, render_timeline_to_wav};
-use surf_audio::{AudioEngine, Command, Synth};
+use surf_audio::{AudioEngine, Command, OutputEvent, Synth};
 use surf_core::recorder::Recorder;
 use surf_core::song::{Song, TimedNote, Timeline, key_name};
-use surf_midi::{LiveEvent, MidiHub, NoteSink};
+use surf_midi::{LiveEvent, MidiHub, NoteSink, PortChange};
 use surf_plugin::client::{RenderNote, VstClient, helper_log_path};
 use surf_plugin::scan::{self as vst_scan, PluginEntry};
 
@@ -611,6 +611,26 @@ impl SurfApp {
         self.status = "VST helper crashed; switched to built-in piano".to_string();
     }
 
+    /// React to MIDI keyboards and audio outputs that come and go while the
+    /// app runs.
+    fn poll_devices(&mut self) {
+        match self.midi.poll() {
+            Some(PortChange::Connected(name)) => self.status = format!("MIDI: connected {name}"),
+            Some(PortChange::Disconnected(name)) => {
+                self.status = format!("MIDI: {name} was unplugged")
+            }
+            None => {}
+        }
+        for event in self.audio.drain_output_events() {
+            self.status = match event {
+                OutputEvent::Rerouted { device } => format!("Audio output switched to {device}"),
+                OutputEvent::Lost => "Audio output device lost — sound is paused".to_string(),
+                OutputEvent::Error(message) => format!("Audio output: {message}"),
+                OutputEvent::Glitch => continue,
+            };
+        }
+    }
+
     fn drain_midi(&mut self) {
         for msg in self.midi.drain() {
             self.handle_live(msg.event, msg.at, false);
@@ -766,6 +786,7 @@ impl Render for SurfApp {
             }
         }
         self.drain_midi();
+        self.poll_devices();
         self.poll_vst_health();
         self.poll_render();
         let now = Instant::now();

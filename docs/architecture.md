@@ -228,6 +228,7 @@ pub fn playback_events(p: &Project, from: Tick, to: Tick) -> impl Iterator<Item 
 
 **Input.**
 - *Current:* `MidiHub` (`midi_input.rs`) enumerates WinMM devices and opens one with `midiInOpen` and a C callback. The callback parses status bytes (`parse_message`: note on/off, CC 64), sends a `Command` to the audio engine, and sends `TimedMidi { at: Instant, event }` to the UI channel. `drain()` is polled by the UI once per frame.
+- *Hot-plug:* `MidiHub::poll()` runs once per UI frame. It re-enumerates ports when the backend reports a change; CoreMIDI notifies, and WinMM and ALSA fall back to a 2 s timer. It reconnects to the same port by name, auto-connects a new port when nothing is connected, and returns a `PortChange` for the status bar.
 - *Now:* `MidiHub::new(sink: NoteSink)`. The sink is a closure called on the driver thread; the app points it at the audio engine. `surf-midi` therefore does not depend on `surf-audio`. Each OS backend exposes `list_ports()` and `open(index, deliver)`, and shares one `parse_message`. The CoreMIDI backend also walks multi-message packets and running status, and skips SysEx and real-time bytes.
 
 **Files** (`song.rs` today):
@@ -264,6 +265,14 @@ pub trait Instrument: Send {          // src/audio/mod.rs
 - One `Core` with N track lanes, each lane holding its own `Instrument`, gain, and pan, summed into the master bus.
 - Scheduling reads `surf-core::playback_events` instead of a flattened `Timeline`.
 - `Command::SetProject(Arc<ProjectSnapshot>)` swaps an immutable snapshot after each edit, so editing never locks the audio thread.
+
+**Output changes:** the cpal error callback classifies stream errors into `OutputEvent`s instead of printing them:
+- `Rerouted { device }`: the default output changed and cpal followed it, for example a USB MIDI keyboard that is also an audio interface;
+- `Lost`: the output device disappeared;
+- `Glitch`: an underrun, counted in `EngineStatus::glitches`;
+- `Error`: anything else.
+
+The UI drains these each frame and shows them in the status bar.
 
 **Offline render** (`render.rs`): `render_with_instrument(timeline, &mut dyn Instrument, path, opts)` runs the same chunked trigger loop with no device and writes 24-bit stereo WAV via `hound`. It handles plugin latency and the tail (L3 §3.8). Built-in renders run on a UI-process worker thread; plugin renders run inside the host.
 
@@ -394,7 +403,7 @@ offset  size   field
 
 ### 3.4 Control protocol (stdin/stdout JSON)
 
-One JSON object per line, tagged with serde (`"cmd"` for requests, `"event"` for events).
+One JSON object per line, tagged with serde (`"cmd"` for requests, `"event"` for events). Before loading a plugin, the host moves the protocol to a private copy of its stdout pipe and points its own stdout (including the C runtime's) at stderr, which is the host log. A plugin that prints to stdout can no longer join or corrupt a protocol line.
 
 | Request (`cmd`) | Fields | Reply (`event`) |
 |---|---|---|
