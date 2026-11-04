@@ -3,7 +3,7 @@
 //! Loading a plugin in-process can crash if the plugin is broken, so this is a
 //! separate process from the visualizer.
 
-use surf::audio::vst::VstPlugin;
+use surf::plugin::backends::vst3::VstPlugin;
 
 fn main() -> anyhow::Result<()> {
     let path = std::env::args()

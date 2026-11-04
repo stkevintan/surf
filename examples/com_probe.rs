@@ -8,20 +8,33 @@
 //! cargo run --example com_probe -- "C:\Program Files\Common Files\VST3\Kontakt 8.vst3"
 //! ```
 
-use surf::audio::vst::VstPlugin;
-use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+#[cfg(windows)]
+mod probe {
+    use surf::plugin::backends::vst3::VstPlugin;
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 
-fn main() -> anyhow::Result<()> {
-    let path = std::env::args()
-        .nth(1)
-        .expect("usage: com_probe <path-to.vst3>");
-    unsafe {
-        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        println!("CoInitializeEx -> {hr:?}");
+    pub fn main() -> anyhow::Result<()> {
+        let path = std::env::args()
+            .nth(1)
+            .expect("usage: com_probe <path-to.vst3>");
+        unsafe {
+            let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            println!("CoInitializeEx -> {hr:?}");
+        }
+        println!("loading {path}");
+        let plugin = VstPlugin::load(&path, 48_000)?;
+        println!("name: {}", plugin.name);
+        println!("has_editor: {}", plugin.has_editor());
+        Ok(())
     }
-    println!("loading {path}");
-    let plugin = VstPlugin::load(&path, 48_000)?;
-    println!("name: {}", plugin.name);
-    println!("has_editor: {}", plugin.has_editor());
-    Ok(())
+}
+
+#[cfg(windows)]
+fn main() -> anyhow::Result<()> {
+    probe::main()
+}
+
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("this probe is Windows-only");
 }

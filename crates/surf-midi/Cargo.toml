@@ -1,0 +1,21 @@
+[package]
+name = "surf-midi"
+description = "Surf MIDI I/O: live input and Standard MIDI Files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+surf-core.workspace = true
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+midly.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Media", "Win32_Media_Audio", "Win32_Media_Multimedia"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+coremidi.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa.workspace = true

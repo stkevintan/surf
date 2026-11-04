@@ -1,15 +1,11 @@
-//! Audio engine: real-time output, live MIDI routing, MIDI playback and
-//! offline rendering.
+//! Audio for Surf: the real-time engine, the [`Instrument`] trait, the
+//! built-in piano and offline WAV rendering.
+//!
+//! Plugin instruments live in `surf-plugin`; they implement [`Instrument`] too.
 
 pub mod engine;
-pub mod ipc;
-pub mod remote;
 pub mod render;
 pub mod synth;
-pub mod vst;
-pub mod vst2;
-pub mod vst_client;
-pub mod vst_scan;
 
 pub use engine::{AudioEngine, Command, EngineStatus};
 pub use synth::Synth;

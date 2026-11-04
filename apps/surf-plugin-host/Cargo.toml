@@ -1,0 +1,27 @@
+[package]
+name = "surf-plugin-host"
+description = "Surf's out-of-process plugin host (one plugin per process)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Keep the binary name the app looks for next to itself.
+[[bin]]
+name = "surf-vst-host"
+path = "src/main.rs"
+
+[dependencies]
+surf-core.workspace = true
+surf-audio.workspace = true
+surf-platform.workspace = true
+surf-plugin = { workspace = true, features = ["host"] }
+anyhow.workspace = true
+serde_json.workspace = true
+vst3-host.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+] }

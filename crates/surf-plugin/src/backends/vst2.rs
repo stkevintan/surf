@@ -16,16 +16,16 @@ use vst::buffer::AudioBuffer;
 use vst::editor::Editor;
 use vst::host::{Host, PluginInstance, PluginLoader};
 use vst::plugin::Plugin;
-use windows::core::HSTRING;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, HICON, HCURSOR, IsWindow,
+    CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, HCURSOR, HICON, IsWindow,
     RegisterClassW, SW_SHOW, SetWindowPos, ShowWindow, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
+use windows::core::HSTRING;
 
-use super::Instrument;
+use surf_audio::Instrument;
 
 pub const VST2_BLOCK: usize = 64;
 
@@ -177,9 +177,7 @@ impl Vst2Plugin {
             .instance
             .lock()
             .map_err(|_| anyhow::anyhow!("VST2 plugin mutex poisoned"))?;
-        let mut editor = plugin
-            .get_editor()
-            .context("VST2 plugin has no editor")?;
+        let mut editor = plugin.get_editor().context("VST2 plugin has no editor")?;
         let window = NativeWindow::new(&self.name)?;
         let parent = window.hwnd.0 as *mut c_void;
         if !editor.open(parent) {
@@ -404,15 +402,7 @@ impl NativeWindow {
             return;
         }
         unsafe {
-            let _ = SetWindowPos(
-                self.hwnd,
-                None,
-                0,
-                0,
-                width,
-                height,
-                Default::default(),
-            );
+            let _ = SetWindowPos(self.hwnd, None, 0, 0, width, height, Default::default());
         }
     }
 
@@ -536,7 +526,8 @@ mod tests {
             for (i, expected) in messages.iter().enumerate() {
                 let event = std::ptr::read_unaligned(array.add(i)) as *const api::MidiEvent;
                 assert_eq!(
-                    (*event).midi_data, *expected,
+                    (*event).midi_data,
+                    *expected,
                     "event {i} must keep its own MIDI bytes"
                 );
             }

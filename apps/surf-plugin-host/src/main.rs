@@ -1,6 +1,6 @@
-//! Out-of-process VST3 host.
+//! Out-of-process plugin host.
 //!
-//! Started by `surf.exe` as `surf-vst-host.exe`.  The plugin, its GUI and its
+//! Started by the Surf app as `surf-vst-host`, one process per plugin.  The plugin, its GUI and its
 //! native threads live only in this process; if Kontakt aborts, the UI process
 //! survives.  Audio/MIDI travel through shared memory; control/state/render
 //! travel over stdin/stdout JSON lines.
@@ -13,22 +13,29 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use surf::audio::Instrument;
-use surf::audio::ipc::{MidiKind, SharedMap};
-use surf::audio::render::{RenderOptions, render_with_instrument};
-use surf::audio::vst::{VstPlugin, render_vst_to_wav};
-use surf::audio::vst2::{Vst2EditorWindow, Vst2Plugin};
-use surf::audio::vst_client::{HelperEvent, HelperRequest, RenderNote};
-use surf::song::{Timeline, TimedNote};
+use surf_audio::Instrument;
+#[cfg(windows)]
+use surf_audio::render::render_with_instrument;
+use surf_audio::render::RenderOptions;
+use surf_core::song::{TimedNote, Timeline};
+use surf_plugin::backends::vst3::{VstPlugin, render_vst_to_wav};
+#[cfg(windows)]
+use surf_plugin::backends::vst2::{Vst2EditorWindow, Vst2Plugin};
+use surf_plugin::protocol::{HelperEvent, HelperRequest, RenderNote};
+use surf_plugin::shm::{MidiKind, SharedMap};
 use vst3_host::window::PluginWindow;
-use windows::core::HSTRING;
+#[cfg(windows)]
 use windows::Win32::System::Com::{
-    CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
 };
+#[cfg(windows)]
 use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
 };
+#[cfg(windows)]
+use windows::core::HSTRING;
 
 /// Initialise COM on the thread that will own the plugin and its editor.
 ///
@@ -41,6 +48,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// does); `COINIT_DISABLE_OLE1DDE` just skips legacy OLE1 support we have no use for.
 /// `RPC_E_CHANGED_MODE` means something already initialised this thread as MTA — worth a
 /// warning, but not fatal, so we carry on rather than refusing to load.
+#[cfg(windows)]
 fn init_com() -> bool {
     // SAFETY: called once, on the main thread, before any plugin or COM object exists.
     let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
@@ -53,8 +61,14 @@ fn init_com() -> bool {
     }
 }
 
+#[cfg(not(windows))]
+fn init_com() -> bool {
+    false
+}
+
 enum Backend {
     Vst3(VstPlugin),
+    #[cfg(windows)]
     Vst2(Vst2Plugin),
 }
 
@@ -67,7 +81,7 @@ fn install_panic_log() {
     std::panic::set_hook(Box::new(move |info| {
         let text = format!("surf-vst-host panic: {info}");
         eprintln!("{text}");
-        let path = surf::paths::data_dir().join("surf-vst-host-panic.log");
+        let path = surf_platform::data_dir().join("surf-vst-host-panic.log");
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -82,6 +96,7 @@ fn install_panic_log() {
 #[allow(dead_code)]
 enum EditorWindow {
     Vst3(PluginWindow),
+    #[cfg(windows)]
     Vst2(Vst2EditorWindow),
 }
 
@@ -90,10 +105,12 @@ enum EditorWindow {
 /// Declared before the plugin in `main` so Rust's reverse drop order tears COM down *after*
 /// the plugin released its COM objects — uninitialising the apartment while a plugin still
 /// holds interfaces is its own crash.
-struct ComGuard(bool);
+// The flag is only read on Windows, where COM exists.
+struct ComGuard(#[cfg_attr(not(windows), allow(dead_code))] bool);
 
 impl Drop for ComGuard {
     fn drop(&mut self) {
+        #[cfg(windows)]
         if self.0 {
             // SAFETY: pairs with the successful CoInitializeEx on this same thread.
             unsafe { CoUninitialize() };
@@ -105,6 +122,7 @@ impl Backend {
     fn name(&self) -> &str {
         match self {
             Self::Vst3(v) => &v.name,
+            #[cfg(windows)]
             Self::Vst2(v) => &v.name,
         }
     }
@@ -112,6 +130,7 @@ impl Backend {
     fn instrument(&self) -> Box<dyn Instrument> {
         match self {
             Self::Vst3(v) => Box::new(v.instrument()),
+            #[cfg(windows)]
             Self::Vst2(v) => Box::new(v.instrument()),
         }
     }
@@ -119,6 +138,7 @@ impl Backend {
     fn open_editor(&self) -> Result<EditorWindow> {
         match self {
             Self::Vst3(v) => Ok(EditorWindow::Vst3(v.open_editor()?)),
+            #[cfg(windows)]
             Self::Vst2(v) => Ok(EditorWindow::Vst2(v.open_editor()?)),
         }
     }
@@ -126,6 +146,7 @@ impl Backend {
     fn state(&self) -> Result<Vec<u8>> {
         match self {
             Self::Vst3(v) => v.state(),
+            #[cfg(windows)]
             Self::Vst2(v) => v.state(),
         }
     }
@@ -133,6 +154,7 @@ impl Backend {
     fn load_state(&self, bytes: &[u8]) -> Result<()> {
         match self {
             Self::Vst3(v) => v.load_state(bytes),
+            #[cfg(windows)]
             Self::Vst2(v) => v.load_state(bytes),
         }
     }
@@ -171,11 +193,14 @@ fn main() -> Result<()> {
                 );
             } else {
                 eprintln!("helper: cwd set to {}", search_dir.display());
-                let wide = HSTRING::from(search_dir.to_string_lossy().as_ref());
-                if let Err(err) = unsafe { SetDllDirectoryW(&wide) } {
-                    eprintln!("helper: SetDllDirectoryW failed: {err}");
-                } else {
-                    eprintln!("helper: DLL directory set to {}", search_dir.display());
+                #[cfg(windows)]
+                {
+                    let wide = HSTRING::from(search_dir.to_string_lossy().as_ref());
+                    if let Err(err) = unsafe { SetDllDirectoryW(&wide) } {
+                        eprintln!("helper: SetDllDirectoryW failed: {err}");
+                    } else {
+                        eprintln!("helper: DLL directory set to {}", search_dir.display());
+                    }
                 }
             }
     }
@@ -186,11 +211,23 @@ fn main() -> Result<()> {
         .extension()
         .and_then(|s| s.to_str())
         .is_some_and(|s| s.eq_ignore_ascii_case("dll"));
-    let backend = if is_vst2 {
-        Backend::Vst2(
+    #[cfg(not(windows))]
+    if is_vst2 {
+        anyhow::bail!("VST2 plugins are only supported on Windows");
+    }
+    #[cfg(windows)]
+    let vst2 = if is_vst2 {
+        Some(Backend::Vst2(
             Vst2Plugin::load_with_state(&args.plugin, args.sample_rate, state.as_deref())
                 .context("helper failed to load VST2 plugin")?,
-        )
+        ))
+    } else {
+        None
+    };
+    #[cfg(not(windows))]
+    let vst2: Option<Backend> = None;
+    let backend = if let Some(backend) = vst2 {
+        backend
     } else {
         Backend::Vst3(
             VstPlugin::load_with_state(&args.plugin, args.sample_rate, state.as_deref())
@@ -251,6 +288,7 @@ fn main() -> Result<()> {
     let mut running = true;
     while running {
         pump_messages();
+        #[cfg(windows)]
         if let Some(EditorWindow::Vst2(window)) = &mut editor {
             window.idle();
         }
@@ -265,7 +303,7 @@ fn main() -> Result<()> {
                 },
                 HelperRequest::CloseEditor => {
                     editor = None;
-                    send_event(&mut out, &HelperEvent::EditorOpened)?;
+                    send_event(&mut out, &HelperEvent::EditorClosed)?;
                 }
                 HelperRequest::SaveState { path } => match backend.state() {
                     Ok(bytes) => match std::fs::write(&path, &bytes) {
@@ -305,6 +343,7 @@ fn main() -> Result<()> {
                             sample_rate,
                             tail_secs,
                         ),
+                        #[cfg(windows)]
                         Backend::Vst2(_) => render_vst2_to_wav(
                             &args.plugin,
                             state.as_deref(),
@@ -397,6 +436,8 @@ fn send_error(out: &mut BufWriter<std::io::Stdout>, message: String) -> Result<(
     send_event(out, &HelperEvent::Error { message })
 }
 
+/// Let the OS deliver window events, which plugin editors depend on.
+#[cfg(windows)]
 fn pump_messages() {
     unsafe {
         let mut msg = MSG::default();
@@ -407,34 +448,10 @@ fn pump_messages() {
     }
 }
 
-/// Register this thread with MMCSS so Windows schedules it as audio work.
-///
-/// Returns the task handle, which must stay alive for the registration to hold.
-///
-/// Without this the render thread is an ordinary thread: the scheduler can park it
-/// for several milliseconds, which forces a large queue cushion just to survive a
-/// missed wakeup, and that cushion *is* the latency the player feels. "Pro Audio" is
-/// the same MMCSS task every DAW and WASAPI's own engine thread uses.
-#[cfg(windows)]
-fn join_pro_audio_mmcss() -> Option<windows::Win32::Foundation::HANDLE> {
-    use windows::Win32::System::Threading::AvSetMmThreadCharacteristicsW;
-    use windows::core::w;
-
-    let mut task_index = 0u32;
-    // SAFETY: called once from the thread being registered; `task_index` is a live out-param.
-    match unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_index) } {
-        Ok(handle) if !handle.is_invalid() => {
-            eprintln!("helper: audio thread joined MMCSS 'Pro Audio'");
-            Some(handle)
-        }
-        Ok(_) => None,
-        Err(err) => {
-            // Not fatal: the cushion still covers scheduling jitter, just less tightly.
-            eprintln!("helper: MMCSS registration failed ({err}); using default scheduling");
-            None
-        }
-    }
-}
+/// Editor windows on macOS/Linux are not wired up yet (see docs/architecture.md),
+/// so there is no event queue to drain.
+#[cfg(not(windows))]
+fn pump_messages() {}
 
 /// Render audio into the shared ring, keeping it topped up to a fixed cushion.
 ///
@@ -442,22 +459,9 @@ fn join_pro_audio_mmcss() -> Option<windows::Win32::Foundation::HANDLE> {
 fn audio_loop(mut instrument: Box<dyn Instrument>, map: Arc<SharedMap>, stop: Arc<AtomicBool>) {
     // Ask for audio-class scheduling before sizing the cushion: the whole point is
     // that a reliably-woken thread needs far less queued audio to stay glitch-free.
-    #[cfg(windows)]
-    let _mmcss = join_pro_audio_mmcss();
-
-    // Make `sleep(1ms)` mean roughly 1 ms. The default timer granularity is ~15.6 ms,
-    // which would let the ring run dry no matter how the loop is written. Paired with
-    // `timeEndPeriod` when the loop exits.
-    #[cfg(windows)]
-    let timer_period = {
-        use windows::Win32::Media::timeBeginPeriod;
-        // SAFETY: plain system call; balanced by timeEndPeriod below.
-        let ok = unsafe { timeBeginPeriod(1) } == 0;
-        if !ok {
-            eprintln!("helper: timeBeginPeriod(1) failed; sleeps may be coarse");
-        }
-        ok
-    };
+    // On Windows this also sets a 1 ms timer resolution so `sleep(1ms)` means ~1 ms;
+    // the default ~15.6 ms granularity would let the ring run dry.
+    let _rt = surf_platform::rt::promote_audio_thread(Duration::from_millis(1));
 
     // How much audio to keep queued ahead of the consumer.
     //
@@ -520,15 +524,6 @@ fn audio_loop(mut instrument: Box<dyn Instrument>, map: Arc<SharedMap>, stop: Ar
         std::thread::sleep(Duration::from_millis(1));
     }
     instrument.all_notes_off();
-
-    #[cfg(windows)]
-    if timer_period {
-        use windows::Win32::Media::timeEndPeriod;
-        // SAFETY: balances the successful timeBeginPeriod(1) above.
-        unsafe {
-            timeEndPeriod(1);
-        }
-    }
 }
 
 fn timeline_from_notes(notes: &[RenderNote], duration: f64) -> Timeline {
@@ -572,6 +567,7 @@ fn render_to_wav(
     Ok((stats.path, stats.duration, stats.peak))
 }
 
+#[cfg(windows)]
 fn render_vst2_to_wav(
     plugin: &std::path::Path,
     state: Option<&[u8]>,

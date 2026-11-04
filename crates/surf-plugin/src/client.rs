@@ -2,7 +2,7 @@
 //!
 //! Control/state/render go over line-delimited JSON on the helper's
 //! stdin/stdout; real-time audio and MIDI use the shared-memory ring in
-//! [`super::ipc`].
+//! [`crate::shm`].
 
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -13,54 +13,10 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 
-use super::ipc::SharedMap;
-use super::remote::RemoteInstrument;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RenderNote {
-    pub key: u8,
-    pub velocity: u8,
-    pub channel: u8,
-    pub start: f64,
-    pub end: f64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "cmd")]
-pub enum HelperRequest {
-    OpenEditor,
-    CloseEditor,
-    SaveState { path: String },
-    LoadState { path: String },
-    Render {
-        output: String,
-        sample_rate: u32,
-        notes: Vec<RenderNote>,
-        duration: f64,
-        tail_secs: f64,
-    },
-    Ping,
-    Shutdown,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "event")]
-pub enum HelperEvent {
-    Ready { name: String, sample_rate: u32 },
-    Error { message: String },
-    StateSaved { bytes: usize, path: String },
-    StateLoaded,
-    EditorOpened,
-    RenderDone {
-        path: String,
-        duration: f64,
-        peak: f32,
-    },
-    Pong,
-    Exited,
-}
+pub use crate::protocol::{HelperEvent, HelperRequest, RenderNote};
+use crate::remote::RemoteInstrument;
+use crate::shm::SharedMap;
 
 pub struct VstClient {
     pub path: PathBuf,
@@ -77,10 +33,10 @@ impl VstClient {
         sample_rate: u32,
         state_path: Option<&Path>,
     ) -> Result<Self> {
-        let plugin = std::path::absolute(plugin.as_ref())
-            .unwrap_or_else(|_| plugin.as_ref().to_path_buf());
+        let plugin =
+            std::path::absolute(plugin.as_ref()).unwrap_or_else(|_| plugin.as_ref().to_path_buf());
         let helper = helper_path()?;
-        let shm_name = super::ipc::make_name();
+        let shm_name = crate::shm::make_name();
         let map = Arc::new(SharedMap::create(&shm_name)?);
         map.set_sample_rate(sample_rate);
 
@@ -250,6 +206,9 @@ impl VstClient {
 
     pub fn close_editor(&mut self) -> Result<()> {
         self.request(&HelperRequest::CloseEditor)?;
+        self.wait_event(Duration::from_secs(15), |ev| {
+            matches!(ev, HelperEvent::EditorClosed)
+        })?;
         Ok(())
     }
 
@@ -283,8 +242,7 @@ impl VstClient {
         sample_rate: u32,
         tail_secs: f64,
     ) -> Result<(String, f64, f32)> {
-        let output = std::path::absolute(output)
-            .unwrap_or_else(|_| output.to_path_buf());
+        let output = std::path::absolute(output).unwrap_or_else(|_| output.to_path_buf());
         self.request(&HelperRequest::Render {
             output: output.display().to_string(),
             sample_rate,
@@ -429,7 +387,7 @@ fn helper_temp_dir() -> Option<PathBuf> {
     if std::env::var_os("SURF_NO_PRIVATE_TEMP").is_some() {
         return None;
     }
-    let dir = crate::paths::data_dir().join("helper-tmp");
+    let dir = surf_platform::data_dir().join("helper-tmp");
     // Best-effort reset; a file we cannot delete is not worth failing the spawn over.
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).ok()?;
@@ -439,7 +397,7 @@ fn helper_temp_dir() -> Option<PathBuf> {
 pub fn helper_log_path() -> PathBuf {
     std::env::var_os("SURF_HELPER_LOG")
         .map(PathBuf::from)
-        .unwrap_or_else(|| crate::paths::data_dir().join("surf-vst-host.log"))
+        .unwrap_or_else(|| surf_platform::data_dir().join("surf-vst-host.log"))
 }
 
 fn helper_path() -> Result<PathBuf> {

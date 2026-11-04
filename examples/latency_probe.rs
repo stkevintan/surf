@@ -56,8 +56,8 @@ fn main() -> anyhow::Result<()> {
 
     println!();
     println!("ring capacity: {} frames = {:.1} ms @ {} Hz",
-        surf::audio::ipc::AUDIO_CAPACITY,
-        surf::audio::ipc::AUDIO_CAPACITY as f64 * 1000.0 / sample_rate as f64,
+        surf::plugin::shm::AUDIO_CAPACITY,
+        surf::plugin::shm::AUDIO_CAPACITY as f64 * 1000.0 / sample_rate as f64,
         sample_rate,
     );
     println!();

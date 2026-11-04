@@ -1,6 +1,6 @@
 # Using plugin instruments
 
-Surf plays through its built-in piano by default. It can also host VST3 and VST2 instruments (Windows today). Every plugin runs in its own `surf-vst-host` process, so a crashing plugin never takes down the app: Surf falls back to the built-in piano and keeps playing.
+Surf plays through its built-in piano by default. On Windows it can also host VST3 and VST2 instruments. On macOS the plugin host builds and runs, but loading VST3 bundles and their editors there is not tested yet. Every plugin runs in its own `surf-vst-host` process, so a crashing plugin never takes down the app: Surf falls back to the built-in piano and keeps playing.
 
 ## Loading an instrument
 
@@ -15,7 +15,7 @@ There are three ways to pick a plugin:
 
    ```powershell
    $env:SURF_VST = "C:\Program Files\Common Files\VST3\Kontakt 8.vst3"
-   cargo run --bin surf
+   cargo run
    ```
 
 `.vst3` paths use the VST3 backend and `.dll` paths use the VST2 backend.

@@ -1,6 +1,6 @@
 //! Dump raw MIDI input, so a non-working pedal becomes a fact rather than a guess.
 //!
-//! Surf only treats **CC 64** as sustain (`midi_input.rs::parse_message`). Pedals
+//! Surf only treats **CC 64** as sustain (`surf_midi::input::parse_message`). Pedals
 //! vary: some send CC 64 as expected, some send a different controller, some send
 //! continuous "half-damper" values, and some are wired to a jack that sends nothing
 //! at all. This prints every message with its status, controller and value, and
@@ -13,13 +13,12 @@
 
 use std::time::Duration;
 
-use surf::midi_input::{LiveEvent, MidiHub};
+use surf::midi::{LiveEvent, MidiHub};
 
 fn main() -> anyhow::Result<()> {
-    // The hub forwards to an audio thread in the real app; here the receiver is
-    // just dropped on the floor, we only want the parsed-event stream.
-    let (audio_tx, _audio_rx) = crossbeam_channel::unbounded();
-    let mut hub = MidiHub::new(audio_tx);
+    // The app forwards events to the audio engine; here we only want the
+    // timestamped stream, so the sink does nothing.
+    let mut hub = MidiHub::new(std::sync::Arc::new(|_| {}));
     hub.refresh();
     let ports = hub.ports();
     if ports.is_empty() {

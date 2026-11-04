@@ -109,7 +109,10 @@ fn scan_roots() -> Vec<Root> {
         }
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
             roots.push(Root {
-                path: PathBuf::from(local).join("Programs").join("Common").join("VST3"),
+                path: PathBuf::from(local)
+                    .join("Programs")
+                    .join("Common")
+                    .join("VST3"),
                 accept_dll: false,
             });
         }
@@ -224,9 +227,15 @@ fn extension(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
+    // Build paths with `join` rather than Windows literals: on macOS and Linux a
+    // backslash is an ordinary file-name character, not a separator.
+    fn plugin(dir: &str, file: &str) -> PathBuf {
+        Path::new("plugins").join(dir).join(file)
+    }
+
     #[test]
     fn entry_name_is_the_file_stem() {
-        let entry = PluginEntry::new(PathBuf::from(r"C:\VST3\Kontakt 8.vst3"), false).unwrap();
+        let entry = PluginEntry::new(plugin("VST3", "Kontakt 8.vst3"), false).unwrap();
         assert_eq!(entry.name, "Kontakt 8");
         assert!(!entry.vst2);
     }
@@ -234,13 +243,13 @@ mod tests {
     #[test]
     fn bundle_directory_keeps_its_stem() {
         // A bundle on disk is a directory, but the name comes from the same place.
-        let entry = PluginEntry::new(PathBuf::from(r"C:\VST3\OmnivocalBeta.vst3"), false).unwrap();
+        let entry = PluginEntry::new(plugin("VST3", "OmnivocalBeta.vst3"), false).unwrap();
         assert_eq!(entry.name, "OmnivocalBeta");
     }
 
     #[test]
     fn vst2_entries_are_flagged() {
-        let entry = PluginEntry::new(PathBuf::from(r"C:\VST\TruePianos.dll"), true).unwrap();
+        let entry = PluginEntry::new(plugin("VST", "TruePianos.dll"), true).unwrap();
         assert!(entry.vst2);
         assert_eq!(entry.name, "TruePianos");
     }
@@ -249,14 +258,17 @@ mod tests {
     fn names_without_a_stem_are_skipped() {
         // `Path::file_stem` of a dot-file is the whole name, which is not a
         // plugin name; neither is an empty one.
-        assert!(PluginEntry::new(PathBuf::from(r"C:\VST3\.vst3"), false).is_none());
-        assert!(PluginEntry::new(PathBuf::from(r"C:\VST3\.hidden.vst3"), false).is_none());
+        assert!(PluginEntry::new(plugin("VST3", ".vst3"), false).is_none());
+        assert!(PluginEntry::new(plugin("VST3", ".hidden.vst3"), false).is_none());
     }
 
     #[test]
     fn extensions_are_matched_case_insensitively() {
-        assert_eq!(extension(Path::new(r"C:\VST3\Foo.VST3")).as_deref(), Some("vst3"));
-        assert_eq!(extension(Path::new(r"C:\VST\Bar.DLL")).as_deref(), Some("dll"));
-        assert_eq!(extension(Path::new(r"C:\VST3\VST3")), None);
+        assert_eq!(
+            extension(&plugin("VST3", "Foo.VST3")).as_deref(),
+            Some("vst3")
+        );
+        assert_eq!(extension(&plugin("VST", "Bar.DLL")).as_deref(), Some("dll"));
+        assert_eq!(extension(&plugin("VST3", "VST3")), None);
     }
 }

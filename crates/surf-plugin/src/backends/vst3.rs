@@ -3,8 +3,8 @@
 //! The audio thread owns a [`VstInstrument`] which shares the actual plugin
 //! instance with the UI through a mutex.  That lets the UI open the plugin's
 //! native editor (Kontakt, Pianoteq, ...) while audio keeps flowing.  A lock
-//! held by the editor can briefly starve the audio callback; for a production
-//! build, move hosting to a dedicated process (see `plughost`).
+//! held by the editor can briefly starve the audio callback, which is one more
+//! reason this only ever runs inside the plugin host process.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -16,9 +16,9 @@ use vst3_host::midi::MidiChannel;
 use vst3_host::plugin::{Plugin, ProcessMode};
 use vst3_host::window::PluginWindow;
 
-use super::Instrument;
-use super::render::{RenderOptions, RenderStats, render_with_instrument};
-use crate::song::Timeline;
+use surf_audio::Instrument;
+use surf_audio::render::{RenderOptions, RenderStats, render_with_instrument};
+use surf_core::song::Timeline;
 
 /// The engine renders 64-frame chunks; matching the plugin block size keeps
 /// every sample accounted for (VST3 `numSamples` follows the buffer length).

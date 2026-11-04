@@ -7,7 +7,7 @@
 //! cargo run --example vst_scan_list
 //! ```
 
-use surf::audio::vst_scan;
+use surf::plugin::scan as vst_scan;
 
 fn main() {
     let plugins = vst_scan::scan_plugin_paths();

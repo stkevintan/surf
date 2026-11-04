@@ -1,24 +1,42 @@
-[package]
-name = "surf"
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/surf-plugin-host"]
+default-members = [".", "apps/surf-plugin-host"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-default-run = "surf"
-description = "A GPUI piano visualizer with live MIDI, MIDI playback and VST3 instruments"
 license = "MIT OR Apache-2.0"
 
-[dependencies]
-gpui = { version = "0.2.2", default-features = false, features = ["windows-manifest"] }
+[workspace.dependencies]
+surf-core = { path = "crates/surf-core" }
+surf-midi = { path = "crates/surf-midi" }
+surf-audio = { path = "crates/surf-audio" }
+surf-platform = { path = "crates/surf-platform" }
+surf-plugin = { path = "crates/surf-plugin" }
+surf-ui = { path = "crates/surf-ui" }
+
 anyhow = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-vst = "0.4"
 cpal = "0.18"
 crossbeam-channel = "0.5"
+gpui = { version = "0.2.2", default-features = false }
 hound = "3.5"
+libc = "0.2"
+# MIDI input talks to each OS API directly instead of going through `midir`:
+# midir 0.11 needs coremidi 0.9 -> core-foundation >=0.10.1, which conflicts with
+# GPUI 0.2.2's exact `=0.10.0` pin; midir 0.10 links an older `alsa` than cpal,
+# and two crates may not both declare `links = "alsa"`.
+# coremidi 0.8 accepts core-foundation 0.9; `alsa` is the version cpal uses.
+alsa = "0.11"
+coremidi = "0.8"
 midly = "0.5"
 parking_lot = "0.12"
 rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+vst = "0.4"
 vst3-host = { version = "0.10", default-features = false }
+windows = "0.61"
 
 # Local patches, 63 lines over upstream 0.10.0 (see docs/vendor-patches.md):
 #  - open_editor treats a pre-attach getSize() failure as fatal; Kontakt's QML
@@ -32,26 +50,43 @@ vst3-host = { version = "0.10", default-features = false }
 vst3-host = { path = "vendor/vst3-host" }
 vst = { path = "vendor/vst" }
 
-[[bin]]
-name = "surf-vst-host"
-path = "src/bin/vst_helper.rs"
+# The app binary. It stays at the workspace root so `cargo run` and the
+# examples/ probes keep working from the repository root.
+[package]
+name = "surf"
+description = "A desktop MIDI studio with live MIDI, a falling-note visualizer and VST hosting"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "surf"
+
+[dependencies]
+surf-core.workspace = true
+surf-midi.workspace = true
+surf-audio.workspace = true
+surf-platform.workspace = true
+surf-plugin.workspace = true
+surf-ui.workspace = true
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+gpui.workspace = true
+
+[dev-dependencies]
+# The examples/ probes call the plugin format adapters directly; the app
+# binary itself never links them.
+surf-plugin = { workspace = true, features = ["host"] }
+hound.workspace = true
+cpal.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = [
+# Windows-only probes in examples/ call Win32 directly.
+vst.workspace = true
+windows = { workspace = true, features = [
     "Win32_Foundation",
-    # MultiByteToWideChar, to decode the helper log's ANSI/GBK plugin output.
-    "Win32_Globalization",
-    "Win32_Media",
-    "Win32_Media_Audio",
-    "Win32_Media_Multimedia",
-    "Win32_Graphics_Gdi",
+    "Win32_Networking_WinSock",
     "Win32_System_Com",
     "Win32_System_Diagnostics_Debug",
-    "Win32_System_Kernel",
     "Win32_System_LibraryLoader",
-    "Win32_System_Memory",
-    # AvSetMmThreadCharacteristics: register the helper's render thread with MMCSS
-    # so Windows schedules it like audio instead of parking it for milliseconds.
-    "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }

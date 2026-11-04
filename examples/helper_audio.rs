@@ -2,13 +2,13 @@
 //! `cargo run --example helper_audio -- <bundle.vst3>`
 
 use surf::audio::Instrument;
-use surf::audio::vst_client::VstClient;
+use surf::plugin::client::VstClient;
 
 fn main() -> anyhow::Result<()> {
     let path = std::env::args()
         .nth(1)
         .expect("usage: helper_audio <bundle.vst3>");
-    let mut client = VstClient::load(&path, 48_000, None)?;
+    let client = VstClient::load(&path, 48_000, None)?;
     let mut instrument = client.instrument();
 
     std::thread::sleep(std::time::Duration::from_millis(800));

@@ -1,7 +1,7 @@
 //! State round-trip smoke test:
 //! `cargo run --example vst_state -- <bundle.vst3> [saved.state]`
 
-use surf::audio::vst::VstPlugin;
+use surf::plugin::backends::vst3::VstPlugin;
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);

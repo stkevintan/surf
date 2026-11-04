@@ -125,7 +125,7 @@ fn main() -> anyhow::Result<()> {
         println!();
         println!("--- helper rate check for {path} ---");
         println!("(loading at the device rate, like the app does)");
-        let client = surf::audio::vst_client::VstClient::load(&path, device_rate, None)?;
+        let client = surf::plugin::client::VstClient::load(&path, device_rate, None)?;
         let map = client.shared_map();
         println!("helper reports      : {} Hz", map.sample_rate());
         if map.sample_rate() != device_rate {

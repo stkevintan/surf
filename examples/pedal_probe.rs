@@ -15,7 +15,7 @@
 //! ```
 
 use surf::audio::Instrument;
-use surf::audio::vst::VstPlugin;
+use surf::plugin::backends::vst3::VstPlugin;
 
 const SR: u32 = 48_000;
 const BLOCK: usize = 64;

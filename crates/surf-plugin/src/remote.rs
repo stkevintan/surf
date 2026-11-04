@@ -1,12 +1,13 @@
-//! UI-side view of a VST3 hosted in `surf-vst-host.exe`.
+//! UI-side view of a plugin hosted in `surf-vst-host`.
 //!
 //! The audio callback only touches the shared-memory ring; it never calls into
 //! the plugin process.
 
 use std::sync::Arc;
 
-use super::ipc::SharedMap;
-use super::Instrument;
+use surf_audio::Instrument;
+
+use crate::shm::{MidiMsg, SharedMap};
 
 pub struct RemoteInstrument {
     map: Arc<SharedMap>,
@@ -28,25 +29,19 @@ impl RemoteInstrument {
 
 impl Instrument for RemoteInstrument {
     fn note_on(&mut self, key: u8, velocity: u8) {
-        let _ = self
-            .map
-            .push_midi(super::ipc::MidiMsg::note_on(key, velocity));
+        let _ = self.map.push_midi(MidiMsg::note_on(key, velocity));
     }
 
     fn note_off(&mut self, key: u8) {
-        let _ = self.map.push_midi(super::ipc::MidiMsg::note_off(key));
+        let _ = self.map.push_midi(MidiMsg::note_off(key));
     }
 
     fn all_notes_off(&mut self) {
-        let _ = self
-            .map
-            .push_midi(super::ipc::MidiMsg::all_notes_off());
+        let _ = self.map.push_midi(MidiMsg::all_notes_off());
     }
 
     fn set_sustain(&mut self, down: bool) {
-        let _ = self
-            .map
-            .push_midi(super::ipc::MidiMsg::sustain(down));
+        let _ = self.map.push_midi(MidiMsg::sustain(down));
     }
 
     fn process(&mut self, out: &mut [f32], frames: usize) {

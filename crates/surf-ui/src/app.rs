@@ -11,13 +11,13 @@ use gpui::{
 };
 use rfd::FileDialog;
 
-use crate::audio::render::{render_timeline_to_wav, RenderOptions};
-use crate::audio::vst_client::{RenderNote, VstClient, helper_log_path};
-use crate::audio::vst_scan::{self, PluginEntry};
-use crate::audio::{AudioEngine, Synth};
-use crate::midi_input::{LiveEvent, MidiHub};
-use crate::recorder::Recorder;
-use crate::song::{Song, TimedNote, Timeline, key_name};
+use surf_audio::render::{RenderOptions, render_timeline_to_wav};
+use surf_audio::{AudioEngine, Command, Synth};
+use surf_core::recorder::Recorder;
+use surf_core::song::{Song, TimedNote, Timeline, key_name};
+use surf_midi::{LiveEvent, MidiHub, NoteSink};
+use surf_plugin::client::{RenderNote, VstClient, helper_log_path};
+use surf_plugin::scan::{self as vst_scan, PluginEntry};
 
 const PAD: f32 = 16.0;
 const GAP: f32 = 12.0;
@@ -74,7 +74,7 @@ pub struct SurfApp {
     live_notes: Vec<LiveNote>,
     computer_notes: HashMap<String, u8>,
     vst: Option<VstClient>,
-    render_rx: Option<Receiver<anyhow::Result<crate::audio::render::RenderStats>>>,
+    render_rx: Option<Receiver<anyhow::Result<surf_audio::render::RenderStats>>>,
     rendering: bool,
     pending_vst: Option<PathBuf>,
     /// Results of the last `SCAN`, shown in the plugin picker.
@@ -96,7 +96,18 @@ impl SurfApp {
         let mut synth = Synth::new(48_000.0);
         synth.set_master_gain(0.9);
         let audio = AudioEngine::new(Box::new(synth));
-        let midi = MidiHub::new(audio.sender());
+        // Live notes go straight from the MIDI driver thread to the audio
+        // thread, so they sound without waiting for a UI frame.
+        let audio_tx = audio.sender();
+        let sink: NoteSink = std::sync::Arc::new(move |event| {
+            let command = match event {
+                LiveEvent::NoteOn { key, velocity } => Command::NoteOn { key, velocity },
+                LiveEvent::NoteOff { key } => Command::NoteOff { key },
+                LiveEvent::Sustain(down) => Command::Sustain(down),
+            };
+            let _ = audio_tx.send(command);
+        });
+        let midi = MidiHub::new(sink);
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
         // Start with a short demo loaded (paused) so the piano roll has
@@ -268,7 +279,7 @@ impl SurfApp {
         else {
             return;
         };
-        match Song::load(&path) {
+        match surf_midi::smf::load(&path) {
             Ok(song) => {
                 self.timeline = song.timeline();
                 self.song_name = song.name.clone();
@@ -300,7 +311,7 @@ impl SurfApp {
         else {
             return;
         };
-        match song.save_midi(&path) {
+        match surf_midi::smf::save(song, &path) {
             Ok(()) => self.status = format!("MIDI exported to {}", path.display()),
             Err(err) => self.status = format!("MIDI export failed: {err:#}"),
         }
@@ -2188,7 +2199,7 @@ fn vst_state_path_for(plugin_path: &Path) -> PathBuf {
         .to_string_lossy()
         .to_lowercase()
         .hash(&mut hasher);
-    crate::paths::data_dir().join(format!("vst-{:016x}.state", hasher.finish()))
+    surf_platform::data_dir().join(format!("vst-{:016x}.state", hasher.finish()))
 }
 
 
