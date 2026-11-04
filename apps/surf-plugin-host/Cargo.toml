@@ -25,3 +25,9 @@ windows = { workspace = true, features = [
     "Win32_System_LibraryLoader",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+# AppKit setup and the event pump that makes plugin editor windows appear.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSEvent", "NSResponder", "NSRunningApplication"] }
+objc2-foundation = { version = "0.3", features = ["NSDate", "NSObjCRuntime", "NSRunLoop", "NSString"] }

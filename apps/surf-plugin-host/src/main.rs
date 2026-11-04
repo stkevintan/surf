@@ -163,6 +163,8 @@ fn main() -> Result<()> {
     eprintln!("helper: starting");
     // Must happen before the plugin is loaded, and must outlive it (see ComGuard).
     let _com = ComGuard(init_com());
+    #[cfg(target_os = "macos")]
+    appkit::init();
     let args = parse_args()?;
     eprintln!("helper: opening shared memory {}", args.shm);
     let map = Arc::new(SharedMap::open(&args.shm)?);
@@ -262,13 +264,22 @@ fn main() -> Result<()> {
     let mut running = true;
     while running {
         pump_messages();
-        if let Some(EditorWindow::Vst2(window)) = &mut editor {
-            window.idle();
+        match &mut editor {
+            Some(EditorWindow::Vst2(window)) => window.idle(),
+            // Applies plugin-initiated resizes (Kontakt sizes itself after attach).
+            Some(EditorWindow::Vst3(window)) => {
+                if let Err(err) = window.service_platform_events() {
+                    eprintln!("helper: editor event servicing failed: {err}");
+                }
+            }
+            None => {}
         }
         while let Ok(request) = rx.try_recv() {
             match request {
                 HelperRequest::OpenEditor => match backend.open_editor() {
                     Ok(window) => {
+                        #[cfg(target_os = "macos")]
+                        appkit::activate();
                         editor = Some(window);
                         send_event(&mut out, &HelperEvent::EditorOpened)?;
                     }
@@ -420,9 +431,70 @@ fn pump_messages() {
     }
 }
 
-/// Editor windows on macOS/Linux are not wired up yet (see docs/architecture.md),
-/// so there is no event queue to drain.
-#[cfg(not(windows))]
+/// AppKit only shows and draws windows for a process that is a launched
+/// `NSApplication` and drains its event queue on the main thread. Without this
+/// a plugin editor window is created but never appears, and the Dock icon does
+/// nothing when clicked.
+#[cfg(target_os = "macos")]
+mod appkit {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSEventMask};
+    use objc2_foundation::{NSDate, NSDefaultRunLoopMode};
+
+    /// Make this process a regular app. Call once, on the main thread, before
+    /// any plugin is loaded.
+    pub fn init() {
+        let Some(mtm) = MainThreadMarker::new() else {
+            eprintln!("helper: not on the main thread; editor windows will not show");
+            return;
+        };
+        let app = NSApplication::sharedApplication(mtm);
+        // Regular, not Accessory: the editor window should be reachable from
+        // the Dock and Cmd-Tab like any app window.
+        app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+        app.finishLaunching();
+    }
+
+    /// Bring this process to the front, so a newly opened editor is not hidden
+    /// behind the Surf window that asked for it.
+    pub fn activate() {
+        if let Some(mtm) = MainThreadMarker::new() {
+            #[allow(deprecated)] // `activate` needs macOS 14; this works on all versions.
+            NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+        }
+    }
+
+    /// Dispatch every pending event without blocking.
+    pub fn pump() {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let app = NSApplication::sharedApplication(mtm);
+        let now = NSDate::distantPast();
+        loop {
+            // SAFETY: called on the main thread with a valid mode and date.
+            let event = unsafe {
+                app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                    NSEventMask::Any,
+                    Some(&now),
+                    NSDefaultRunLoopMode,
+                    true,
+                )
+            };
+            let Some(event) = event else { break };
+            app.sendEvent(&event);
+        }
+        app.updateWindows();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn pump_messages() {
+    appkit::pump();
+}
+
+/// Linux editors (X11 + `IRunLoop`) are not wired up yet.
+#[cfg(all(unix, not(target_os = "macos")))]
 fn pump_messages() {}
 
 /// Render audio into the shared ring, keeping it topped up to a fixed cushion.

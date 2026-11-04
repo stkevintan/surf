@@ -115,7 +115,8 @@ Platform differences are pushed down to a few narrow traits; everything above th
 | MIDI in | WinMM | CoreMIDI (`coremidi` 0.8) | ALSA sequencer (`alsa` 0.11) |
 | Shared memory | `CreateFileMapping` | `shm_open` + `mmap` | `shm_open` + `mmap` |
 | RT priority (host audio) | MMCSS "Pro Audio" + `timeBeginPeriod(1)` | `thread_policy_set` (time-constraint) | `SCHED_FIFO` via rtkit (optional) |
-| Plugin formats | VST3, VST2 (`.dll`) | VST3, VST2 (`.vst` bundle); editors not yet | VST3, VST2 (`.so`); editors not yet |
+| Plugin formats | VST3, VST2 (`.dll`) | VST3 (editor works), VST2 (`.vst` bundle, no editor yet) | VST3, VST2 (`.so`); no editors yet |
+| Editor event loop | Win32 message pump | the host becomes a regular `NSApplication` (Dock icon) and drains AppKit events every 2 ms on the main thread | not yet (`X11` + `IRunLoop`) |
 | Format rules | `surf-plugin::format` maps a path to a format and, for a macOS bundle, to its Mach-O binary (via `Info.plist`) | | |
 | Editor parent window | HWND | NSView | X11 window |
 | Data dir | `%APPDATA%\Surf` | `~/Library/Application Support/Surf` | `$XDG_DATA_HOME/surf` |
