@@ -20,7 +20,7 @@ parking_lot = "0.12"
 rfd = "0.17"
 vst3-host = { version = "0.10", default-features = false }
 
-# Local patches, 63 lines over upstream 0.10.0 (see README "vendor 补丁"):
+# Local patches, 63 lines over upstream 0.10.0 (see docs/vendor-patches.md):
 #  - open_editor treats a pre-attach getSize() failure as fatal; Kontakt's QML
 #    editor fails it legitimately, so it is non-fatal with an 800x600 default.
 #  - PluginWindow::open pre-queries the editor size, which burns a throw-away
