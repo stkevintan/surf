@@ -8,6 +8,7 @@
 //! [`scan`] only walks the file system, so it is safe to call from the UI.
 
 pub mod client;
+pub mod format;
 pub mod protocol;
 pub mod remote;
 pub mod scan;

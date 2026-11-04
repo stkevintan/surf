@@ -13,7 +13,7 @@ A desktop MIDI studio written in Rust with [GPUI](https://www.gpui.rs/). Play a 
 - **Export**: type-1 MIDI files and 24-bit / 48 kHz WAV.
 - **Runs without an audio device**: the timeline and visuals keep working, which is handy over remote desktop or in CI.
 
-> **Status:** early development. Runs on Windows 10/11 and macOS (Apple silicon). Plugin hosting (VST3 / VST2) is Windows-only for now, and Linux is not tested yet. Multi-track editing and a Logic-style interface are in progress. See the [UI design](docs/design/README.md) and the [roadmap](docs/architecture.md#roadmap-mapping).
+> **Status:** early development. Runs on Windows 10/11 and macOS (Apple silicon). Plugin hosting is tested with real instruments on Windows, and with VST2 test plugins on macOS. Plugin editors only open on Windows so far, and Linux is not tested yet. Multi-track editing and a Logic-style interface are in progress. See the [UI design](docs/design/README.md) and the [roadmap](docs/architecture.md#roadmap-mapping).
 
 ## Get started
 
@@ -22,7 +22,7 @@ A desktop MIDI studio written in Rust with [GPUI](https://www.gpui.rs/). Play a 
 - Rust stable (tested with 1.94 on Windows and 1.98 on macOS)
 - Windows: Visual Studio Build Tools with the MSVC toolchain and the Windows SDK
 - macOS: the Xcode Command Line Tools (`xcode-select --install`); full Xcode is not needed
-- Optional: a MIDI keyboard; VST3 / VST2 instruments (Windows)
+- Optional: a MIDI keyboard; VST3 / VST2 instruments
 
 ### Build and run
 

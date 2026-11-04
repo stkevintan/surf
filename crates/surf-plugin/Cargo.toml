@@ -18,17 +18,14 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 vst3-host = { workspace = true, optional = true }
-
-# VST2 hosting is Windows-only (the only VST2 targets in practice).
-[target.'cfg(windows)'.dependencies]
 vst = { workspace = true, optional = true }
+
+# The VST2 editor's parent window is Win32 on Windows (other OSes have no
+# VST2 editor yet).
+[target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
     "Win32_UI_WindowsAndMessaging",
 ] }
-
-[target.'cfg(not(windows))'.dependencies]
-# Declared so the `host` feature resolves on every OS; unused off Windows.
-vst = { workspace = true, optional = true }
