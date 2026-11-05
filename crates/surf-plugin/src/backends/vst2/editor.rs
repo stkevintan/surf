@@ -1,6 +1,8 @@
 //! The VST2 editor's parent window on Windows: a plain Win32 top-level window.
 
+use std::collections::HashSet;
 use std::ffi::c_void;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use vst::editor::Editor;
@@ -11,7 +13,7 @@ use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, HCURSOR, HICON, IsWindow,
-    RegisterClassW, SW_SHOW, SetWindowPos, ShowWindow, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    RegisterClassW, SW_SHOW, SetWindowPos, ShowWindow, WM_CLOSE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::HSTRING;
 
@@ -28,12 +30,28 @@ pub fn open(plugin: &mut PluginInstance, name: &str) -> Result<Vst2EditorWindow>
     Ok(Vst2EditorWindow { window, editor })
 }
 
+/// Editor windows whose close button was clicked, keyed by `HWND` as `usize`.
+///
+/// `DefWindowProcW` would answer `WM_CLOSE` by destroying the window while the plugin's
+/// editor is still attached to it. The window procedure records the request instead and the
+/// host closes the editor, then the window, in that order.
+fn close_requests() -> &'static Mutex<HashSet<usize>> {
+    static REQUESTS: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+    REQUESTS.get_or_init(Mutex::default)
+}
+
 unsafe extern "system" fn vst2_wndproc(
     hwnd: HWND,
     msg: u32,
     wparam: windows::Win32::Foundation::WPARAM,
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
+    if msg == WM_CLOSE {
+        if let Ok(mut requests) = close_requests().lock() {
+            requests.insert(hwnd.0 as usize);
+        }
+        return windows::Win32::Foundation::LRESULT(0);
+    }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
@@ -99,6 +117,9 @@ impl NativeWindow {
 
 impl Drop for NativeWindow {
     fn drop(&mut self) {
+        if let Ok(mut requests) = close_requests().lock() {
+            requests.remove(&(self.hwnd.0 as usize));
+        }
         unsafe {
             if IsWindow(Some(self.hwnd)).as_bool() {
                 let _ = DestroyWindow(self.hwnd);
@@ -115,6 +136,14 @@ pub struct Vst2EditorWindow {
 impl Vst2EditorWindow {
     pub fn idle(&mut self) {
         self.editor.idle();
+    }
+
+    /// Whether the user clicked the window's close button. The host should drop this
+    /// window when it reports `true`.
+    pub fn closed_by_user(&self) -> bool {
+        close_requests()
+            .lock()
+            .is_ok_and(|requests| requests.contains(&(self.window.hwnd.0 as usize)))
     }
 }
 

@@ -64,6 +64,29 @@ fn init_com() -> bool {
     false
 }
 
+/// Opt the helper into per-monitor-v2 DPI awareness, before any plugin is loaded.
+///
+/// Without it Windows treats the helper as DPI-unaware: the editor window is sized in 96-DPI
+/// logical pixels and bitmap-stretched, `GetDpiForWindow` reports 96 so the plugin is told a
+/// content scale of 1.0, yet plugins like Kontakt switch their own UI thread to per-monitor
+/// awareness and size their view in physical pixels. On a 150% display the window then comes
+/// out 1.5x too small and the editor is clipped. The main app gets the same mode from its
+/// manifest; the helper has none, so it sets it in code.
+#[cfg(windows)]
+fn init_dpi_awareness() {
+    use windows::Win32::UI::HiDpi::{
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    };
+    // SAFETY: plain process-wide setting, called once before any window exists.
+    match unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) } {
+        Ok(()) => eprintln!("helper: DPI awareness = per-monitor v2"),
+        Err(err) => eprintln!("helper: could not set DPI awareness: {err}"),
+    }
+}
+
+#[cfg(not(windows))]
+fn init_dpi_awareness() {}
+
 enum Backend {
     Vst3(VstPlugin),
     Vst2(Vst2Plugin),
@@ -161,6 +184,7 @@ struct Args {
 fn main() -> Result<()> {
     install_panic_log();
     eprintln!("helper: starting");
+    init_dpi_awareness();
     // Must happen before the plugin is loaded, and must outlive it (see ComGuard).
     let _com = ComGuard(init_com());
     #[cfg(target_os = "macos")]
@@ -280,43 +304,49 @@ fn main() -> Result<()> {
             editor_opened_at = None;
             appkit::perform_close_all();
         }
-        match &mut editor {
-            Some(EditorWindow::Vst2(window)) => window.idle(),
+        let dismissed = match &mut editor {
             Some(EditorWindow::Vst3(window)) => {
-                // The title-bar close button hides the window but tells neither the
-                // plugin nor us. Drop it so the plugin's view is detached; otherwise
-                // the next OpenEditor fails with "Editor already open".
-                if window.closed_by_user() {
-                    editor = None;
-                    eprintln!("helper: editor closed by the user");
-                    send_event(&mut out, &HelperEvent::EditorClosed)?;
-                } else if let Err(err) = window.service_platform_events() {
-                    // Applies plugin-initiated resizes (Kontakt sizes itself after attach).
-                    eprintln!("helper: editor event servicing failed: {err}");
+                // Applies plugin-initiated resizes (IPlugFrame::resizeView) and DPI changes.
+                if let Err(err) = window.service_platform_events() {
+                    eprintln!("helper: editor event servicing failed: {err:#}");
                 }
+                window.closed_by_user()
             }
-            None => {}
+            Some(EditorWindow::Vst2(window)) => {
+                window.idle();
+                window.closed_by_user()
+            }
+            None => false,
+        };
+        if dismissed {
+            // The title-bar close button only *requests* a close (or, on macOS, just hides
+            // the window). Tear the editor down here so the plugin's view is detached before
+            // its window goes away; otherwise the next OpenEditor fails with
+            // "Editor already open".
+            editor = None;
+            eprintln!("helper: editor closed by the user");
+            send_event(&mut out, &HelperEvent::EditorClosed)?;
         }
         while let Ok(request) = rx.try_recv() {
             match request {
-                HelperRequest::OpenEditor => match {
-                    // A plugin allows one editor view at a time: release the
-                    // previous one before asking for another.
+                HelperRequest::OpenEditor => {
+                    // A plugin may allow only one live view (Kontakt), so the old editor has
+                    // to be fully closed before the new one is created.
                     editor = None;
-                    backend.open_editor()
-                } {
-                    Ok(window) => {
-                        #[cfg(target_os = "macos")]
-                        appkit::activate();
-                        editor = Some(window);
-                        #[cfg(target_os = "macos")]
-                        {
-                            editor_opened_at = Some(std::time::Instant::now());
+                    match backend.open_editor() {
+                        Ok(window) => {
+                            #[cfg(target_os = "macos")]
+                            appkit::activate();
+                            editor = Some(window);
+                            #[cfg(target_os = "macos")]
+                            {
+                                editor_opened_at = Some(std::time::Instant::now());
+                            }
+                            send_event(&mut out, &HelperEvent::EditorOpened)?;
                         }
-                        send_event(&mut out, &HelperEvent::EditorOpened)?;
+                        Err(err) => send_error(&mut out, format!("{err:#}"))?,
                     }
-                    Err(err) => send_error(&mut out, format!("{err:#}"))?,
-                },
+                }
                 HelperRequest::CloseEditor => {
                     editor = None;
                     send_event(&mut out, &HelperEvent::EditorClosed)?;
