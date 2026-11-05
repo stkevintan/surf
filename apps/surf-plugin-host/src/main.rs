@@ -187,6 +187,8 @@ fn main() -> Result<()> {
     init_dpi_awareness();
     // Must happen before the plugin is loaded, and must outlive it (see ComGuard).
     let _com = ComGuard(init_com());
+    #[cfg(target_os = "macos")]
+    appkit::init();
     let args = parse_args()?;
     eprintln!("helper: opening shared memory {}", args.shm);
     let map = Arc::new(SharedMap::open(&args.shm)?);
@@ -283,9 +285,25 @@ fn main() -> Result<()> {
         .context("could not spawn helper control thread")?;
 
     let mut editor: Option<EditorWindow> = None;
+    // Debug hook for the `editor_reopen` probe: simulate the user closing the
+    // editor with its title-bar button this many milliseconds after it opens.
+    #[cfg(target_os = "macos")]
+    let test_close_after = std::env::var("SURF_TEST_CLOSE_EDITOR_AFTER_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis);
+    #[cfg(target_os = "macos")]
+    let mut editor_opened_at: Option<std::time::Instant> = None;
     let mut running = true;
     while running {
         pump_messages();
+        #[cfg(target_os = "macos")]
+        if let (Some(after), Some(at)) = (test_close_after, editor_opened_at)
+            && at.elapsed() >= after
+        {
+            editor_opened_at = None;
+            appkit::perform_close_all();
+        }
         let dismissed = match &mut editor {
             Some(EditorWindow::Vst3(window)) => {
                 // Applies plugin-initiated resizes (IPlugFrame::resizeView) and DPI changes.
@@ -301,9 +319,12 @@ fn main() -> Result<()> {
             None => false,
         };
         if dismissed {
-            // The title-bar close button only *requests* a close; tear the editor down
-            // here so the view is detached before its window is destroyed.
+            // The title-bar close button only *requests* a close (or, on macOS, just hides
+            // the window). Tear the editor down here so the plugin's view is detached before
+            // its window goes away; otherwise the next OpenEditor fails with
+            // "Editor already open".
             editor = None;
+            eprintln!("helper: editor closed by the user");
             send_event(&mut out, &HelperEvent::EditorClosed)?;
         }
         while let Ok(request) = rx.try_recv() {
@@ -314,7 +335,13 @@ fn main() -> Result<()> {
                     editor = None;
                     match backend.open_editor() {
                         Ok(window) => {
+                            #[cfg(target_os = "macos")]
+                            appkit::activate();
                             editor = Some(window);
+                            #[cfg(target_os = "macos")]
+                            {
+                                editor_opened_at = Some(std::time::Instant::now());
+                            }
                             send_event(&mut out, &HelperEvent::EditorOpened)?;
                         }
                         Err(err) => send_error(&mut out, format!("{err:#}"))?,
@@ -466,9 +493,84 @@ fn pump_messages() {
     }
 }
 
-/// Editor windows on macOS/Linux are not wired up yet (see docs/architecture.md),
-/// so there is no event queue to drain.
-#[cfg(not(windows))]
+/// AppKit only shows and draws windows for a process that is a launched
+/// `NSApplication` and drains its event queue on the main thread. Without this
+/// a plugin editor window is created but never appears, and the Dock icon does
+/// nothing when clicked.
+#[cfg(target_os = "macos")]
+mod appkit {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSEventMask};
+    use objc2_foundation::{NSDate, NSDefaultRunLoopMode};
+
+    /// Make this process a regular app. Call once, on the main thread, before
+    /// any plugin is loaded.
+    pub fn init() {
+        let Some(mtm) = MainThreadMarker::new() else {
+            eprintln!("helper: not on the main thread; editor windows will not show");
+            return;
+        };
+        let app = NSApplication::sharedApplication(mtm);
+        // Regular, not Accessory: the editor window should be reachable from
+        // the Dock and Cmd-Tab like any app window.
+        app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+        app.finishLaunching();
+    }
+
+    /// Bring this process to the front, so a newly opened editor is not hidden
+    /// behind the Surf window that asked for it.
+    pub fn activate() {
+        if let Some(mtm) = MainThreadMarker::new() {
+            #[allow(deprecated)] // `activate` needs macOS 14; this works on all versions.
+            NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+        }
+    }
+
+    /// Test hook: press the close button of every visible window, exactly as a
+    /// user clicking the title bar would (`performClose:`). Used by the
+    /// `editor_reopen` probe through `SURF_TEST_CLOSE_EDITOR_AFTER_MS`.
+    pub fn perform_close_all() {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        for window in NSApplication::sharedApplication(mtm).windows().iter() {
+            if window.isVisible() {
+                window.performClose(None);
+            }
+        }
+    }
+
+    /// Dispatch every pending event without blocking.
+    pub fn pump() {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let app = NSApplication::sharedApplication(mtm);
+        let now = NSDate::distantPast();
+        loop {
+            // SAFETY: called on the main thread with a valid mode and date.
+            let event = unsafe {
+                app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                    NSEventMask::Any,
+                    Some(&now),
+                    NSDefaultRunLoopMode,
+                    true,
+                )
+            };
+            let Some(event) = event else { break };
+            app.sendEvent(&event);
+        }
+        app.updateWindows();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn pump_messages() {
+    appkit::pump();
+}
+
+/// Linux editors (X11 + `IRunLoop`) are not wired up yet.
+#[cfg(all(unix, not(target_os = "macos")))]
 fn pump_messages() {}
 
 /// Render audio into the shared ring, keeping it topped up to a fixed cushion.

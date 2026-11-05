@@ -1,6 +1,6 @@
 # Using plugin instruments
 
-Surf plays through its built-in piano by default. It can also host VST3 and VST2 instruments. On Windows both formats are tested with real instruments, including their editors. On macOS, VST2 audio, MIDI, state and rendering are tested with test plugins. Plugin editors don't open there yet, and VST3 is untested. Every plugin runs in its own `surf-vst-host` process, so a crashing plugin never takes down the app: Surf falls back to the built-in piano and keeps playing.
+Surf plays through its built-in piano by default. It can also host VST3 and VST2 instruments. On Windows both formats are tested with real instruments, including their editors. On macOS, Kontakt 8 (VST3) is tested: it loads, saves its state, and its editor opens. VST2 audio, MIDI, state and rendering are tested there with test plugins; VST2 editors don't open on macOS yet. Every plugin runs in its own `surf-vst-host` process, so a crashing plugin never takes down the app: Surf falls back to the built-in piano and keeps playing.
 
 ## Loading an instrument
 
