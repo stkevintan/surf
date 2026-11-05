@@ -1,0 +1,26 @@
+[package]
+name = "surf-ui"
+description = "Surf's GPUI interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+surf-core.workspace = true
+surf-midi.workspace = true
+surf-audio.workspace = true
+surf-platform.workspace = true
+surf-plugin.workspace = true
+anyhow.workspace = true
+gpui = { workspace = true, features = ["windows-manifest"] }
+rfd.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# MultiByteToWideChar, to decode the helper log's ANSI/GBK plugin output.
+windows = { workspace = true, features = ["Win32_Globalization"] }
+
+# macOS: `runtime_shaders` compiles GPUI's Metal shaders at startup instead of in
+# the build script, which would otherwise need full Xcode (`xcrun metal`) rather
+# than just the Command Line Tools. `font-kit` backs the macOS text system.
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui = { workspace = true, features = ["runtime_shaders", "font-kit"] }

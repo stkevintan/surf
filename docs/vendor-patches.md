@@ -23,6 +23,7 @@ A normal dependency can't express "0.10.0 plus three local fixes". Committing th
 | 3 | `open_editor` treats a `getSize()` failure as fatal. Kontakt's QML editor fails it before `attached()`, and some editors return `kResultOk` with an empty rect | **Local patch** in `plugin_impl.rs`: non-fatal, default 800×600 (matches `get_editor_size()` in the same file). |
 | 4 | `PluginWindow::open` creates a throw-away `IPlugView` to query the size. Kontakt tolerates only one view, so the real one then fails | **Local patch** in `window.rs`: skip the pre-query, open at 800×600, and let `IPlugFrame::resizeView` report the real size after attach. |
 | 5 | Regression in 0.10.0: `module_info.rs` fails the whole load when `IPluginCompatibility` metadata is unusable. Kontakt 8 declares the class but `getCompatibilityJSON` returns `kResultFalse` | **Local patch** in `module_info.rs`: log and return an empty list. The data is optional. Upstream PR #16 addresses the same issue. |
+| 6 | `PluginWindow::open` (Windows) leaves the window at 800×600 after attach and waits for `resizeView`. Kontakt does not send one, so the window and editor sizes disagree | **Local patch** in `window.rs`: after `attached()`, read `attached_editor_size()` and fit the window before showing it. `resize_native_window` uses `AdjustWindowRectExForDpi` for the window's own DPI. |
 
 #3 and #4 have no upstream issue or PR yet and are good candidates to contribute back. Upstream requires `cargo fmt`, `clippy -D warnings`, a regression test, and a Keep-a-Changelog entry.
 

@@ -6,7 +6,7 @@
 > - **L2** describes each module: its job, API, and implementation.
 > - **L3** describes feature details: algorithms, data layouts, protocols, timing.
 >
-> Each section separates **Current** (what is in `src/` at commit `708ea20`) from **Target** (the agreed refactor toward a modular, cross-platform workspace). The UI design lives in [design/README.md](design/README.md); this document covers everything below the pixels.
+> Each section separates **Current** (what the code does today) from **Target** (where it is heading). Phase 1, the workspace split and platform layer, is done; see §1.7 and the roadmap at the end. The UI design lives in [design/README.md](design/README.md); this document covers everything below the pixels.
 
 ---
 
@@ -49,7 +49,7 @@ surf (UI process)                                        surf-plugin-host  (one 
 - **Control plane:** line-delimited JSON over the host's stdin/stdout. It carries requests and events: load state, open editor, render.
 - **Data plane:** one shared-memory region per host with two lock-free single-producer/single-consumer (SPSC) rings, one for audio and one for MIDI. The real-time paths never touch the control pipe.
 
-*Current:* one host process at a time (`surf-vst-host.exe`), Windows only. *Target:* one host per plugin-backed track, all three platforms.
+*Current:* one host process at a time (`surf-vst-host`). It builds and runs on Windows and macOS; plugin loading is only verified on Windows. *Target:* one host per plugin-backed track, all three platforms.
 
 ### 1.3 Layers
 
@@ -77,7 +77,7 @@ Dependencies only point downward. `surf-core` has no I/O and no platform code, s
 | Thread | Owner | May block? | May allocate? | Talks to others via |
 |---|---|---|---|---|
 | UI main | GPUI | yes (briefly) | yes | `Command` channel → audio; atomics ← audio |
-| Audio callback | cpal | **no** | **no** (target; see §3.2) | `try_lock` on Core, `try_recv` commands, atomics out |
+| Audio callback | cpal | **no** | **no** (except `Command::Play`, which moves a `Timeline` in) | `try_lock` on Core, `try_recv` commands, atomics out |
 | MIDI driver callback | OS | no | no | `Command` channel → audio; timed events → UI |
 | Host audio | host binary | sleeps 1 ms between top-ups | no | SPSC rings |
 | Host control | host binary | yes | yes | JSON pipe, `mpsc` to host main |
@@ -112,62 +112,77 @@ Platform differences are pushed down to a few narrow traits; everything above th
 | Concern | Windows | macOS | Linux |
 |---|---|---|---|
 | Audio out | cpal (WASAPI/ASIO) | cpal (CoreAudio) | cpal (ALSA/PipeWire via ALSA) |
-| MIDI in | WinMM *(current)* → `midir` | `midir` (CoreMIDI) | `midir` (ALSA seq) |
+| MIDI in | WinMM | CoreMIDI (`coremidi` 0.8) | ALSA sequencer (`alsa` 0.11) |
 | Shared memory | `CreateFileMapping` | `shm_open` + `mmap` | `shm_open` + `mmap` |
 | RT priority (host audio) | MMCSS "Pro Audio" + `timeBeginPeriod(1)` | `thread_policy_set` (time-constraint) | `SCHED_FIFO` via rtkit (optional) |
-| Plugin formats | VST3, VST2, CLAP | VST3 (bundles), CLAP | VST3, CLAP |
+| Plugin formats | VST3, VST2 (`.dll`) | VST3, VST2 (`.vst` bundle); editors not yet | VST3, VST2 (`.so`); editors not yet |
+| Format rules | `surf-plugin::format` maps a path to a format and, for a macOS bundle, to its Mach-O binary (via `Info.plist`) | | |
 | Editor parent window | HWND | NSView | X11 window |
 | Data dir | `%APPDATA%\Surf` | `~/Library/Application Support/Surf` | `$XDG_DATA_HOME/surf` |
 | Scan roots | `Common Files\VST3`, `VSTPlugins` | `/Library/Audio/Plug-Ins/VST3`, `~/Library/…` | `~/.vst3`, `/usr/lib/vst3` |
+
+Why not `midir`: midir 0.11 needs `coremidi` 0.9, which needs `core-foundation` ≥ 0.10.1, but GPUI 0.2.2 pins `core-foundation = "=0.10.0"`; midir 0.10 links an older `alsa` than cpal, and Cargo allows only one crate per `links = "alsa"`. Calling the three OS APIs directly avoids both conflicts and is about 300 lines.
+
+macOS build: GPUI is built with `runtime_shaders`, so its Metal shaders compile at startup and the build needs only the Command Line Tools, not full Xcode.
 
 Main-thread constraint: on macOS, GPUI and any second windowing stack (winit/Bevy for `surf-visual`) both need the main thread. A full-screen stage renderer must therefore be its own process, which is the same pattern as plugin hosts.
 
 ### 1.7 Repository layout
 
-*Current*
+*Current (after Phase 1)*
 
 ```
-src/
-  main.rs, lib.rs, app.rs (UI, 2.2k lines)
-  song.rs  recorder.rs  midi_input.rs  paths.rs
-  audio/   engine.rs synth.rs render.rs ipc.rs remote.rs
-           vst.rs vst2.rs vst_client.rs vst_scan.rs
-  bin/vst_helper.rs                         → surf-vst-host
-vendor/vst3-host, vendor/vst                patched forks (see docs/vendor-patches.md)
-examples/                                   probes and smoke tests
-```
-
-*Target*
-
-```
+src/main.rs                the app binary (`surf`), plus a lib facade for examples/
 crates/
-  surf-core/          model, commands, undo, tempo map, quantize
-  surf-midi/          MidiInput trait + midir backend, SMF read/write
-  surf-audio/         engine, Instrument trait, synth, offline render
-  surf-plugin/        protocol, client, shm, scan, backends/{vst3,vst2,clap}
-  surf-platform/      SharedRegion, rt_priority, data_dir, editor parent
-  surf-ui/            GPUI views + theme.rs (from docs/design/tokens.json)
-  surf-visual/        wgpu stage renderer (phase 4)
-apps/surf/            binary: wiring only
-apps/surf-plugin-host/  binary: one plugin per process
+  surf-core/               song model, tempo map, recorder (pure: no I/O, no deps)
+  surf-midi/               live input (WinMM / CoreMIDI / ALSA seq), SMF read/write
+  surf-audio/              engine, Instrument trait, built-in synth, offline render
+  surf-platform/           SharedRegion, promote_audio_thread, data_dir
+  surf-plugin/             protocol, client, remote, shm rings, scan;
+                           backends/{vst3, vst2 (Windows)} behind feature `host`
+  surf-ui/                 GPUI app (still the original single view, app.rs)
+apps/surf-plugin-host/     the `surf-vst-host` binary
+vendor/vst3-host, vendor/vst   patched forks (see docs/vendor-patches.md)
+examples/                  probes and smoke tests; Windows-only probes compile to a stub elsewhere
 ```
 
-Migration from current to target (file → crate):
+Dependency graph (normal dependencies only):
 
-| Current | Target |
+```
+surf (app) ──▶ surf-ui ──▶ surf-plugin ──▶ surf-audio ──▶ surf-core
+                  │             └────────▶ surf-platform
+                  ├──▶ surf-midi ──▶ surf-core
+                  └──▶ surf-audio, surf-platform, surf-core
+surf-plugin-host ──▶ surf-plugin[host] (+ vst3-host, vst on Windows)
+```
+
+The app binary does not link `vst3-host` or `vst`; only the host does (`cargo tree -p surf` shows neither).
+
+*Still to come*
+
+```
+crates/surf-core/          + Project/Track/Region, commands, undo, quantize (phase 2)
+crates/surf-ui/            split app.rs into shell, tracks, roll, mixer, … + theme.rs (phase 2–3)
+crates/surf-visual/        wgpu stage renderer (phase 4)
+```
+
+Where the original files went:
+
+| Before | Now |
 |---|---|
-| `song.rs` (model, tempo) | `surf-core::{project, tempo}` |
-| `song.rs` (SMF parse/write) | `surf-midi::smf` |
-| `recorder.rs` | `surf-core::record` (pure, takes timestamps) |
-| `midi_input.rs` | `surf-midi::input` (+ `midir` backend) |
-| `audio/engine.rs`, `synth.rs`, `render.rs` | `surf-audio` |
-| `audio/ipc.rs` | `surf-plugin::shm` over `surf-platform::SharedRegion` |
-| `audio/vst_client.rs`, `remote.rs` | `surf-plugin::client` |
-| `audio/vst.rs`, `vst2.rs` | `surf-plugin::backends` (only linked into the host binary) |
-| `audio/vst_scan.rs` | `surf-plugin::scan` (per-OS roots) |
-| `bin/vst_helper.rs` | `apps/surf-plugin-host` |
+| `song.rs` (model, tempo) | `surf-core::song` |
+| `song.rs` (SMF parse/write) | `surf-midi::smf` (`load`, `save`, `from_bytes`, `to_bytes`) |
+| `recorder.rs` | `surf-core::recorder` |
+| `midi_input.rs` | `surf-midi::input` (`MidiHub`, backends `winmm` / `coremidi_backend` / `alsa_seq`) |
+| `audio/mod.rs`, `engine.rs`, `synth.rs`, `render.rs` | `surf-audio` |
+| `audio/ipc.rs` | `surf-plugin::shm`, built on `surf-platform::shm::SharedRegion` |
+| `audio/vst_client.rs` | `surf-plugin::client` + `surf-plugin::protocol` |
+| `audio/remote.rs` | `surf-plugin::remote` |
+| `audio/vst.rs`, `vst2.rs` | `surf-plugin::backends::{vst3, vst2}` |
+| `audio/vst_scan.rs` | `surf-plugin::scan` |
 | `paths.rs` | `surf-platform::dirs` |
-| `app.rs` | `surf-ui::{shell, tracks, roll, mixer, inspector, library, perform}` |
+| `bin/vst_helper.rs` | `apps/surf-plugin-host` (MMCSS code moved to `surf-platform::rt`) |
+| `app.rs` | `surf-ui::app` (unchanged view; split in phase 2) |
 
 ---
 
@@ -212,7 +227,7 @@ pub fn playback_events(p: &Project, from: Tick, to: Tick) -> impl Iterator<Item 
 
 **Input.**
 - *Current:* `MidiHub` (`midi_input.rs`) enumerates WinMM devices and opens one with `midiInOpen` and a C callback. The callback parses status bytes (`parse_message`: note on/off, CC 64), sends a `Command` to the audio engine, and sends `TimedMidi { at: Instant, event }` to the UI channel. `drain()` is polled by the UI once per frame.
-- *Target:* a `MidiInput` trait with the same two outputs (an audio command sink and a timestamped UI stream), backed by `midir` on all three OSes. The original reason for avoiding `midir` was an ALSA `links` conflict with cpal (research doc §0.3); it must be re-checked against cpal 0.18 before the switch.
+- *Now:* `MidiHub::new(sink: NoteSink)`. The sink is a closure called on the driver thread; the app points it at the audio engine. `surf-midi` therefore does not depend on `surf-audio`. Each OS backend exposes `list_ports()` and `open(index, deliver)`, and shares one `parse_message`. The CoreMIDI backend also walks multi-message packets and running status, and skips SysEx and real-time bytes.
 
 **Files** (`song.rs` today):
 - Import with `midly`: accept metrical or SMPTE timing (SMPTE falls back to the default PPQ), read tempo and time-signature meta events, pair note on/off per `(channel, key)` with a stack (an overlapping same-key note-off closes the most recent note-on), drop drum channel 10 and keys above 127, then extend durations under sustain (L3 §3.6).
@@ -257,7 +272,8 @@ pub trait Instrument: Send {          // src/audio/mod.rs
 
 | Part | Current file | Role |
 |---|---|---|
-| `scan` | `vst_scan.rs` | Walk standard roots (+ `SURF_VST_SCAN`) for `.vst3` (recursive, depth ≤ 6) and `.dll` (top level of VST2 roots). Never loads anything. Max 400 results, sorted, deduplicated. |
+| `scan` | `vst_scan.rs` | Walk the standard roots (+ `SURF_VST_SCAN`) recursively, up to depth 6, for `.vst3` and this OS's VST2 type (from VST2 roots only). Never loads anything. Max 400 results, sorted, deduplicated. |
+| `format` | — | Format detection by extension, VST2 bundle → binary resolution, and `Format::has_editor`. |
 | `shm` | `ipc.rs` | Shared region layout and SPSC rings (L3 §3.3). |
 | `protocol` | `vst_client.rs` (`HelperRequest`/`HelperEvent`) | serde-tagged JSON enums (L3 §3.4). |
 | `client` | `vst_client.rs` (`VstClient`) | Spawn the host, handshake, request/response with timeouts, health check, log capture. |
@@ -282,7 +298,7 @@ Startup order matters, because each step fixes a real Kontakt failure:
 2. Initialize COM (STA) on Windows. The guard outlives the plugin.
 3. Open the shared map **before** loading the plugin.
 4. `chdir` + `SetDllDirectoryW` to the plugin's parent folder (opt out with `SURF_NO_CHDIR`).
-5. Pick the backend by extension: `.dll` is VST2, everything else is VST3. Load it with the optional state blob.
+5. Pick the backend with `format::detect`: this OS's VST2 type goes to the VST2 backend, everything else to VST3. Load it with the optional state blob.
 6. Set `helper_alive`, spawn the audio thread, send `Ready`.
 7. Spawn the control thread (reads stdin lines into an `mpsc` channel). When stdin closes, it sends `Shutdown`.
 8. Main loop, every 2 ms: pump OS messages (the editor window needs it), idle the VST2 editor, handle requests, exit if `main_alive` is false.
@@ -353,9 +369,8 @@ UI audio callback (cpal, ~480 frames)          host audio thread (MMCSS, 1 ms sl
 - **Backlog trim.** If the consumer stalls (a long GUI operation), the UI drops audio beyond 1536 frames (32 ms) so latency cannot grow without bound.
 - **Underrun.** It plays silence and never repeats stale audio.
 - **Known gap.** `MidiMsg` carries no frame offset; the host applies MIDI at the start of its next 64-frame block, giving roughly 1–11 ms of jitter on plugin playback. *Target:* put a target frame index in the `_pad` field and split the plugin block at event offsets.
-- **Known gap.** `Core::trigger` allocates a `Vec` per chunk that has note-offs. *Target:* a preallocated scratch buffer.
 
-### 3.3 Shared-memory layout (`ipc.rs`)
+### 3.3 Shared-memory layout (`surf-plugin::shm`)
 
 ```
 offset  size   field
@@ -383,7 +398,7 @@ One JSON object per line, tagged with serde (`"cmd"` for requests, `"event"` for
 | Request (`cmd`) | Fields | Reply (`event`) |
 |---|---|---|
 | `OpenEditor` | — | `EditorOpened` \| `Error` |
-| `CloseEditor` | — | `EditorOpened` *(bug: should be a distinct `EditorClosed`)* |
+| `CloseEditor` | — | `EditorClosed` |
 | `SaveState` | `path` | `StateSaved { bytes, path }` \| `Error` |
 | `LoadState` | `path` | `StateLoaded` \| `Error` |
 | `Render` | `output, sample_rate, notes: [RenderNote], duration, tail_secs` | `RenderDone { path, duration, peak }` \| `Error` |
@@ -392,7 +407,7 @@ One JSON object per line, tagged with serde (`"cmd"` for requests, `"event"` for
 
 The host sends `Ready { name, sample_rate }` once, unprompted. `Exited` is synthesized by the client's stdout reader on EOF. `RenderNote { key, velocity, channel, start, end }` is in seconds.
 
-*Target additions:* `EditorClosed`, `RenderProgress { frac }` for async export, `SetParam`/`ParamChanged` for automation, and a protocol version number in `Ready`.
+*Target additions:* `RenderProgress { frac }` for async export, `SetParam`/`ParamChanged` for automation, and a protocol version number in `Ready`.
 
 ### 3.5 Live input, recording, and visual feedback
 
@@ -452,7 +467,7 @@ Each of these comes from a reproduced failure; details are in [troubleshooting.m
 ### 3.11 Plugin discovery
 
 - VST3 roots are scanned recursively up to depth 6. A `.vst3` file or bundle directory is one entry, named by its file stem. Stub files are skipped.
-- VST2 roots are scanned for `.dll` at the top level only, and those entries are flagged `vst2`.
+- VST2 roots are scanned recursively for this OS's VST2 type (`.dll`, `.vst` bundle, `.so`), and those entries are flagged `vst2`. On macOS the loader opens `Contents/MacOS/<CFBundleExecutable>` inside the bundle.
 - Extensions are matched case-insensitively. Results are capped at 400, sorted, and deduplicated.
 - `scan_folder(dir)` backs `LOAD VST`: if the folder holds one plugin it loads it directly; if it holds several, it opens the picker.
 
@@ -475,9 +490,12 @@ Each of these comes from a reproduced failure; details are in [troubleshooting.m
 
 ### 3.13 Testing
 
-- **Unit tests (current, 15):** tempo map round trip, MIDI write/read round trip, recorded notes → ticks, synth note/release/sustain, non-silent 24-bit stereo WAV, five scan rules.
+- **Unit tests (current, 27):** run with `cargo test --workspace --lib`. They cover the tempo map, MIDI file round trip, recorded notes → ticks, synth note/release/sustain, non-silent 24-bit stereo WAV, and six scan rules. Also covered:
+  - MIDI message parsing, CoreMIDI packet walking, and a CoreMIDI loopback through a virtual source into `MidiHub` (macOS only, no hardware needed);
+  - shared memory create/open (`surf-platform`), plus the shm rings across two mappings: header, MIDI order, a two-thread audio stream across several wraps, and full-ring rejection;
+  - the JSON wire format of the control protocol.
 - **Probes** (`examples/`): load/render/state smoke tests per format (`vst_probe`, `vst_render`, `vst2_probe`, `helper_audio`, `helper_render`) and diagnostics for host failures (`raw_load_probe`, `crash_probe`, `fdpair_probe`, `shm_probe`, `latency_probe`, `glitch_probe`).
-- **Target:** `surf-core` commands get property tests (apply then undo is the identity); the shared-memory rings get a loom or stress test; the protocol gets golden JSON fixtures, so the UI and host can't drift apart.
+- **Target:** `surf-core` commands get property tests (apply then undo is the identity), and CI runs the suite on Windows, macOS and Linux.
 
 ---
 
@@ -485,7 +503,7 @@ Each of these comes from a reproduced failure; details are in [troubleshooting.m
 
 | Phase | Scope | Main sections |
 |---|---|---|
-| 1 | Workspace split + platform traits; macOS builds and runs built-in synth + MIDI + playback; Windows behavior unchanged | §1.6, §1.7, §2.7 |
+| 1 ✅ | Workspace split + platform layer; macOS builds and runs built-in synth + MIDI + playback; Windows behavior unchanged | §1.6, §1.7, §2.7 |
 | 2 | `surf-core` model + commands + new transport; Logic-style shell; Perform view in GPUI | §2.1, §2.6, §3.1 |
 | 3 | Piano Roll, Event List, Mixer with multi-track engine; sample-accurate plugin MIDI; async export | §2.3, §3.2, §3.8 |
 | 4 | `surf-visual` stage renderer, video export | §2.8 |

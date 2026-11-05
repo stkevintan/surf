@@ -1,0 +1,8 @@
+[package]
+name = "surf-core"
+description = "Surf's musical data model: notes, tempo map, recording"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

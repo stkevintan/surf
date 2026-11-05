@@ -335,10 +335,20 @@ impl PluginWindow {
                 }
                 match plugin.open_editor(window_handle) {
                     Ok(()) => {
+                        // The window was created at a default size (see above). Now that the
+                        // view is attached it knows its real size, so fit the window to it
+                        // before showing. Not every plugin follows up with `resizeView`
+                        // (Kontakt does not reliably), so do not wait for one.
+                        let attached = plugin.attached_editor_size();
                         drop(plugin);
+                        self.native_window = Some(hwnd);
+                        match attached {
+                            Ok(Some((w, h))) => self.resize_native_window(w, h),
+                            Ok(None) => {}
+                            Err(e) => log::debug!("attached editor size unavailable: {e}"),
+                        }
                         ShowWindow(hwnd, SW_SHOW);
                         UpdateWindow(hwnd);
-                        self.native_window = Some(hwnd);
                     }
                     Err(e) => {
                         drop(plugin);
@@ -527,7 +537,20 @@ impl PluginWindow {
                 bottom: height,
             };
             unsafe {
-                winapi::um::winuser::AdjustWindowRectEx(&mut rect, WS_OVERLAPPEDWINDOW, 0, 0);
+                // Chrome thickness depends on the monitor's DPI; plain AdjustWindowRectEx uses
+                // the system DPI and is off by a few pixels on a per-monitor-aware host.
+                let dpi = winapi::um::winuser::GetDpiForWindow(hwnd);
+                if dpi > 0 {
+                    winapi::um::winuser::AdjustWindowRectExForDpi(
+                        &mut rect,
+                        WS_OVERLAPPEDWINDOW,
+                        0,
+                        0,
+                        dpi,
+                    );
+                } else {
+                    winapi::um::winuser::AdjustWindowRectEx(&mut rect, WS_OVERLAPPEDWINDOW, 0, 0);
+                }
                 SetWindowPos(
                     hwnd,
                     std::ptr::null_mut(),

@@ -1,8 +1,8 @@
 //! Render through the isolated helper:
 //! `cargo run --example helper_render -- <bundle.vst3> out.wav`
 
-use surf::audio::vst_client::{RenderNote, VstClient};
-use surf::song::Song;
+use surf::plugin::client::{RenderNote, VstClient};
+use surf::core::song::Song;
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);

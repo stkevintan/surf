@@ -16,7 +16,7 @@
 use std::time::{Duration, Instant};
 
 use surf::audio::Instrument;
-use surf::audio::vst_client::VstClient;
+use surf::plugin::client::VstClient;
 
 const SR: f64 = 48_000.0;
 /// The measured WASAPI period on this machine (see `examples/latency_probe.rs`).
@@ -27,7 +27,7 @@ fn main() -> anyhow::Result<()> {
     let path = std::env::args()
         .nth(1)
         .expect("usage: glitch_probe <bundle.vst3>");
-    let mut client = VstClient::load(&path, 48_000, None)?;
+    let client = VstClient::load(&path, 48_000, None)?;
     let map = client.shared_map();
     let mut instrument = client.instrument();
 

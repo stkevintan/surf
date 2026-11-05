@@ -2,7 +2,7 @@
 //! `cargo run --example render_demo -- demo.wav`
 
 use surf::audio::render::{RenderOptions, render_song_to_wav};
-use surf::song::Song;
+use surf::core::song::Song;
 
 fn main() -> anyhow::Result<()> {
     let path = std::env::args()

@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, point, px, size};
-use surf::app::SurfApp;
+use surf_ui::SurfApp;
 
 fn main() {
     Application::new().run(|cx: &mut App| {

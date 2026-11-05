@@ -5,14 +5,14 @@
 //! cargo run --example shm_probe -- "C:\Program Files\Common Files\VST3\Kontakt 8.vst3"
 //! ```
 
-use surf::audio::ipc::SharedMap;
-use surf::audio::vst::VstPlugin;
+use surf::plugin::shm::SharedMap;
+use surf::plugin::backends::vst3::VstPlugin;
 
 fn main() -> anyhow::Result<()> {
     let path = std::env::args()
         .nth(1)
         .expect("usage: shm_probe <path-to.vst3>");
-    let name = surf::audio::ipc::make_name();
+    let name = surf::plugin::shm::make_name();
     let map = SharedMap::create(&name)?;
     println!("shared memory {name} mapped; loading {path}");
     let plugin = VstPlugin::load(&path, 48_000)?;

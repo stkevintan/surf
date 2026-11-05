@@ -15,7 +15,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use parking_lot::Mutex;
 
 use super::Instrument;
-use crate::song::Timeline;
+use surf_core::song::Timeline;
 
 const CHUNK: usize = 64;
 const MAX_BLOCK: usize = 8192;
@@ -70,6 +70,9 @@ struct Core {
     timeline: Option<Timeline>,
     next_note: usize,
     active: Vec<ActiveNote>,
+    /// Scratch for keys released in the current chunk. Preallocated so the
+    /// audio callback never allocates.
+    ended: Vec<u8>,
     pos_frames: u64,
     duration_frames: u64,
     playing: bool,
@@ -87,7 +90,8 @@ impl Core {
             instrument,
             timeline: None,
             next_note: 0,
-            active: Vec::new(),
+            active: Vec::with_capacity(256),
+            ended: Vec::with_capacity(256),
             pos_frames: 0,
             duration_frames: 0,
             playing: false,
@@ -218,7 +222,8 @@ impl Core {
         };
 
         // Note-offs first so back-to-back notes on the same key retrigger cleanly.
-        let mut ended = Vec::new();
+        let ended = &mut self.ended;
+        ended.clear();
         self.active.retain(|note| {
             if note.end_frame <= end {
                 ended.push(note.key);
@@ -227,7 +232,7 @@ impl Core {
                 true
             }
         });
-        for key in ended {
+        for &key in &self.ended {
             self.instrument.note_off(key);
         }
 

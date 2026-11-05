@@ -1,5 +1,5 @@
-//! Shared-memory audio/MIDI transport between the UI process and the VST3
-//! helper process.
+//! Shared-memory audio/MIDI transport between the UI process and a plugin
+//! host process.
 //!
 //! Layout is a fixed header followed by two SPSC rings:
 //!
@@ -13,18 +13,12 @@
 //! are monotonic framecounts; only the producer advances write, only the
 //! consumer advances read.
 
-use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use anyhow::{Context, Result};
-use windows::core::HSTRING;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-use windows::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
-    OpenFileMappingW, PAGE_READWRITE, UnmapViewOfFile,
-};
+use anyhow::Result;
+use surf_platform::shm::SharedRegion;
 
 pub const AUDIO_CAPACITY: usize = 16_384; // stereo frames (~341 ms @ 48 kHz)
 pub const MIDI_CAPACITY: usize = 1_024;
@@ -103,9 +97,8 @@ impl MidiMsg {
 }
 
 pub struct SharedMap {
+    region: SharedRegion,
     ptr: *mut u8,
-    handle: HANDLE,
-    _private: (),
 }
 
 // The mapping is shared by the UI and helper process; access is synchronised
@@ -115,33 +108,11 @@ unsafe impl Sync for SharedMap {}
 
 impl SharedMap {
     pub fn create(name: &str) -> Result<Self> {
-        let name = HSTRING::from(name);
-        let handle = unsafe {
-            CreateFileMappingW(
-                INVALID_HANDLE_VALUE,
-                None,
-                PAGE_READWRITE,
-                0,
-                TOTAL_SIZE as u32,
-                &name,
-            )
-        }
-        .context("CreateFileMappingW failed")?;
-        let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, TOTAL_SIZE) };
-        if view.Value.is_null() {
-            unsafe {
-                let _ = CloseHandle(handle);
-            }
-            anyhow::bail!("MapViewOfFile failed");
-        }
+        let region = SharedRegion::create(name, TOTAL_SIZE)?;
         let map = Self {
-            ptr: view.Value as *mut u8,
-            handle,
-            _private: (),
+            ptr: region.as_ptr(),
+            region,
         };
-        unsafe {
-            ptr::write_bytes(map.ptr, 0, TOTAL_SIZE);
-        }
         map.atomic_u64(OFF_MAGIC).store(MAGIC, Ordering::Release);
         map.set_helper_alive(false);
         map.atomic_u32(OFF_MAIN_ALIVE).store(1, Ordering::Release);
@@ -149,25 +120,20 @@ impl SharedMap {
     }
 
     pub fn open(name: &str) -> Result<Self> {
-        let name = HSTRING::from(name);
-        let handle = unsafe { OpenFileMappingW(FILE_MAP_ALL_ACCESS.0, false, &name) }
-            .context("OpenFileMappingW failed")?;
-        let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, TOTAL_SIZE) };
-        if view.Value.is_null() {
-            unsafe {
-                let _ = CloseHandle(handle);
-            }
-            anyhow::bail!("MapViewOfFile failed");
-        }
+        let region = SharedRegion::open(name, TOTAL_SIZE)?;
         let map = Self {
-            ptr: view.Value as *mut u8,
-            handle,
-            _private: (),
+            ptr: region.as_ptr(),
+            region,
         };
         if map.atomic_u64(OFF_MAGIC).load(Ordering::Acquire) != MAGIC {
             anyhow::bail!("shared memory magic mismatch");
         }
         Ok(map)
+    }
+
+    /// Size of the mapping, for diagnostics.
+    pub fn size(&self) -> usize {
+        self.region.len()
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -315,24 +281,111 @@ impl SharedMap {
     }
 }
 
-impl Drop for SharedMap {
-    fn drop(&mut self) {
-        unsafe {
-            let view = MEMORY_MAPPED_VIEW_ADDRESS {
-                Value: self.ptr as *mut c_void,
-            };
-            let _ = UnmapViewOfFile(view);
-            let _ = CloseHandle(self.handle);
-        }
-    }
-}
+pub use surf_platform::shm::make_name;
 
-/// Generate a per-instance local mapping name.
-pub fn make_name() -> String {
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("Local\\SurfVst-{pid}-{nanos}")
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    /// Two mappings of one region, as the UI and the host process would hold.
+    fn pair() -> (SharedMap, SharedMap) {
+        let name = make_name();
+        let creator = SharedMap::create(&name).unwrap();
+        let opener = SharedMap::open(&name).unwrap();
+        (creator, opener)
+    }
+
+    #[test]
+    fn header_is_shared_between_mappings() {
+        let (ui, host) = pair();
+        ui.set_sample_rate(44_100);
+        assert_eq!(host.sample_rate(), 44_100);
+        assert!(!ui.helper_alive());
+        host.set_helper_alive(true);
+        assert!(ui.helper_alive());
+        assert!(host.main_alive(), "creator marks the main process alive");
+    }
+
+    #[test]
+    fn midi_crosses_the_mapping_in_order() {
+        let (ui, host) = pair();
+        assert!(ui.push_midi(MidiMsg::note_on(60, 100)));
+        assert!(ui.push_midi(MidiMsg::sustain(true)));
+        assert!(ui.push_midi(MidiMsg::note_off(60)));
+        let kinds: Vec<_> = std::iter::from_fn(|| host.pop_midi())
+            .map(|m| (m.kind, m.a, m.b))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (MidiKind::NoteOn as u32, 60, 100),
+                (MidiKind::Sustain as u32, 1, 0),
+                (MidiKind::NoteOff as u32, 60, 0),
+            ]
+        );
+    }
+
+    /// The host's real pattern (64-frame blocks, topped up to a cushion) against
+    /// the UI's (480-frame device buffers), on two threads, across the wrap
+    /// point several times. Every sample must arrive once, in order.
+    #[test]
+    fn audio_streams_intact_across_threads_and_wraps() {
+        let (ui, host) = pair();
+        let host = Arc::new(host);
+        let total_frames: u64 = AUDIO_CAPACITY as u64 * 4 + 37;
+
+        let producer = {
+            let host = host.clone();
+            std::thread::spawn(move || {
+                let mut next = 0u64;
+                let mut block = [0.0f32; 128];
+                while next < total_frames {
+                    if host.audio_backlog() + 64 > 4_096 {
+                        std::thread::yield_now();
+                        continue;
+                    }
+                    let n = (total_frames - next).min(64) as usize;
+                    for i in 0..n {
+                        // Left carries the frame index, right its negative.
+                        block[i * 2] = (next + i as u64) as f32;
+                        block[i * 2 + 1] = -((next + i as u64) as f32);
+                    }
+                    assert!(host.push_audio(&block[..n * 2]));
+                    next += n as u64;
+                }
+            })
+        };
+
+        let mut seen = 0u64;
+        let mut buf = vec![0.0f32; 480 * 2];
+        while seen < total_frames {
+            let got = ui.pop_audio(&mut buf) as u64;
+            for i in 0..got {
+                let expected = (seen + i) as f32;
+                assert_eq!(buf[i as usize * 2], expected);
+                assert_eq!(buf[i as usize * 2 + 1], -expected);
+            }
+            seen += got;
+            if got == 0 {
+                std::thread::yield_now();
+            }
+        }
+        producer.join().unwrap();
+        assert_eq!(ui.audio_backlog(), 0);
+    }
+
+    #[test]
+    fn full_ring_rejects_instead_of_overwriting() {
+        let (ui, host) = pair();
+        let block = vec![0.5f32; 1024 * 2];
+        for _ in 0..AUDIO_CAPACITY / 1024 {
+            assert!(host.push_audio(&block));
+        }
+        assert!(!host.push_audio(&block), "a full ring must refuse more");
+        ui.trim_audio_backlog(512);
+        assert_eq!(ui.audio_backlog(), 512);
+        assert!(host.push_audio(&block));
+    }
 }

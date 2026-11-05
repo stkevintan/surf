@@ -1,9 +1,10 @@
 //! Writable per-user directories.
 //!
-//! `%APPDATA%\Surf` is the right place for a normal desktop launch, but the DSH
-//! shell runs with workspace-write sandboxing, which denies writes there.  Probe
-//! writability once and fall back to a workspace-local `.surf/` directory (or
-//! the executable directory for an installed build).
+//! The OS convention comes first: `%APPDATA%\Surf` on Windows,
+//! `~/Library/Application Support/Surf` on macOS, `$XDG_DATA_HOME/surf` (or
+//! `~/.local/share/surf`) on Linux. A sandboxed shell may deny writes there, so
+//! writability is probed once, with fallbacks to a workspace-local `.surf/`,
+//! the executable directory, and finally the temp directory.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -18,11 +19,10 @@ pub fn data_dir() -> PathBuf {
                 return dir;
             }
         }
-        if let Some(appdata) = std::env::var_os("APPDATA") {
-            let dir = PathBuf::from(appdata).join("Surf");
-            if writable_dir(&dir) {
-                return dir;
-            }
+        if let Some(dir) = platform_data_dir()
+            && writable_dir(&dir)
+        {
+            return dir;
         }
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         if cwd.join("Cargo.toml").exists() && writable_dir(&cwd.join(".surf")) {
@@ -41,6 +41,25 @@ pub fn data_dir() -> PathBuf {
         dir
     })
     .clone()
+}
+
+fn platform_data_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join("Surf"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join("Library/Application Support/Surf"))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+            .map(|dir| dir.join("surf"))
+    }
 }
 
 fn writable_dir(dir: &Path) -> bool {

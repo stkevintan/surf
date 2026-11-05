@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 
 use super::Instrument;
 use super::synth::Synth;
-use crate::song::{Song, Timeline};
+use surf_core::song::{Song, Timeline};
 
 #[derive(Clone, Debug)]
 pub struct RenderOptions {
@@ -149,7 +149,7 @@ pub fn render_with_instrument(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::song::{Note, Song};
+    use surf_core::song::{Note, Song};
 
     #[test]
     fn writes_non_silent_wav() {

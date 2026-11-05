@@ -11,10 +11,10 @@
 //! If the plugin loads here but not when the app spawns the helper, the
 //! difference is the helper's stdio/console setup rather than the plugin.
 
-use surf::audio::ipc::SharedMap;
+use surf::plugin::shm::SharedMap;
 
 fn main() -> anyhow::Result<()> {
-    let name = surf::audio::ipc::make_name();
+    let name = surf::plugin::shm::make_name();
     let _map = SharedMap::create(&name)?;
     println!("{name}");
     println!("holding for 120s — start surf-vst-host.exe with --shm {name}");
