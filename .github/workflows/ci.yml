@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # Large crates (`windows`, gpui's tree) can time out on a slow mirror; see .cargo/config.toml.
+  CARGO_NET_RETRY: 10
+
+jobs:
+  build-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-24.04
+          - name: macOS
+            os: macos-15
+          - name: Windows
+            os: windows-2025
+    steps:
+      - uses: actions/checkout@v5
+
+      # System libraries for gpui (X11/Wayland, xkbcommon, fontconfig), cpal/alsa
+      # (ALSA), rfd (Wayland portal) and vst3-host's editor windows (xcb).
+      - name: Install Linux system packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libasound2-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libfontconfig1-dev libfreetype-dev libvulkan-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Test
+        run: cargo test --workspace --locked --no-fail-fast
+
+  # Release binaries for every commit that lands on main, uploaded as workflow artifacts.
+  release:
+    name: Release ${{ matrix.name }}
+    # Also runnable by hand (Actions -> CI -> Run workflow) to test packaging from a branch.
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      github.event_name == 'workflow_dispatch'
+    needs: build-test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            exe: ""
+          - name: macOS
+            os: macos-15
+            target: aarch64-apple-darwin
+            exe: ""
+          - name: Windows
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+            exe: .exe
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Linux system packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libasound2-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libfontconfig1-dev libfreetype-dev libvulkan-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+
+      # Builds the two default members: the `surf` app and the `surf-vst-host` helper.
+      - name: Build release binaries
+        run: cargo build --release --locked
+
+      # The app looks for the helper next to its own executable, so ship them together.
+      # Unix packages are tarred: artifact zips drop the executable bit.
+      - name: Package
+        shell: bash
+        run: |
+          name="surf-${GITHUB_SHA::7}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/release/surf${{ matrix.exe }}" "target/release/surf-vst-host${{ matrix.exe }}" \
+            README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a -tzip "$name.zip" "$name" > /dev/null
+            echo "ARCHIVE=dist/$name.zip" >> "$GITHUB_ENV"
+          else
+            tar -czf "$name.tar.gz" "$name"
+            echo "ARCHIVE=dist/$name.tar.gz" >> "$GITHUB_ENV"
+          fi
+          echo "PACKAGE=$name" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+          retention-days: 30

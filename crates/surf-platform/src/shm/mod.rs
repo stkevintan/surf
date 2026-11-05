@@ -51,6 +51,9 @@ mod tests {
         }
     }
 
+    /// The 31-byte limit is macOS's POSIX shm rule; Windows section names
+    /// (`Local\...`) allow up to MAX_PATH and are deliberately longer.
+    #[cfg(unix)]
     #[test]
     fn names_fit_the_posix_limit() {
         assert!(make_name().len() <= 31);

@@ -167,10 +167,20 @@ mod tests {
         );
     }
 
+    /// The CoreMIDI tests share one system-wide device list, and the test harness runs them on
+    /// parallel threads. A virtual source from one test would otherwise show up in the other's
+    /// hub: the hot-plug test auto-connects to it, then sees it vanish mid-test.
+    static COREMIDI_TESTS: Mutex<()> = Mutex::new(());
+
+    fn coremidi_lock() -> std::sync::MutexGuard<'static, ()> {
+        COREMIDI_TESTS.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
     /// End to end through CoreMIDI: a virtual source shows up as a port, and
     /// bytes sent from it arrive parsed through [`MidiHub`]. Needs no hardware.
     #[test]
     fn virtual_source_reaches_the_hub() {
+        let _serial = coremidi_lock();
         use std::time::{Duration, Instant};
 
         use coremidi::PacketBuffer;
@@ -218,6 +228,7 @@ mod tests {
     /// Removing the source takes it out of the list again.
     #[test]
     fn hot_plugged_source_is_listed_and_removed() {
+        let _serial = coremidi_lock();
         use std::time::{Duration, Instant};
 
         use crate::{MidiHub, PortChange};
