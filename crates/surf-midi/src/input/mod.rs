@@ -8,13 +8,19 @@
 //! - to a channel of [`TimedMidi`], timestamped on arrival, which the UI drains
 //!   once per frame for drawing and recording.
 //!
+//! Devices may come and go while Surf runs. [`MidiHub::poll`] re-enumerates
+//! ports when the backend reports a change (or every couple of seconds as a
+//! fallback), reconnects to the same port by name, and picks up a newly
+//! plugged-in keyboard when nothing is connected.
+//!
 //! Backends talk to each OS API directly: WinMM on Windows, CoreMIDI on macOS,
 //! the ALSA sequencer on Linux. (`midir` would wrap these, but its versions
 //! conflict with GPUI's and cpal's pinned dependencies; see the workspace
 //! manifest.)
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -51,6 +57,19 @@ pub type NoteSink = Arc<dyn Fn(LiveEvent) + Send + Sync>;
 /// What a backend calls for each parsed message.
 pub(crate) type Deliver = Arc<dyn Fn(LiveEvent) + Send + Sync>;
 
+/// What [`MidiHub::poll`] found, for the status bar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PortChange {
+    /// Connected to a port that was not connected before (often a newly
+    /// plugged-in keyboard).
+    Connected(String),
+    /// The connected port disappeared.
+    Disconnected(String),
+}
+
+/// How often to re-enumerate when the backend cannot notify us.
+const POLL_FALLBACK: Duration = Duration::from_secs(2);
+
 pub struct MidiHub {
     devices: Vec<String>,
     connection: Option<backend::Connection>,
@@ -59,12 +78,18 @@ pub struct MidiHub {
     tx: Sender<TimedMidi>,
     sink: NoteSink,
     error: Option<String>,
+    /// Set by the backend's change notification; cleared by `poll`.
+    dirty: Arc<AtomicBool>,
+    _watcher: Option<backend::Watcher>,
+    last_scan: Instant,
 }
 
 impl MidiHub {
     /// Create a hub and connect to the first available port, if any.
     pub fn new(sink: NoteSink) -> Self {
         let (tx, rx) = unbounded();
+        let dirty = Arc::new(AtomicBool::new(false));
+        let watcher = backend::watch(dirty.clone());
         let mut hub = Self {
             devices: Vec::new(),
             connection: None,
@@ -73,9 +98,65 @@ impl MidiHub {
             tx,
             sink,
             error: None,
+            dirty,
+            _watcher: watcher,
+            last_scan: Instant::now(),
         };
         hub.refresh();
         hub
+    }
+
+    /// Notice ports that appeared or went away. Call once per UI frame; cheap
+    /// unless something changed.
+    pub fn poll(&mut self) -> Option<PortChange> {
+        let notified = self.dirty.swap(false, Ordering::AcqRel);
+        if !notified && self.last_scan.elapsed() < POLL_FALLBACK {
+            return None;
+        }
+        let before_name = self.selected.and_then(|i| self.devices.get(i).cloned());
+        let before_ports = self.devices.clone();
+        let ports = match backend::list_ports() {
+            Ok(ports) => ports,
+            Err(err) => {
+                self.error = Some(err.to_string());
+                self.last_scan = Instant::now();
+                return None;
+            }
+        };
+        self.last_scan = Instant::now();
+        if ports == before_ports {
+            return None;
+        }
+        self.devices = ports;
+
+        match before_name {
+            // Still there: keep the connection if the index is unchanged,
+            // otherwise reconnect by name (indices shift as ports come and go).
+            Some(name) if self.devices.contains(&name) => {
+                if self.devices.get(self.selected.unwrap_or(usize::MAX)) != Some(&name) {
+                    let _ = self.connect_by_name(&name);
+                }
+                None
+            }
+            Some(name) => {
+                self.disconnect();
+                // Fall through to auto-connect another port, if any.
+                self.connect_first_new(&before_ports)
+                    .or(Some(PortChange::Disconnected(name)))
+            }
+            None => self.connect_first_new(&before_ports),
+        }
+    }
+
+    /// Connect to the first port that was not in `before`, else the first port.
+    fn connect_first_new(&mut self, before: &[String]) -> Option<PortChange> {
+        let index = self
+            .devices
+            .iter()
+            .position(|p| !before.contains(p))
+            .or((!self.devices.is_empty()).then_some(0))?;
+        self.connect(index).ok()?;
+        Some(PortChange::Connected(self.devices[index].clone()))
     }
 
     /// Re-enumerate ports. Connects to the first port when nothing is connected.

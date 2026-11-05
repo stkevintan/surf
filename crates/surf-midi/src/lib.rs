@@ -3,4 +3,4 @@
 pub mod input;
 pub mod smf;
 
-pub use input::{LiveEvent, MidiHub, NoteSink, TimedMidi};
+pub use input::{LiveEvent, MidiHub, NoteSink, PortChange, TimedMidi};

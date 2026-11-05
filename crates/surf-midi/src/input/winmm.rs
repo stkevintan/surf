@@ -5,6 +5,8 @@
 //! [`Deliver`], which fans it out to the audio engine and the UI.
 
 use std::mem::size_of;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
 use windows::Win32::Media::Audio::{
@@ -70,6 +72,14 @@ fn device_name(index: u32) -> Option<String> {
     }
     let pname = unsafe { std::ptr::addr_of!(caps.szPname).read_unaligned() };
     Some(wide_to_string(&pname))
+}
+
+/// WinMM has no device-change notification; `MidiHub::poll` re-enumerates on
+/// its fallback timer instead.
+pub(crate) struct Watcher;
+
+pub(crate) fn watch(_dirty: Arc<AtomicBool>) -> Option<Watcher> {
+    None
 }
 
 pub(crate) fn list_ports() -> Result<Vec<String>> {

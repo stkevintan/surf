@@ -3,8 +3,11 @@
 //! CoreMIDI calls the input port's read block on its own high-priority thread
 //! for every packet list, which plays the role of the WinMM driver callback.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::{Context, Result};
-use coremidi::{Client, InputPort, PacketList, Source, Sources};
+use coremidi::{Client, InputPort, Notification, PacketList, Source, Sources};
 
 use super::{Deliver, parse_message};
 
@@ -26,6 +29,30 @@ fn source_name(source: &Source) -> String {
         .display_name()
         .or_else(|| source.name())
         .unwrap_or_else(|| "Unknown MIDI input".to_string())
+}
+
+/// Keeps a CoreMIDI client alive whose notify block marks the port list dirty
+/// when devices are added, removed or reconfigured.
+pub(crate) struct Watcher {
+    _client: Client,
+}
+
+pub(crate) fn watch(dirty: Arc<AtomicBool>) -> Option<Watcher> {
+    // CoreMIDI only delivers notifications for clients created on a thread
+    // with a run loop; the GPUI main thread has one, and the 2 s fallback
+    // poll covers anywhere else.
+    let client = Client::new_with_notifications("Surf Watcher", move |n: &Notification| {
+        if matches!(
+            n,
+            Notification::SetupChanged
+                | Notification::ObjectAdded(_)
+                | Notification::ObjectRemoved(_)
+        ) {
+            dirty.store(true, Ordering::Release);
+        }
+    })
+    .ok()?;
+    Some(Watcher { _client: client })
 }
 
 pub(crate) fn list_ports() -> Result<Vec<String>> {
@@ -95,7 +122,7 @@ fn dispatch(bytes: &[u8], deliver: &Deliver) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
     use super::*;
     use crate::LiveEvent;
@@ -183,5 +210,55 @@ mod tests {
         assert_eq!(*heard.lock().unwrap(), expected, "sink saw the notes");
         let timed: Vec<_> = hub.drain().into_iter().map(|t| t.event).collect();
         assert_eq!(timed, expected, "UI stream saw the notes");
+    }
+
+    /// A source that appears after the hub started shows up in the port list.
+    /// If nothing was connected it is connected automatically; a port that is
+    /// already connected (a real keyboard on this machine) is not replaced.
+    /// Removing the source takes it out of the list again.
+    #[test]
+    fn hot_plugged_source_is_listed_and_removed() {
+        use std::time::{Duration, Instant};
+
+        use crate::{MidiHub, PortChange};
+
+        let wait_for = |hub: &mut MidiHub, cond: &dyn Fn(&MidiHub) -> bool| {
+            let mut changes = Vec::new();
+            // Notifications need a run loop; without one the fallback poll
+            // (every 2 s) still has to find the change.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline && !cond(hub) {
+                changes.extend(hub.poll());
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            changes
+        };
+
+        let mut hub = MidiHub::new(Arc::new(|_| {}));
+        let had_connection = hub.selected().map(|i| hub.ports()[i].clone());
+        let name = format!("Surf Hotplug {}", std::process::id());
+        let client = Client::new("Surf Hotplug Sender").unwrap();
+        let source = client.virtual_source(&name).unwrap();
+
+        let changes = wait_for(&mut hub, &|h| h.ports().contains(&name));
+        assert!(hub.ports().contains(&name), "new source is listed");
+        let connected_to = hub.selected().map(|i| hub.ports()[i].clone());
+        match &had_connection {
+            Some(previous) => assert_eq!(
+                connected_to.as_ref(),
+                Some(previous),
+                "an existing connection is kept"
+            ),
+            None => {
+                assert_eq!(connected_to.as_deref(), Some(name.as_str()), "auto-connected");
+                assert!(changes.contains(&PortChange::Connected(name.clone())));
+            }
+        }
+
+        drop(source);
+        wait_for(&mut hub, &|h| !h.ports().contains(&name));
+        assert!(!hub.ports().contains(&name), "removed source is unlisted");
+        let still = hub.selected().map(|i| hub.ports()[i].clone());
+        assert_eq!(still, had_connection, "back to the original connection");
     }
 }

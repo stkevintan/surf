@@ -41,6 +41,22 @@ pub enum Command {
     SetVolume(f32),
 }
 
+/// Something that happened to the output stream, reported by the audio backend.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OutputEvent {
+    /// The system default output changed and the stream followed it (for
+    /// example, a USB MIDI keyboard that is also an audio interface was
+    /// plugged in). `device` is the new output's name.
+    Rerouted { device: String },
+    /// The output device went away and no default replaced it.
+    Lost,
+    /// The device asked for audio faster than it was produced; a click is
+    /// possible. Counted rather than reported one by one.
+    Glitch,
+    /// Any other backend error, as text.
+    Error(String),
+}
+
 #[derive(Clone, Debug)]
 pub struct EngineStatus {
     pub playing: bool,
@@ -50,6 +66,8 @@ pub struct EngineStatus {
     pub sample_rate: u32,
     pub output: String,
     pub sample_accurate: bool,
+    /// Audio glitches (underruns/overruns) since the engine started.
+    pub glitches: u32,
 }
 
 struct Shared {
@@ -58,6 +76,7 @@ struct Shared {
     playing: AtomicBool,
     peak: AtomicU32,
     sample_rate: AtomicU32,
+    glitches: AtomicU32,
 }
 
 struct ActiveNote {
@@ -276,8 +295,9 @@ pub struct AudioEngine {
     _stream: Option<cpal::Stream>,
     _null_clock: Option<NullClock>,
     sample_rate: u32,
-    output: String,
+    output: parking_lot::Mutex<String>,
     sample_accurate: bool,
+    events: crossbeam_channel::Receiver<OutputEvent>,
 }
 
 impl AudioEngine {
@@ -288,7 +308,9 @@ impl AudioEngine {
             playing: AtomicBool::new(false),
             peak: AtomicU32::new(0),
             sample_rate: AtomicU32::new(48_000),
+            glitches: AtomicU32::new(0),
         });
+        let (event_tx, events) = crossbeam_channel::unbounded();
         let (tx, rx) = crossbeam_channel::unbounded();
 
         // Try the default output device first.
@@ -301,7 +323,15 @@ impl AudioEngine {
                     shared.clone(),
                 )));
                 let callback_core = core.clone();
-                let err_fn = |err| eprintln!("audio output error: {err}");
+                let err_shared = shared.clone();
+                let err_fn = move |err: cpal::Error| {
+                    let event = classify(&err);
+                    if event == OutputEvent::Glitch {
+                        err_shared.glitches.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    let _ = event_tx.send(event);
+                };
                 let config = cpal::StreamConfig {
                     channels,
                     sample_rate,
@@ -346,8 +376,9 @@ impl AudioEngine {
                     _stream: Some(stream),
                     _null_clock: None,
                     sample_rate,
-                    output: name,
+                    output: parking_lot::Mutex::new(name),
                     sample_accurate: true,
+                    events,
                 }
             }
             Err(err) => {
@@ -392,8 +423,9 @@ impl AudioEngine {
                         handle: Some(handle),
                     }),
                     sample_rate,
-                    output: "Silent (no audio device)".to_string(),
+                    output: parking_lot::Mutex::new("Silent (no audio device)".to_string()),
                     sample_accurate: false,
+                    events,
                 }
             }
         }
@@ -414,9 +446,24 @@ impl AudioEngine {
                 / sample_rate.max(1) as f64,
             peak: f32::from_bits(self.shared.peak.load(Ordering::Relaxed)),
             sample_rate,
-            output: self.output.clone(),
+            output: self.output.lock().clone(),
             sample_accurate: self.sample_accurate,
+            glitches: self.shared.glitches.load(Ordering::Relaxed),
         }
+    }
+
+    /// Output events since the last call. Updates the reported output name
+    /// when the stream was rerouted. Call once per UI frame.
+    pub fn drain_output_events(&self) -> Vec<OutputEvent> {
+        let events: Vec<OutputEvent> = self.events.try_iter().collect();
+        for event in &events {
+            match event {
+                OutputEvent::Rerouted { device } => *self.output.lock() = device.clone(),
+                OutputEvent::Lost => *self.output.lock() = "No output device".to_string(),
+                _ => {}
+            }
+        }
+        events
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -488,6 +535,25 @@ impl AudioEngine {
     }
 }
 
+/// Map a cpal stream error to what Surf cares about.
+fn classify(err: &cpal::Error) -> OutputEvent {
+    use cpal::ErrorKind;
+    match err.kind() {
+        // cpal has already rerouted the stream; the new device is the default.
+        ErrorKind::DeviceChanged => OutputEvent::Rerouted {
+            device: default_output_name().unwrap_or_else(|| "default output".to_string()),
+        },
+        ErrorKind::DeviceNotAvailable => OutputEvent::Lost,
+        ErrorKind::Xrun => OutputEvent::Glitch,
+        _ => OutputEvent::Error(err.to_string()),
+    }
+}
+
+fn default_output_name() -> Option<String> {
+    let device = cpal::default_host().default_output_device()?;
+    device.description().ok().map(|d| d.name().to_string())
+}
+
 fn open_output() -> Result<(cpal::Device, u32, u16, String)> {
     let host = cpal::default_host();
     let device = host
@@ -508,4 +574,30 @@ fn open_output() -> Result<(cpal::Device, u32, u16, String)> {
     }
     let sample_rate = supported.sample_rate();
     Ok((device, sample_rate, supported.channels(), name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cpal::ErrorKind;
+
+    #[test]
+    fn route_changes_and_glitches_are_not_reported_as_errors() {
+        assert!(matches!(
+            classify(&cpal::Error::new(ErrorKind::DeviceChanged)),
+            OutputEvent::Rerouted { .. }
+        ));
+        assert_eq!(
+            classify(&cpal::Error::new(ErrorKind::DeviceNotAvailable)),
+            OutputEvent::Lost
+        );
+        assert_eq!(
+            classify(&cpal::Error::new(ErrorKind::Xrun)),
+            OutputEvent::Glitch
+        );
+        assert!(matches!(
+            classify(&cpal::Error::new(ErrorKind::DeviceBusy)),
+            OutputEvent::Error(_)
+        ));
+    }
 }

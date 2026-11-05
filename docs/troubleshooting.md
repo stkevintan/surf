@@ -86,6 +86,12 @@ The symlink `C:\Program Files\Common Files\VST3\Kontakt 8 Portable` breaks if th
 
 On a cold cache, Kontakt 8 can take around 80 seconds to return from `createInstance` while it scans libraries at full CPU. Surf waits up to 240 seconds before giving up. Give manual tests at least that long too.
 
+### A MIDI keyboard was plugged in after Surf started
+
+Surf picks it up within a couple of seconds and shows "MIDI: connected …" in the status bar; there's no need to press `RESCAN`. If it was already connected to another port, it keeps that one. Click the new port in the sidebar to switch.
+
+Many USB keyboards are also audio interfaces, so plugging one in can make macOS or Windows switch the default output to it. Surf follows the switch, and the status bar shows "Audio output switched to …". To get sound back on your speakers, change the output in System Settings → Sound (macOS) or Settings → System → Sound (Windows).
+
 ### Audio crackles with a plugin
 
 The plugin host keeps about 10.7 ms (512 frames) of audio queued. On a busy machine, raise it:
