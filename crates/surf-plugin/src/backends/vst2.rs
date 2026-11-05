@@ -347,6 +347,10 @@ mod editor {
 
     impl Vst2EditorWindow {
         pub fn idle(&mut self) {}
+
+        pub fn closed_by_user(&self) -> bool {
+            false
+        }
     }
 
     pub fn open(_plugin: &mut PluginInstance, _name: &str) -> Result<Vst2EditorWindow> {
