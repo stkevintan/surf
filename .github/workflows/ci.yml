@@ -31,7 +31,7 @@ jobs:
           - name: Windows
             os: windows-2025
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # System libraries for gpui (X11/Wayland, xkbcommon, fontconfig), cpal/alsa
       # (ALSA), rfd (Wayland portal) and vst3-host's editor windows (xcb).
