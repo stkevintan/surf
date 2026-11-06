@@ -47,6 +47,7 @@ pub enum MidiKind {
     Sustain = 3,
     AllNotesOff = 4,
     PitchBend = 5,
+    ControlChange = 6,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -55,43 +56,43 @@ pub struct MidiMsg {
     pub kind: u32,
     pub a: u32,
     pub b: u32,
-    pub _pad: u32,
+    /// MIDI channel 0..=15. Was padding before channels were sent, so an
+    /// older UI simply plays everything on channel 1.
+    pub channel: u32,
 }
 
 impl MidiMsg {
-    pub fn note_on(key: u8, velocity: u8) -> Self {
-        Self {
-            kind: MidiKind::NoteOn as u32,
-            a: key as u32,
-            b: velocity as u32,
-            _pad: 0,
-        }
+    pub fn note_on(channel: u8, key: u8, velocity: u8) -> Self {
+        Self::new(MidiKind::NoteOn, channel, key as u32, velocity as u32)
     }
 
-    pub fn note_off(key: u8) -> Self {
-        Self {
-            kind: MidiKind::NoteOff as u32,
-            a: key as u32,
-            b: 0,
-            _pad: 0,
-        }
+    pub fn note_off(channel: u8, key: u8) -> Self {
+        Self::new(MidiKind::NoteOff, channel, key as u32, 0)
     }
 
-    pub fn sustain(down: bool) -> Self {
-        Self {
-            kind: MidiKind::Sustain as u32,
-            a: down as u32,
-            b: 0,
-            _pad: 0,
-        }
+    pub fn sustain(channel: u8, down: bool) -> Self {
+        Self::new(MidiKind::Sustain, channel, down as u32, 0)
     }
 
     pub fn all_notes_off() -> Self {
+        Self::new(MidiKind::AllNotesOff, 0, 0, 0)
+    }
+
+    pub fn control_change(channel: u8, controller: u8, value: u8) -> Self {
+        Self::new(
+            MidiKind::ControlChange,
+            channel,
+            controller as u32,
+            value as u32,
+        )
+    }
+
+    fn new(kind: MidiKind, channel: u8, a: u32, b: u32) -> Self {
         Self {
-            kind: MidiKind::AllNotesOff as u32,
-            a: 0,
-            b: 0,
-            _pad: 0,
+            kind: kind as u32,
+            a,
+            b,
+            channel: (channel & 15) as u32,
         }
     }
 }
@@ -311,18 +312,20 @@ mod tests {
     #[test]
     fn midi_crosses_the_mapping_in_order() {
         let (ui, host) = pair();
-        assert!(ui.push_midi(MidiMsg::note_on(60, 100)));
-        assert!(ui.push_midi(MidiMsg::sustain(true)));
-        assert!(ui.push_midi(MidiMsg::note_off(60)));
+        assert!(ui.push_midi(MidiMsg::note_on(2, 60, 100)));
+        assert!(ui.push_midi(MidiMsg::sustain(2, true)));
+        assert!(ui.push_midi(MidiMsg::note_off(2, 60)));
+        assert!(ui.push_midi(MidiMsg::control_change(5, 7, 90)));
         let kinds: Vec<_> = std::iter::from_fn(|| host.pop_midi())
-            .map(|m| (m.kind, m.a, m.b))
+            .map(|m| (m.kind, m.channel, m.a, m.b))
             .collect();
         assert_eq!(
             kinds,
             vec![
-                (MidiKind::NoteOn as u32, 60, 100),
-                (MidiKind::Sustain as u32, 1, 0),
-                (MidiKind::NoteOff as u32, 60, 0),
+                (MidiKind::NoteOn as u32, 2, 60, 100),
+                (MidiKind::Sustain as u32, 2, 1, 0),
+                (MidiKind::NoteOff as u32, 2, 60, 0),
+                (MidiKind::ControlChange as u32, 5, 7, 90),
             ]
         );
     }

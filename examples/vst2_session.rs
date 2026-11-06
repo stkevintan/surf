@@ -16,7 +16,7 @@ fn main() -> anyhow::Result<()> {
     println!("loaded: {}", client.name);
 
     let mut instrument = client.instrument();
-    instrument.note_on(64, 100);
+    instrument.note_on(0, 64, 100);
     let mut buffer = [0.0f32; 128];
     let mut peak = 0.0f32;
     for _ in 0..1_000 {
@@ -24,7 +24,7 @@ fn main() -> anyhow::Result<()> {
         peak = buffer.iter().fold(peak, |p, s| p.max(s.abs()));
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    instrument.note_off(64);
+    instrument.note_off(0, 64);
     println!("audio peak: {:.1}%", peak * 100.0);
 
     let state =

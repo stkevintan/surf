@@ -8,6 +8,7 @@ pub mod dialogs;
 pub mod editing;
 pub mod fonts;
 pub mod icons;
+pub mod rack;
 pub mod session;
 pub mod shell;
 pub mod theme;

@@ -1,9 +1,9 @@
 //! Channel strip, shared by the Inspector and the Mixer.
 //!
 //! Top to bottom: EQ thumbnail, setting, instrument, audio FX, sends, output,
-//! pan, level readout, fader + meter, mute/solo, name. Only the fader and the
-//! meter are live today (the one track plays through the master volume);
-//! the rest holds its place for the multi-track mixer.
+//! pan, level readout, fader + meter, mute/solo, name. The instrument, fader,
+//! meter and mute/solo are live (each track's slot in the engine); the rest
+//! holds its place for the full mixer.
 
 use gpui::{
     Context, FontWeight, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,

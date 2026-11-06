@@ -186,7 +186,7 @@ fn headers(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
                                 .whitespace_nowrap()
                                 .child(format!(
                                     "{} · Ch {}",
-                                    views::instrument_name(&app.session),
+                                    views::instrument_name(&app.session, t),
                                     t.channel + 1
                                 )),
                         ),
@@ -214,11 +214,11 @@ fn headers(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
                                 move |this, _: &gpui::ClickEvent, _, cx| {
                                     cx.stop_propagation();
                                     let s = &mut this.session;
-                                    s.record_arm = if s.record_arm == Some(id) {
+                                    s.set_record_arm(if s.record_arm == Some(id) {
                                         None
                                     } else {
                                         Some(id)
-                                    };
+                                    });
                                     cx.notify();
                                 },
                             )),

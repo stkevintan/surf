@@ -108,6 +108,8 @@ pub enum TrackField {
     Solo(bool),
     Volume(f32),
     Channel(u8),
+    /// The plugin the track plays; None is the built-in piano.
+    Instrument(Option<std::path::PathBuf>),
 }
 
 impl Edit {
@@ -417,6 +419,9 @@ impl Edit {
                     TrackField::Channel(v) => {
                         TrackField::Channel(std::mem::replace(&mut t.channel, (*v).min(15)))
                     }
+                    TrackField::Instrument(v) => {
+                        TrackField::Instrument(std::mem::replace(&mut t.instrument, v.clone()))
+                    }
                 };
                 Edit::SetTrack {
                     track: *track,
@@ -695,6 +700,10 @@ mod tests {
         round_trips(Edit::SetTrack {
             track: p.tracks[1].id,
             field: TrackField::Volume(0.3),
+        });
+        round_trips(Edit::SetTrack {
+            track: p.tracks[0].id,
+            field: TrackField::Instrument(Some("/plugins/Kontakt 8.vst3".into())),
         });
     }
 

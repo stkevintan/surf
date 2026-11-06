@@ -10,15 +10,17 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Instant;
 
-use surf_audio::render::{RenderOptions, render_timeline_to_wav};
+use surf_audio::render::{RenderOptions, RenderStats, mix_stems, render_timeline_to_wav};
 use surf_audio::{AudioEngine, Command, EngineStatus, OutputEvent, Synth};
 use surf_core::recorder::Recorder;
-use surf_core::edit::{Edit, History};
+use surf_core::edit::{Edit, History, TrackField};
 use surf_core::project::{Id, Project};
 use surf_core::song::{Song, Timeline};
 use surf_midi::{LiveEvent, MidiHub, NoteSink, PortChange};
 use surf_plugin::client::{RenderNote, VstClient, helper_log_path};
 use surf_plugin::scan::{self as vst_scan, PluginEntry};
+
+use crate::rack::{self, Host, Rack, Source};
 
 /// A note the user is playing (or just played), for the rising-note view.
 pub struct LiveNote {
@@ -39,8 +41,9 @@ pub struct Session {
     /// Rebuilt after every edit by [`Session::project_changed`].
     pub timeline: Timeline,
     pub live_notes: Vec<LiveNote>,
-    pub vst: Option<VstClient>,
-    render_rx: Option<Receiver<anyhow::Result<surf_audio::render::RenderStats>>>,
+    /// The instruments the tracks play: built-in pianos and plugin hosts.
+    pub rack: Rack,
+    render_rx: Option<Receiver<anyhow::Result<RenderStats>>>,
     pub rendering: bool,
     pending_vst: Option<PathBuf>,
     /// Results of the last `SCAN`, shown in the plugin picker.
@@ -57,15 +60,17 @@ pub struct Session {
     pub sustained_keys: HashSet<u8>,
     /// Track armed for recording (the R button); None means the first track.
     pub record_arm: Option<Id>,
+    /// Track whose instrument live input plays: the selected track.
+    input_track: Option<Id>,
     /// The last recorded region, so the editor can open it.
     pub record_region: Option<Id>,
 }
 
 impl Session {
     pub fn new() -> Self {
-        let mut synth = Synth::new(48_000.0);
-        synth.set_master_gain(0.9);
-        let audio = AudioEngine::new(Box::new(synth));
+        let audio = AudioEngine::new();
+        // The spare piano, for tracks that find no slot of their own.
+        audio.set_slot(0, Some(Box::new(piano(audio.sample_rate()))));
         // Live notes go straight from the MIDI driver thread to the audio
         // thread, so they sound without waiting for a UI frame.
         let audio_tx = audio.sender();
@@ -92,7 +97,7 @@ impl Session {
         // walks the file system, so it is cheap and cannot crash.
         let plugin_scan = vst_scan::scan_plugin_paths();
         let engine = audio.status();
-        Self {
+        let mut session = Self {
             audio,
             midi,
             recorder: Recorder::new(),
@@ -100,7 +105,7 @@ impl Session {
             history: History::new(),
             timeline,
             live_notes: Vec::new(),
-            vst: None,
+            rack: Rack::new(),
             render_rx: None,
             rendering: false,
             pending_vst: std::env::var_os("SURF_VST").map(PathBuf::from),
@@ -108,12 +113,15 @@ impl Session {
             sustain: false,
             sustained_keys: HashSet::new(),
             record_arm: None,
+            input_track: None,
             record_region: None,
             loop_playback: false,
             volume: 0.9,
             status,
             engine,
-        }
+        };
+        session.sync_instruments();
+        session
     }
 
     pub fn toggle_play(&mut self) {
@@ -227,8 +235,23 @@ impl Session {
     }
 
     /// Replace the whole project (a new file). Clears undo history.
-    pub fn set_project(&mut self, project: Project) {
+    ///
+    /// The new tracks keep the instruments already loaded: a track takes
+    /// the plugin of the old track on its MIDI channel, else the first old
+    /// track's. Opening a file doesn't unload Kontakt.
+    pub fn set_project(&mut self, mut project: Project) {
         self.audio.stop();
+        let fallback = self.project.tracks.first().and_then(|t| t.instrument.clone());
+        for t in &mut project.tracks {
+            if t.instrument.is_none() {
+                t.instrument = self
+                    .project
+                    .tracks
+                    .iter()
+                    .find(|old| old.channel == t.channel)
+                    .map_or(fallback.clone(), |old| old.instrument.clone());
+            }
+        }
         self.project = project;
         self.history.clear();
         self.record_arm = None;
@@ -240,9 +263,157 @@ impl Session {
     pub fn project_changed(&mut self) {
         let position = self.position();
         let playing = self.engine.playing;
-        self.timeline = self.project.timeline();
-        if playing {
-            self.audio.play(self.timeline.clone(), position);
+        self.sync_instruments();
+        let timeline = self.project.timeline();
+        // Mute, solo and volume changes reach the engine without restarting
+        // the song; only a change in what plays does.
+        if playing && timeline != self.timeline {
+            self.audio.play(timeline.clone(), position);
+        }
+        self.timeline = timeline;
+    }
+
+    /// Give every track the instrument it names: start plugin hosts that
+    /// are new, stop ones no track uses, add or drop built-in pianos, then
+    /// send the engine each track's route and gain.
+    pub fn sync_instruments(&mut self) {
+        let sample_rate = self.audio.sample_rate();
+        let wanted: Vec<Source> = self
+            .project
+            .tracks
+            .iter()
+            .map(|t| rack::wanted(t, &self.rack.failed))
+            .collect();
+
+        // Drop what no track wants any more.
+        for slot in 1..self.rack.slots.len() {
+            let Some(source) = self.rack.slots[slot].clone() else {
+                continue;
+            };
+            if wanted.contains(&source) {
+                continue;
+            }
+            self.audio.set_slot(slot as u8, None);
+            self.rack.slots[slot] = None;
+            if let Source::Plugin(path) = source
+                && let Some(i) = self.rack.hosts.iter().position(|h| h.path == path)
+            {
+                let mut host = self.rack.hosts.remove(i);
+                // Park its state so undo can bring it back as it was.
+                let _ = host.client.save_state(&rack::parked_state_path(&path));
+                drop(host);
+            }
+            self.rack.sent_cc7.retain(|(s, _), _| *s as usize != slot);
+        }
+
+        // Add what is new, in track order.
+        let mut seen: Vec<Source> = Vec::new();
+        for source in wanted {
+            if seen.contains(&source) || self.rack.slots.contains(&Some(source.clone())) {
+                seen.push(source);
+                continue;
+            }
+            seen.push(source.clone());
+            let Some(slot) = self.rack.free_slot() else {
+                // The spare piano plays it.
+                continue;
+            };
+            match &source {
+                Source::Piano(_) => {
+                    self.audio.set_slot(slot, Some(Box::new(piano(sample_rate))));
+                    self.rack.slots[slot as usize] = Some(source);
+                }
+                Source::Plugin(path) => {
+                    if let Some(client) = self.start_host(path) {
+                        self.audio.set_slot(slot, Some(Box::new(client.instrument())));
+                        self.rack.hosts.push(Host {
+                            path: path.clone(),
+                            client,
+                            slot,
+                        });
+                        self.rack.slots[slot as usize] = Some(source);
+                    }
+                }
+            }
+        }
+        self.send_plan();
+    }
+
+    /// Routes, slot gains and channel volumes for the current project.
+    fn send_plan(&mut self) {
+        let plan = rack::plan(&self.project, &self.rack.slots, &self.rack.failed);
+        self.audio.send(Command::SetRoutes(plan.routes));
+        for (slot, gain) in plan.gains {
+            self.audio.send(Command::SetSlotGain { slot, gain });
+        }
+        for (slot, channel, value) in plan.cc7 {
+            if self.rack.sent_cc7.insert((slot, channel), value) != Some(value) {
+                self.audio.send(Command::ControlChange {
+                    slot,
+                    channel,
+                    controller: 7,
+                    value,
+                });
+            }
+        }
+        // Live input plays the record-armed track, else the selected one.
+        let input = self
+            .record_arm
+            .or(self.input_track)
+            .and_then(|id| self.project.tracks.iter().position(|t| t.id == id))
+            .unwrap_or(0);
+        self.audio.send(Command::SetInput(input as u16));
+    }
+
+    /// Start a plugin host, restoring the state saved for the plugin (or
+    /// parked when its last track let it go). A failure is remembered, so
+    /// the tracks fall back to the piano instead of retrying every frame.
+    fn start_host(&mut self, path: &Path) -> Option<VstClient> {
+        let parked = rack::parked_state_path(path);
+        let saved = vst_state_path_for(path);
+        let state = if parked.exists() {
+            Some(parked)
+        } else if std::env::var_os("SURF_NO_STATE").is_none() && saved.exists() {
+            Some(saved)
+        } else {
+            None
+        };
+        match VstClient::load(path, self.audio.sample_rate(), state.as_deref()) {
+            Ok(client) => {
+                self.status = match &state {
+                    Some(state) => format!(
+                        "Loaded {} (state from {})",
+                        client.name,
+                        state.display()
+                    ),
+                    None => format!("Loaded {}", client.name),
+                };
+                let has_editor = surf_plugin::format::detect(path)
+                    .is_none_or(surf_plugin::format::Format::has_editor);
+                if !has_editor {
+                    self.status.push_str(" · no editor on this platform yet");
+                }
+                Some(client)
+            }
+            Err(err) => {
+                self.rack.failed.insert(path.to_path_buf());
+                self.status = load_failure(path, &err);
+                None
+            }
+        }
+    }
+
+    /// Arm a track for recording; live input then plays its instrument.
+    pub fn set_record_arm(&mut self, track: Option<Id>) {
+        self.record_arm = track;
+        self.send_plan();
+    }
+
+    /// The track live input plays: the one selected in the editor.
+    pub fn set_input_track(&mut self, track: Option<Id>) {
+        if self.input_track != track {
+            self.input_track = track;
+            self.send_plan();
         }
     }
 
@@ -256,6 +427,8 @@ impl Session {
     pub fn preview(&mut self, label: &str, edit: Edit) {
         self.history.preview(&mut self.project, label, edit);
         self.timeline = self.project.timeline();
+        // A fader drag is heard while it moves.
+        self.send_plan();
     }
 
     /// End a drag started with [`Session::preview`].
@@ -350,56 +523,99 @@ impl Session {
         if !self.can_export_wav() {
             return;
         }
-        let timeline = self.timeline.clone();
         let sample_rate = self.audio.sample_rate();
         let options = RenderOptions {
             sample_rate,
             tail_secs: 3.0,
-            gain: self.volume,
+            gain: 1.0,
+        };
+        let plan = rack::plan(&self.project, &self.rack.slots, &self.rack.failed);
+        let gain_of = |slot: u8| {
+            plan.gains
+                .iter()
+                .find(|(s, _)| *s == slot)
+                .map_or(1.0, |(_, g)| *g)
         };
 
-        if let Some(vst) = &mut self.vst {
-            let notes = timeline
-                .notes
-                .iter()
-                .map(|n| RenderNote {
-                    key: n.key,
-                    velocity: n.velocity,
-                    channel: n.channel,
-                    start: n.start,
-                    end: n.end,
-                })
-                .collect::<Vec<_>>();
-            self.rendering = true;
-            self.status = "Rendering WAV through the isolated VST helper…".to_string();
-            let result = vst.render(
-                &path,
-                notes,
-                timeline.duration,
-                sample_rate,
-                options.tail_secs,
-            );
-            self.rendering = false;
-            match result {
-                Ok((path, duration, peak)) => {
-                    self.status = format!(
-                        "WAV ready: {} · {:.1}s · peak {:.0}%",
-                        path,
-                        duration,
-                        peak * 100.0
-                    );
-                }
-                Err(err) => self.status = format!("VST helper render failed: {err:#}"),
+        // One stem per slot, from the notes routed to it.
+        let mut by_slot: std::collections::BTreeMap<u8, Timeline> = Default::default();
+        for n in &self.timeline.notes {
+            let slot = plan.routes.get(n.track as usize).map_or(0, |r| r.slot);
+            let mut n = *n;
+            if let Some(r) = plan.routes.get(n.track as usize) {
+                n.channel = r.channel;
             }
-            return;
+            by_slot
+                .entry(slot)
+                .or_insert_with(|| Timeline {
+                    notes: Vec::new(),
+                    duration: self.timeline.duration,
+                })
+                .notes
+                .push(n);
+        }
+        let stem_dir = std::env::temp_dir().join(format!("surf-stems-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&stem_dir);
+        let mut pianos = Vec::new();
+        let mut stems = Vec::new();
+        for (slot, timeline) in by_slot {
+            let stem = stem_dir.join(format!("slot-{slot}.wav"));
+            let host = self.rack.hosts.iter_mut().find(|h| h.slot == slot);
+            match host {
+                Some(host) => {
+                    // Plugins render in their own host, here and now: the
+                    // helper is busy until the file is written.
+                    self.status = format!("Rendering {} in its plugin host…", host.client.name);
+                    let notes = timeline
+                        .notes
+                        .iter()
+                        .map(|n| RenderNote {
+                            key: n.key,
+                            velocity: n.velocity,
+                            channel: n.channel,
+                            start: n.start,
+                            end: n.end,
+                        })
+                        .collect();
+                    let controls = plan
+                        .cc7
+                        .iter()
+                        .filter(|(s, _, _)| *s == slot)
+                        .map(|&(_, channel, value)| (channel, 7, value))
+                        .collect();
+                    if let Err(err) = host.client.render(
+                        &stem,
+                        notes,
+                        timeline.duration,
+                        sample_rate,
+                        options.tail_secs,
+                        controls,
+                    ) {
+                        self.status = format!("{} render failed: {err:#}", host.client.name);
+                        let _ = std::fs::remove_dir_all(&stem_dir);
+                        return;
+                    }
+                    stems.push((stem, gain_of(slot)));
+                }
+                None => pianos.push((stem, timeline, gain_of(slot))),
+            }
         }
 
+        // The built-in pianos render off the UI thread, then everything mixes.
         let (tx, rx) = mpsc::channel();
         self.render_rx = Some(rx);
         self.rendering = true;
-        self.status = "Rendering WAV with the built-in piano…".to_string();
+        self.status = "Rendering WAV…".to_string();
+        let master = self.volume;
         std::thread::spawn(move || {
-            let result = render_timeline_to_wav(&timeline, &path, &options);
+            let result = (|| {
+                for (stem, timeline, gain) in pianos {
+                    render_timeline_to_wav(&timeline, &stem, &options)?;
+                    stems.push((stem, gain));
+                }
+                mix_stems(&stems, &path, sample_rate, master)
+            })();
+            let _ = std::fs::remove_dir_all(&stem_dir);
             let _ = tx.send(result);
         });
     }
@@ -483,139 +699,163 @@ impl Session {
         self.load_vst_path(path);
     }
 
+    /// The track the instrument commands act on: the selected one, else the
+    /// first.
+    fn instrument_track(&self) -> Option<Id> {
+        self.input_track
+            .filter(|id| self.project.track(*id).is_some())
+            .or_else(|| self.project.tracks.first().map(|t| t.id))
+    }
+
+    /// Put a plugin on the selected track (undoable). Another track already
+    /// on the same plugin shares its host.
     pub fn load_vst_path(&mut self, path: PathBuf) {
-        self.status = format!("Loading {} in helper…", path.display());
-        let old = self.vst.take();
-        let state_path = vst_state_path_for(&path);
-        let use_state = std::env::var_os("SURF_NO_STATE").is_none() && state_path.exists();
-        match VstClient::load(
-            &path,
-            self.audio.sample_rate(),
-            if use_state {
-                Some(state_path.as_path())
-            } else {
-                None
-            },
-        ) {
-            Ok(vst) => {
-                let name = vst.name.clone();
-                self.audio.set_instrument(Box::new(vst.instrument()));
-                self.status = if use_state {
-                    format!(
-                        "Loaded VST helper: {} (state from {})",
-                        name,
-                        state_path.display()
-                    )
-                } else {
-                    format!("Loaded VST helper: {name}")
-                };
-                self.vst = Some(vst);
-                drop(old);
-                let has_editor = surf_plugin::format::detect(&path)
-                    .is_none_or(surf_plugin::format::Format::has_editor);
-                if !has_editor {
-                    self.status.push_str(" · no editor on this platform yet");
-                } else if std::env::var_os("SURF_NO_EDITOR").is_none() {
-                    self.open_vst_editor();
-                }
-            }
-            Err(err) => {
-                self.vst = old;
-                let tail = helper_log_tail(3);
-                // Mirror the failure to stderr: the status bar truncates, and a terminal
-                // transcript is what you actually paste into a bug report.
-                eprintln!("---- VST helper load failed ----");
-                eprintln!("plugin: {}", path.display());
-                eprintln!("error : {err:#}");
-                if !tail.is_empty() {
-                    eprintln!("helper log tail:");
-                    for line in tail.lines() {
-                        eprintln!("  {line}");
-                    }
-                }
-                eprintln!("full log: {}", helper_log_path().display());
-                eprintln!("--------------------------------");
-                self.status = if tail.is_empty() {
-                    format!(
-                        "VST helper load failed for {}: {err:#} (helper log: {})",
-                        path.display(),
-                        helper_log_path().display()
-                    )
-                } else {
-                    format!(
-                        "VST helper load failed: {err:#} · helper says: {} (log: {})",
-                        tail.replace('\n', " | "),
-                        helper_log_path().display()
-                    )
-                };
-            }
+        let path = std::path::absolute(&path).unwrap_or(path);
+        let Some(track) = self.instrument_track() else {
+            self.status = "Add a track first".to_string();
+            return;
+        };
+        // Picking a plugin again is how to retry one that failed.
+        self.rack.failed.remove(&path);
+        // Start the host first: if it fails, the track keeps its instrument
+        // and nothing lands on the undo stack.
+        if self.rack.host(&path).is_none() {
+            let Some(slot) = self.rack.free_slot() else {
+                self.status = "Every instrument slot is in use".to_string();
+                return;
+            };
+            let Some(client) = self.start_host(&path) else {
+                return;
+            };
+            self.audio.set_slot(slot, Some(Box::new(client.instrument())));
+            self.rack.hosts.push(Host {
+                path: path.clone(),
+                client,
+                slot,
+            });
+            self.rack.slots[slot as usize] = Some(Source::Plugin(path.clone()));
         }
+        let status = std::mem::take(&mut self.status);
+        self.set_instrument(track, Some(path.clone()));
+        self.status = status;
+        let shared = self
+            .project
+            .tracks
+            .iter()
+            .filter(|t| t.instrument.as_ref() == Some(&path))
+            .count();
+        if shared > 1 {
+            self.status.push_str(&format!(
+                " · shared by {shared} tracks, each on its own MIDI channel"
+            ));
+        }
+        let editor = surf_plugin::format::detect(&path)
+            .is_none_or(surf_plugin::format::Format::has_editor);
+        if editor && shared == 1 && std::env::var_os("SURF_NO_EDITOR").is_none() {
+            self.open_vst_editor();
+        }
+    }
+
+    pub fn set_instrument(&mut self, track: Id, instrument: Option<PathBuf>) {
+        let same = self
+            .project
+            .track(track)
+            .is_some_and(|t| t.instrument == instrument);
+        if !same {
+            self.apply(
+                "Change Instrument",
+                Edit::SetTrack {
+                    track,
+                    field: TrackField::Instrument(instrument),
+                },
+            );
+        }
+    }
+
+    /// The selected track's plugin host, if it plays one.
+    fn track_host(&mut self) -> Option<&mut Host> {
+        let track = self.instrument_track()?;
+        let path = self.project.track(track)?.instrument.clone()?;
+        self.rack.host_mut(&path)
     }
 
     pub fn open_vst_editor(&mut self) {
-        let Some(vst) = &mut self.vst else {
-            self.status = "Load a VST instrument first".to_string();
+        let Some(host) = self.track_host() else {
+            self.status = "This track plays the built-in piano".to_string();
             return;
         };
-        match vst.open_editor() {
-            Ok(()) => {
-                self.status =
-                    "Plugin editor opened in helper — load your Kontakt instrument there"
-                        .to_string();
-            }
-            Err(err) => self.status = format!("Could not open plugin editor: {err:#}"),
-        }
+        let status = match host.client.open_editor() {
+            Ok(()) => format!(
+                "{} editor opened — tracks sharing it play on their own MIDI channels",
+                host.client.name
+            ),
+            Err(err) => format!("Could not open plugin editor: {err:#}"),
+        };
+        self.status = status;
     }
 
     pub fn save_vst_state(&mut self) {
-        let Some(vst) = &mut self.vst else {
-            self.status = "No VST instrument loaded".to_string();
+        let Some(host) = self.track_host() else {
+            self.status = "This track plays the built-in piano".to_string();
             return;
         };
-        let path = vst_state_path_for(&vst.path);
-        if let Some(parent) = path.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                self.status = format!(
-                    "Could not create VST state directory {}: {err}",
-                    parent.display()
-                );
-                return;
-            }
+        let path = vst_state_path_for(&host.path);
+        if let Some(parent) = path.parent()
+            && let Err(err) = std::fs::create_dir_all(parent)
+        {
+            self.status = format!(
+                "Could not create VST state directory {}: {err}",
+                parent.display()
+            );
+            return;
         }
-        match vst.save_state(&path) {
-            Ok(bytes) => {
-                self.status = format!(
-                    "VST state saved in helper ({} bytes) to {}",
-                    bytes,
-                    path.display()
-                )
-            }
-            Err(err) => self.status = format!("Could not save VST state: {err:#}"),
-        }
+        self.status = match host.client.save_state(&path) {
+            Ok(bytes) => format!(
+                "VST state saved in helper ({} bytes) to {}",
+                bytes,
+                path.display()
+            ),
+            Err(err) => format!("Could not save VST state: {err:#}"),
+        };
     }
 
+    /// Put the selected track back on the built-in piano.
     pub fn unload_vst(&mut self) {
-        let old = self.vst.take();
-        self.audio
-            .set_instrument(Box::new(Synth::new(self.audio.sample_rate() as f32)));
-        drop(old);
-        self.status = "Using built-in piano".to_string();
+        if let Some(track) = self.instrument_track() {
+            self.set_instrument(track, None);
+            self.status = "Using built-in piano".to_string();
+        }
     }
 
-    /// If the helper aborts (Kontakt is native code), the UI process keeps
-    /// running and falls back to the built-in piano.
+    /// If a helper aborts (Kontakt is native code), the UI keeps running and
+    /// the tracks on that plugin fall back to the built-in piano.
     fn poll_vst_health(&mut self) {
-        let Some(vst) = &mut self.vst else {
-            return;
-        };
-        if vst.is_alive() {
+        let dead: Vec<PathBuf> = self
+            .rack
+            .hosts
+            .iter_mut()
+            .filter_map(|h| (!h.client.is_alive()).then(|| h.path.clone()))
+            .collect();
+        if dead.is_empty() {
             return;
         }
-        let dead = self.vst.take();
-        self.audio
-            .set_instrument(Box::new(Synth::new(self.audio.sample_rate() as f32)));
-        drop(dead);
-        self.status = "VST helper crashed; switched to built-in piano".to_string();
+        for path in &dead {
+            if let Some(i) = self.rack.hosts.iter().position(|h| &h.path == path) {
+                let host = self.rack.hosts.remove(i);
+                self.audio.set_slot(host.slot, None);
+                self.rack.slots[host.slot as usize] = None;
+                drop(host);
+            }
+            self.rack.failed.insert(path.clone());
+        }
+        self.sync_instruments();
+        self.status = format!(
+            "{} crashed; its tracks play the built-in piano · pick it again to retry",
+            dead[0]
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        );
     }
 
     /// React to MIDI keyboards and audio outputs that come and go while the
@@ -716,6 +956,7 @@ impl Session {
             && path.exists()
         {
             self.load_vst_path(path);
+            self.history.clear();
         }
         self.drain_midi();
         self.poll_devices();
@@ -883,6 +1124,43 @@ fn decode_gbk_lossy(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+fn piano(sample_rate: u32) -> Synth {
+    let mut synth = Synth::new(sample_rate as f32);
+    synth.set_master_gain(0.9);
+    synth
+}
+
+/// Status line for a plugin that would not load, mirrored to stderr: the
+/// status bar truncates, and a terminal transcript is what goes into a bug
+/// report.
+fn load_failure(path: &Path, err: &anyhow::Error) -> String {
+    let tail = helper_log_tail(3);
+    eprintln!("---- VST helper load failed ----");
+    eprintln!("plugin: {}", path.display());
+    eprintln!("error : {err:#}");
+    if !tail.is_empty() {
+        eprintln!("helper log tail:");
+        for line in tail.lines() {
+            eprintln!("  {line}");
+        }
+    }
+    eprintln!("full log: {}", helper_log_path().display());
+    eprintln!("--------------------------------");
+    if tail.is_empty() {
+        format!(
+            "VST helper load failed for {}: {err:#} (helper log: {})",
+            path.display(),
+            helper_log_path().display()
+        )
+    } else {
+        format!(
+            "VST helper load failed: {err:#} · helper says: {} (log: {})",
+            tail.replace('\n', " | "),
+            helper_log_path().display()
+        )
+    }
+}
+
 fn vst_state_path_for(plugin_path: &Path) -> PathBuf {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -974,6 +1252,118 @@ mod tests {
         assert_eq!(s.record_region, Some(new.id));
         s.undo();
         assert_eq!(s.project.track(track).unwrap().regions.len(), regions);
+    }
+
+    fn two_tracks() -> Session {
+        let mut s = Session::new();
+        let mut song = Song::demo();
+        for n in song.notes.iter_mut().filter(|n| n.key < 55) {
+            n.channel = 1;
+        }
+        s.set_project(Project::from_song(&song));
+        s
+    }
+
+    fn pianos(s: &Session) -> Vec<Id> {
+        s.rack
+            .slots
+            .iter()
+            .flatten()
+            .filter_map(|src| match src {
+                Source::Piano(id) => Some(*id),
+                Source::Plugin(_) => None,
+            })
+            .collect()
+    }
+
+    /// Each track plays its own piano, so its fader is a real gain stage;
+    /// deleting a track frees its slot, and undo brings it back.
+    #[test]
+    fn every_track_gets_its_own_instrument_slot() {
+        let mut s = two_tracks();
+        let ids: Vec<Id> = s.project.tracks.iter().map(|t| t.id).collect();
+        assert_eq!(pianos(&s), ids);
+        let plan = rack::plan(&s.project, &s.rack.slots, &s.rack.failed);
+        assert_ne!(plan.routes[0].slot, plan.routes[1].slot);
+        assert_eq!(plan.routes[1].channel, 1);
+
+        s.apply("Delete Track", Edit::RemoveTrack { track: ids[1] });
+        assert_eq!(pianos(&s), vec![ids[0]]);
+        s.undo();
+        assert_eq!(pianos(&s).len(), 2);
+    }
+
+    /// Volume, mute and solo change the mix, not the notes that play.
+    #[test]
+    fn mixing_does_not_touch_the_timeline() {
+        let mut s = two_tracks();
+        let before = s.timeline.clone();
+        let t = s.project.tracks[0].id;
+        s.apply("Volume", Edit::SetTrack { track: t, field: TrackField::Volume(0.4) });
+        assert_eq!(s.timeline, before, "velocities stay as written");
+        let plan = rack::plan(&s.project, &s.rack.slots, &s.rack.failed);
+        assert!(plan.gains.contains(&(plan.routes[0].slot, 0.4)));
+    }
+
+    /// A plugin that will not load leaves the track as it was, with no undo
+    /// step, and says why.
+    #[test]
+    fn a_plugin_that_fails_to_load_changes_nothing() {
+        let mut s = two_tracks();
+        let before = s.project.clone();
+        let label = s.history.undo_label().map(str::to_string);
+        s.load_vst_path(PathBuf::from("/nonexistent/Missing.vst3"));
+        assert_eq!(s.project, before);
+        assert_eq!(s.history.undo_label().map(str::to_string), label);
+        assert!(s.status.contains("failed"), "status: {}", s.status);
+        assert!(s.rack.hosts.is_empty());
+    }
+
+    /// Two tracks on one real Kontakt share a single host on their own
+    /// channels, and export renders through it. Needs Kontakt installed:
+    /// `cargo test -p surf-ui kontakt -- --ignored`.
+    #[test]
+    #[ignore]
+    fn tracks_share_one_kontakt_host() {
+        let kontakt = PathBuf::from("/Library/Audio/Plug-Ins/VST3/Kontakt 8.vst3");
+        if !kontakt.exists() {
+            return;
+        }
+        // SAFETY: set before any thread reads it.
+        unsafe { std::env::set_var("SURF_NO_EDITOR", "1") };
+        let mut s = two_tracks();
+        let ids: Vec<Id> = s.project.tracks.iter().map(|t| t.id).collect();
+        for id in &ids {
+            s.set_input_track(Some(*id));
+            s.load_vst_path(kontakt.clone());
+            assert!(s.rack.host(&kontakt).is_some(), "status: {}", s.status);
+        }
+        assert_eq!(s.rack.hosts.len(), 1, "one host for both tracks");
+        assert!(pianos(&s).is_empty());
+        let plan = rack::plan(&s.project, &s.rack.slots, &s.rack.failed);
+        assert_eq!(plan.routes[0].slot, plan.routes[1].slot);
+        assert_eq!((plan.routes[0].channel, plan.routes[1].channel), (0, 1));
+        assert_eq!(plan.cc7.len(), 2);
+
+        let out = std::env::temp_dir().join(format!("surf-kontakt-{}.wav", std::process::id()));
+        s.export_wav_to(out.clone());
+        while s.rendering {
+            s.poll_render();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(s.status.starts_with("WAV ready"), "status: {}", s.status);
+        assert!(out.exists());
+        std::fs::remove_file(&out).ok();
+
+        // Back to the piano on one track: the host stays for the other.
+        s.set_input_track(Some(ids[0]));
+        s.unload_vst();
+        assert_eq!(s.rack.hosts.len(), 1);
+        s.set_input_track(Some(ids[1]));
+        s.unload_vst();
+        assert!(s.rack.hosts.is_empty(), "no track uses it: the host stops");
+        s.undo();
+        assert_eq!(s.rack.hosts.len(), 1, "undo brings it back");
     }
 
     /// Export writes every track, on its own channel.

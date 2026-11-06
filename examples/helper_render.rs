@@ -24,7 +24,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut client = VstClient::load(&plugin, 48_000, None)?;
     let (path, duration, peak) =
-        client.render(out.as_ref(), notes, timeline.duration, 48_000, 2.0)?;
+        client.render(out.as_ref(), notes, timeline.duration, 48_000, 2.0, Vec::new())?;
     println!("helper rendered {path} · {duration:.2}s · peak {:.1}%", peak * 100.0);
     Ok(())
 }

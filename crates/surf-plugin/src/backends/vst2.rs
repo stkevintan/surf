@@ -269,20 +269,28 @@ impl Vst2Instrument {
 }
 
 impl Instrument for Vst2Instrument {
-    fn note_on(&mut self, key: u8, velocity: u8) {
-        self.send_midi([0x90, key, velocity]);
+    fn note_on(&mut self, channel: u8, key: u8, velocity: u8) {
+        self.send_midi([0x90 | (channel & 15), key, velocity]);
     }
 
-    fn note_off(&mut self, key: u8) {
-        self.send_midi([0x80, key, 0]);
+    fn note_off(&mut self, channel: u8, key: u8) {
+        self.send_midi([0x80 | (channel & 15), key, 0]);
     }
 
     fn all_notes_off(&mut self) {
-        self.send_midi([0xB0, 123, 0]);
+        // Tracks sharing the plugin play on different channels.
+        for channel in 0..16u8 {
+            self.send_midi([0xB0 | channel, 64, 0]);
+            self.send_midi([0xB0 | channel, 123, 0]);
+        }
     }
 
-    fn set_sustain(&mut self, down: bool) {
-        self.send_midi([0xB0, 64, if down { 127 } else { 0 }]);
+    fn set_sustain(&mut self, channel: u8, down: bool) {
+        self.send_midi([0xB0 | (channel & 15), 64, if down { 127 } else { 0 }]);
+    }
+
+    fn control_change(&mut self, channel: u8, controller: u8, value: u8) {
+        self.send_midi([0xB0 | (channel & 15), controller & 127, value & 127]);
     }
 
     fn process(&mut self, out: &mut [f32], frames: usize) {

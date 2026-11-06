@@ -125,6 +125,10 @@ impl VstPlugin {
     }
 }
 
+fn midi_channel(channel: u8) -> MidiChannel {
+    MidiChannel::from_index(channel & 15).unwrap_or(MidiChannel::Ch1)
+}
+
 pub struct VstInstrument {
     plugin: Arc<Mutex<Plugin>>,
     buffers: AudioBuffers,
@@ -153,17 +157,17 @@ impl VstInstrument {
 }
 
 impl Instrument for VstInstrument {
-    fn note_on(&mut self, key: u8, velocity: u8) {
+    fn note_on(&mut self, channel: u8, key: u8, velocity: u8) {
         if let Ok(mut plugin) = self.plugin.lock() {
-            if let Err(err) = plugin.send_midi_note(key, velocity, MidiChannel::Ch1) {
+            if let Err(err) = plugin.send_midi_note(key, velocity, midi_channel(channel)) {
                 eprintln!("VST note_on failed: {err}");
             }
         }
     }
 
-    fn note_off(&mut self, key: u8) {
+    fn note_off(&mut self, channel: u8, key: u8) {
         if let Ok(mut plugin) = self.plugin.lock() {
-            if let Err(err) = plugin.send_midi_note_off(key, MidiChannel::Ch1) {
+            if let Err(err) = plugin.send_midi_note_off(key, midi_channel(channel)) {
                 eprintln!("VST note_off failed: {err}");
             }
         }
@@ -175,9 +179,15 @@ impl Instrument for VstInstrument {
         }
     }
 
-    fn set_sustain(&mut self, down: bool) {
+    fn set_sustain(&mut self, channel: u8, down: bool) {
         if let Ok(mut plugin) = self.plugin.lock() {
-            let _ = plugin.send_midi_cc(64, if down { 127 } else { 0 }, MidiChannel::Ch1);
+            let _ = plugin.send_midi_cc(64, if down { 127 } else { 0 }, midi_channel(channel));
+        }
+    }
+
+    fn control_change(&mut self, channel: u8, controller: u8, value: u8) {
+        if let Ok(mut plugin) = self.plugin.lock() {
+            let _ = plugin.send_midi_cc(controller & 127, value & 127, midi_channel(channel));
         }
     }
 
@@ -232,6 +242,7 @@ pub fn render_vst_to_wav(
     output: impl AsRef<Path>,
     sample_rate: u32,
     options: &RenderOptions,
+    controls: &[(u8, u8, u8)],
 ) -> Result<RenderStats> {
     let plugin_path = plugin_path.as_ref();
     let mut host = Vst3Host::builder()
@@ -253,5 +264,8 @@ pub fn render_vst_to_wav(
     plugin.start_processing()?;
     let name = plugin.info().name.clone();
     let mut instrument = VstInstrument::new(Arc::new(Mutex::new(plugin)), name, sample_rate);
+    for &(channel, controller, value) in controls {
+        instrument.control_change(channel, controller, value);
+    }
     render_with_instrument(timeline, &mut instrument, output, options)
 }

@@ -500,6 +500,8 @@ impl Render for SurfApp {
         window.request_animation_frame();
         self.session.tick();
         self.ui.edit.reconcile(&self.session.project);
+        // Live input and the instrument commands follow the selected track.
+        self.session.set_input_track(self.ui.edit.track);
         if let Some(region) = self.session.record_region.take() {
             self.ui
                 .edit

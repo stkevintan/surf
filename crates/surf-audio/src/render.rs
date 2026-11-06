@@ -82,7 +82,7 @@ pub fn render_with_instrument(
     let content_frames = ((timeline.duration + tail) * sample_rate).ceil() as u64;
     let total_frames = content_frames + latency;
     let mut next_note = 0usize;
-    let mut active: Vec<(u8, u64)> = Vec::new();
+    let mut active: Vec<(u8, u8, u64)> = Vec::new();
     let mut pos = 0u64;
     // 64 frames matches the VST3 host block size used by the live engine, so
     // the same code path works for the built-in synth and for Kontakt.
@@ -95,16 +95,16 @@ pub fn render_with_instrument(
         let end = pos + chunk as u64;
 
         let mut ended = Vec::new();
-        active.retain(|(key, note_end)| {
+        active.retain(|(channel, key, note_end)| {
             if *note_end <= end {
-                ended.push(*key);
+                ended.push((*channel, *key));
                 false
             } else {
                 true
             }
         });
-        for key in ended {
-            instrument.note_off(key);
+        for (channel, key) in ended {
+            instrument.note_off(channel, key);
         }
         while next_note < timeline.notes.len() {
             let note = &timeline.notes[next_note];
@@ -116,8 +116,12 @@ pub fn render_with_instrument(
             if start < pos {
                 continue;
             }
-            instrument.note_on(note.key, note.velocity);
-            active.push((note.key, ((note.end * sample_rate) as u64).max(start + 1)));
+            instrument.note_on(note.channel, note.key, note.velocity);
+            active.push((
+                note.channel,
+                note.key,
+                ((note.end * sample_rate) as u64).max(start + 1),
+            ));
         }
 
         instrument.process(&mut block[..chunk * 2], chunk);
@@ -141,6 +145,59 @@ pub fn render_with_instrument(
     Ok(RenderStats {
         frames: written,
         duration: written as f64 / sample_rate,
+        peak,
+        path: path.display().to_string(),
+    })
+}
+
+/// Mix rendered stems into one file: each stem scaled by its gain, the sum
+/// by `master`. Stems may differ in length; the mix is as long as the longest.
+/// All stems must share `sample_rate` and be 24-bit stereo, as
+/// [`render_with_instrument`] writes them.
+pub fn mix_stems(
+    stems: &[(std::path::PathBuf, f32)],
+    path: impl AsRef<Path>,
+    sample_rate: u32,
+    master: f32,
+) -> Result<RenderStats> {
+    const FULL: f32 = 8_388_607.0;
+    let mut mix: Vec<f32> = Vec::new();
+    for (stem, gain) in stems {
+        let mut reader = hound::WavReader::open(stem)
+            .with_context(|| format!("could not read stem {}", stem.display()))?;
+        let spec = reader.spec();
+        if spec.channels != 2 || spec.sample_rate != sample_rate {
+            anyhow::bail!("stem {} is not {sample_rate} Hz stereo", stem.display());
+        }
+        for (i, sample) in reader.samples::<i32>().enumerate() {
+            let v = sample? as f32 / FULL * gain;
+            if i >= mix.len() {
+                mix.push(v);
+            } else {
+                mix[i] += v;
+            }
+        }
+    }
+    let path = path.as_ref();
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate,
+        bits_per_sample: 24,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)
+        .with_context(|| format!("could not create {}", path.display()))?;
+    let mut peak = 0.0f32;
+    for v in &mix {
+        let v = (v * master).clamp(-1.0, 1.0);
+        peak = peak.max(v.abs());
+        writer.write_sample((v * FULL) as i32)?;
+    }
+    writer.finalize()?;
+    let frames = (mix.len() / 2) as u64;
+    Ok(RenderStats {
+        frames,
+        duration: frames as f64 / sample_rate.max(1) as f64,
         peak,
         path: path.display().to_string(),
     })
@@ -192,6 +249,19 @@ mod tests {
         let reader = hound::WavReader::open(&path).unwrap();
         assert_eq!(reader.spec().channels, 2);
         assert_eq!(reader.spec().bits_per_sample, 24);
+
+        // Two copies at half gain mix back to the original level.
+        let mixed = path.with_extension("mix.wav");
+        let half = mix_stems(
+            &[(path.clone(), 0.5), (path.clone(), 0.5)],
+            &mixed,
+            48_000,
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(half.frames, stats.frames);
+        assert!((half.peak - stats.peak).abs() < 1e-3, "{} vs {}", half.peak, stats.peak);
+        std::fs::remove_file(mixed).ok();
         std::fs::remove_file(path).ok();
     }
 }

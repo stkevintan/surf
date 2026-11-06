@@ -89,7 +89,7 @@ fn main() -> anyhow::Result<()> {
     // MIDI 69 is A4; if the chain is honest this must read ~440 Hz.
     const KEY: u8 = 69;
     let mut synth = Synth::new(device_rate as f32);
-    synth.note_on(KEY, 110);
+    synth.note_on(0, KEY, 110);
     let frames = device_rate as usize; // one second
     let mut stereo = vec![0.0f32; frames * 2];
     // Render in the engine's block size so the measurement sees the real path.

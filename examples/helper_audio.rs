@@ -12,7 +12,7 @@ fn main() -> anyhow::Result<()> {
     let mut instrument = client.instrument();
 
     std::thread::sleep(std::time::Duration::from_millis(800));
-    instrument.note_on(60, 110);
+    instrument.note_on(0, 60, 110);
     let mut buffer = [0.0f32; 128];
     let mut peak = 0.0f32;
     for _ in 0..3_000 {
@@ -22,7 +22,7 @@ fn main() -> anyhow::Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    instrument.note_off(60);
+    instrument.note_off(0, 60);
     println!("shared-memory audio peak: {:.1}%", peak * 100.0);
     Ok(())
 }

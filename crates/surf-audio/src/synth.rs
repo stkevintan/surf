@@ -120,7 +120,7 @@ impl Synth {
 }
 
 impl Instrument for Synth {
-    fn note_on(&mut self, key: u8, velocity: u8) {
+    fn note_on(&mut self, _channel: u8, key: u8, velocity: u8) {
         if !(super::MIN_KEY..=super::MAX_KEY).contains(&key) {
             return;
         }
@@ -148,11 +148,11 @@ impl Instrument for Synth {
             .push(Voice::new(key, velocity, self.sample_rate));
     }
 
-    fn note_off(&mut self, key: u8) {
+    fn note_off(&mut self, _channel: u8, key: u8) {
         self.release_key(key);
     }
 
-    fn set_sustain(&mut self, down: bool) {
+    fn set_sustain(&mut self, _channel: u8, down: bool) {
         self.sustain = down;
         if !down {
             // Pedal up only releases notes whose keys are already up.
@@ -215,7 +215,7 @@ mod tests {
     #[test]
     fn renders_a_note() {
         let mut synth = Synth::new(48_000.0);
-        synth.note_on(60, 100);
+        synth.note_on(0, 60, 100);
         let mut buffer = vec![0.0f32; 4800 * 2];
         synth.process(&mut buffer, 4800);
         assert!(buffer.iter().any(|s| s.abs() > 1e-4));
@@ -225,10 +225,10 @@ mod tests {
     #[test]
     fn note_off_releases() {
         let mut synth = Synth::new(48_000.0);
-        synth.note_on(60, 100);
+        synth.note_on(0, 60, 100);
         let mut buffer = vec![0.0f32; 4800 * 2];
         synth.process(&mut buffer, 4800);
-        synth.note_off(60);
+        synth.note_off(0, 60);
         let mut tail = vec![0.0f32; 48_000 * 2];
         synth.process(&mut tail, 48_000);
         assert!(tail.iter().all(|s| s.is_finite()));
@@ -241,9 +241,9 @@ mod tests {
     #[test]
     fn sustain_holds_notes() {
         let mut synth = Synth::new(48_000.0);
-        synth.set_sustain(true);
-        synth.note_on(60, 100);
-        synth.note_off(60);
+        synth.set_sustain(0, true);
+        synth.note_on(0, 60, 100);
+        synth.note_off(0, 60);
         let mut buffer = vec![0.0f32; 9600 * 2];
         synth.process(&mut buffer, 9600);
         let late = &buffer[8000 * 2..];

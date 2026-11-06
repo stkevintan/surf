@@ -43,16 +43,16 @@ fn tail_with_pedal(plugin: &VstPlugin, pedal: bool) -> f32 {
     render_peak(&mut instrument, 0.2);
 
     if pedal {
-        instrument.set_sustain(true);
+        instrument.set_sustain(0, true);
     }
-    instrument.note_on(60, 110);
+    instrument.note_on(0, 60, 110);
     render_peak(&mut instrument, 0.5); // let it speak
-    instrument.note_off(60);
+    instrument.note_off(0, 60);
     // Skip the natural decay right after release, then measure what is left.
     render_peak(&mut instrument, 0.5);
     let tail = render_peak(&mut instrument, 1.0);
 
-    instrument.set_sustain(false);
+    instrument.set_sustain(0, false);
     instrument.all_notes_off();
     tail
 }

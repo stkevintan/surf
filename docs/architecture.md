@@ -49,7 +49,7 @@ surf (UI process)                                        surf-plugin-host  (one 
 - **Control plane:** line-delimited JSON over the host's stdin/stdout. It carries requests and events: load state, open editor, render.
 - **Data plane:** one shared-memory region per host with two lock-free single-producer/single-consumer (SPSC) rings, one for audio and one for MIDI. The real-time paths never touch the control pipe.
 
-*Current:* one host process at a time (`surf-vst-host`). It builds and runs on Windows and macOS; plugin loading is only verified on Windows. *Target:* one host per plugin-backed track, all three platforms.
+*Current:* one host per distinct plugin. Tracks that pick the same plugin share its host and are told apart by MIDI channel, so one Kontakt can play several tracks in multi mode (§2.6). Plugin loading is verified on Windows and macOS (Kontakt 8 VST3). *Target:* the same on Linux.
 
 ### 1.3 Layers
 
@@ -103,7 +103,7 @@ UiState ─ selection (regions | notes), focus area, edit region, zoom/scroll   
 
 Positions are stored in **ticks** (PPQ 960 in the target; 480 today) and converted to seconds or frames through the tempo map only at the edges: playback scheduling, rendering, drawing.
 
-*Current:* `surf-core::project::Project` holds tracks → regions → notes, in ticks at the file's PPQ (480 for files Surf writes). Note starts are relative to their region, so moving a region moves its notes. Every object has a stable `Id`, so selection and undo survive edits. Mixer fields are `volume`, `mute`, `solo` and `channel`. There is no per-track instrument yet: all tracks play through the one loaded instrument (§2.3). `Song` remains the MIDI-file form; `Project::from_song` makes one track per MIDI channel, and `Project::to_song` / `timeline()` flatten it back for export and playback.
+*Current:* `surf-core::project::Project` holds tracks → regions → notes, in ticks at the file's PPQ (480 for files Surf writes). Note starts are relative to their region, so moving a region moves its notes. Every object has a stable `Id`, so selection and undo survive edits. Mixer fields are `volume`, `mute`, `solo` and `channel`, and `instrument` names the plugin the track plays (`None` is the built-in piano). Changing it is an undoable edit like any other (§2.6). `Song` remains the MIDI-file form; `Project::from_song` makes one track per MIDI channel, and `Project::to_song` / `timeline()` flatten it back for export and playback.
 
 ### 1.6 Cross-platform strategy
 
@@ -162,7 +162,7 @@ The app binary does not link `vst3-host` or `vst`; only the host does (`cargo tr
 *Still to come*
 
 ```
-crates/surf-audio/         per-track instruments and gain (Kontakt shared by MIDI channel) (phase 3)
+crates/surf-audio/         engine with instrument slots, routes and slot gains (phase 3 ✅)
 crates/surf-visual/        wgpu stage renderer (phase 4)
 ```
 
@@ -194,7 +194,7 @@ Each module is listed with its responsibility, public surface, and implementatio
 
 **Responsibility:** the single source of truth for musical data, and every operation that changes it.
 
-- `project.rs`: `Project { tempos, time_signature, tracks: Vec<Track> }`, `Track { channel, mute, solo, volume, regions }`, `Region { start, len, notes }`, `Note { key, velocity, start, len }`, all with `Id`s. Conversions: `from_song`, `to_song`, `timeline()`. `timeline()` drops tracks that are muted or soloed out, and scales velocity by track volume until each track gets a real gain stage. Notes past a region's end are kept but don't play.
+- `project.rs`: `Project { tempos, time_signature, tracks: Vec<Track> }`, `Track { channel, mute, solo, volume, regions }`, `Region { start, len, notes }`, `Note { key, velocity, start, len }`, all with `Id`s. Conversions: `from_song`, `to_song`, `timeline()`. `timeline()` drops tracks that are muted or soloed out and tags every note with its track's index (`TimedNote::track`), which the engine routes. Volume is the engine's gain stage, so velocities play as written. Notes past a region's end are kept but don't play.
 - `edit.rs`: `Edit`, an enum covering every change:
   - notes: move, resize, velocity, add, delete, quantize;
   - regions: move (across tracks), resize, split, join, insert, remove;
@@ -225,11 +225,12 @@ Tests apply every edit kind and undo it, asserting the project is bit-for-bit un
 **Responsibility:** produce audio in real time and offline from scheduled notes.
 
 ```rust
-pub trait Instrument: Send {          // src/audio/mod.rs
-    fn note_on(&mut self, key: u8, velocity: u8);
-    fn note_off(&mut self, key: u8);
+pub trait Instrument: Send {          // surf-audio/src/lib.rs
+    fn note_on(&mut self, channel: u8, key: u8, velocity: u8);
+    fn note_off(&mut self, channel: u8, key: u8);
     fn all_notes_off(&mut self);
-    fn set_sustain(&mut self, down: bool);
+    fn set_sustain(&mut self, channel: u8, down: bool);
+    fn control_change(&mut self, _channel: u8, _cc: u8, _value: u8) {}
     fn process(&mut self, out: &mut [f32], frames: usize); // interleaved stereo
     fn latency_samples(&self) -> u32 { 0 }
     fn set_sample_rate(&mut self, _sr: f32) {}
@@ -237,18 +238,18 @@ pub trait Instrument: Send {          // src/audio/mod.rs
 }
 ```
 
-`Instrument` is the seam that lets the engine stay unaware of where sound comes from. Implementations: `Synth` (built-in), `RemoteInstrument` (a plugin in a host, via shared memory), and inside the host binary `VstInstrument` / `Vst2Instrument`.
+`Instrument` is the seam that lets the engine stay unaware of where sound comes from. Implementations: `Synth` (built-in, ignores the channel), `RemoteInstrument` (a plugin in a host, via shared memory), and inside the host binary `VstInstrument` / `Vst2Instrument`, which put the channel on the MIDI they send.
 
 **Engine** (`engine.rs`):
-- `AudioEngine::new(instrument)` opens the default cpal output. If none is available, it starts a `NullClock` thread that renders 240-frame blocks every 5 ms, so the timeline keeps moving without a device.
-- The UI sends `Command`s (`NoteOn`, `Play { timeline, from }`, `Seek`, `SetInstrument { ack }`, …) over an unbounded crossbeam channel. The callback drains them at the start of each buffer.
-- `Core::render(frames)` works in 64-frame chunks. For each chunk it triggers note-offs, then note-ons whose start frame falls inside it, then calls `instrument.process`, applies volume and clamping, and tracks the peak.
-- Status goes out through atomics: `position_frames`, `duration_frames`, `playing`, `peak`, `sample_rate`.
-- `SetInstrument` carries an optional `ack` sender. The old instrument is dropped on the audio thread, then the ack fires, so the UI can safely release the last plugin handle.
+- `AudioEngine::new()` opens the default cpal output with every instrument slot empty. If no output is available, it starts a `NullClock` thread that renders 240-frame blocks every 5 ms, so the timeline keeps moving without a device.
+- **Slots and routes.** The engine mixes up to `MAX_SLOTS` (32) instruments. `SetSlot { slot, instrument, ack }` fills or empties one; the old instrument is dropped on the audio thread before the ack fires, so the UI can then release the last plugin handle. `SetRoutes(Vec<Route>)` says, by track index, which slot and MIDI channel each track plays: `Route { slot, channel }`. `SetSlotGain` sets a slot's gain. `SetInput(track)` picks the track live input plays.
+- The UI sends `Command`s over an unbounded crossbeam channel; the callback drains them at the start of each buffer.
+- `Core::render(frames)` works in 64-frame chunks. For each chunk it triggers note-offs, then note-ons whose start frame falls inside it, each on its track's route. Then it runs **every** filled slot, even a silent one, since a plugin host's audio ring has to keep draining. It scales each slot by its gain, sums the slots, applies master volume and clamping, and tracks the peaks.
+- Live notes remember the route they went to, so a note-off follows its note-on even if the input track changed while the key was down.
+- Status goes out through atomics: `position_frames`, `duration_frames`, `playing`, `peak`, `slot_peaks[]`, `sample_rate`.
 
 **Target changes:**
-- One `Core` with N track lanes, each lane holding its own `Instrument`, gain, and pan, summed into the master bus.
-- Scheduling reads `surf-core::playback_events` instead of a flattened `Timeline`.
+- Pan per slot, and effects inserts.
 - `Command::SetProject(Arc<ProjectSnapshot>)` swaps an immutable snapshot after each edit, so editing never locks the audio thread.
 
 **Output changes:** the cpal error callback classifies stream errors into `OutputEvent`s instead of printing them:
@@ -259,7 +260,7 @@ pub trait Instrument: Send {          // src/audio/mod.rs
 
 The UI drains these each frame and shows them in the status bar.
 
-**Offline render** (`render.rs`): `render_with_instrument(timeline, &mut dyn Instrument, path, opts)` runs the same chunked trigger loop with no device and writes 24-bit stereo WAV via `hound`. It handles plugin latency and the tail (L3 §3.8). Built-in renders run on a UI-process worker thread; plugin renders run inside the host.
+**Offline render** (`render.rs`): `render_with_instrument(timeline, &mut dyn Instrument, path, opts)` runs the same chunked trigger loop with no device and writes 24-bit stereo WAV via `hound`. It handles plugin latency and the tail (L3 §3.8). Export renders one stem per slot and `mix_stems` sums them with the slot gains and master volume. Built-in stems render on a UI-process worker thread; plugin stems render inside their host.
 
 ### 2.4 `surf-plugin` — hosting client, protocol, transport
 
@@ -280,10 +281,10 @@ The UI drains these each frame and shows them in the status bar.
 2. Spawn the host with `--shm --plugin --sample-rate [--state]`. Set the working directory to the plugin's parent folder, give it a private empty `TEMP`, and send stderr to an append-only log file (L3 §3.10).
 3. Wait up to **240 s** for `Ready { name, sample_rate }`. Kontakt takes about 80 s on a cold cache.
 4. On failure: get the exit code, kill the child, and replay this run's part of the log to stderr.
-5. While running: the UI polls `is_alive()` (child exit + `helper_alive` flag). On death, the engine swaps in the built-in `Synth`.
+5. While running: the UI polls `is_alive()` (child exit + `helper_alive` flag). On death, the plugin is marked offline and its tracks fall back to built-in pianos until the user picks it again.
 6. On drop: send `Shutdown`, clear `main_alive`, and wait.
 
-**Target:** one `PluginSession` per plugin-backed track; a session pool with lazy start; non-blocking requests (render and state save return futures or poll handles instead of blocking the UI thread); and a CLAP backend via `clack`.
+**Target:** non-blocking requests (render and state save return futures or poll handles instead of blocking the UI thread); and a CLAP backend via `clack`.
 
 ### 2.5 `surf-plugin-host` — the host binary *(today `src/bin/vst_helper.rs`)*
 
@@ -319,6 +320,13 @@ The host audio thread is described in L3 §3.2.
 | `theme` | — | constants generated from `docs/design/tokens.json` |
 
 `UiState { selection: Regions(Set) | Notes(Set), focus: Tracks | Roll, edit_region, … }` lives in `surf-ui`, not in the project file.
+
+**Instruments per track** (`session.rs`, `rack.rs`). The Library puts the picked plugin on the selected track as an undoable edit. After every edit, `Session::sync_instruments` makes the engine match the project:
+- every track on the built-in piano gets its own piano in its own slot, so its fader is a real gain stage;
+- tracks that name the same plugin share one host and one slot, each on its own MIDI channel (Kontakt multi);
+- hosts no track uses are stopped, and their state is parked for undo (§3.9).
+
+`rack::plan` is the pure part: it maps each track to a `Route` and each slot to a gain. A slot with one track takes that track's fader. A shared plugin's audio comes back already mixed, so its tracks are balanced with CC 7 (channel volume) instead. If a plugin fails to load, nothing changes and nothing goes on the undo stack. Slot 0 is a spare piano for tracks that find no free slot. Live input plays the record-armed track, else the selected one. Opening a MIDI file keeps the loaded plugins: each new track takes the instrument of the old track on its channel.
 
 ### 2.7 `surf-platform` — OS seams
 
@@ -363,7 +371,7 @@ UI audio callback (cpal, ~480 frames)          host audio thread (MMCSS, 1 ms sl
 - **Self-pacing.** The host renders "up to the cushion" instead of "since elapsed time". Rendering whole 64-frame blocks against a time target loses a remainder every pass and drifts slower than real time. Topping up to a depth corrects itself at the consumer's drain rate.
 - **Backlog trim.** If the consumer stalls (a long GUI operation), the UI drops audio beyond 1536 frames (32 ms) so latency cannot grow without bound.
 - **Underrun.** It plays silence and never repeats stale audio.
-- **Known gap.** `MidiMsg` carries no frame offset; the host applies MIDI at the start of its next 64-frame block, giving roughly 1–11 ms of jitter on plugin playback. *Target:* put a target frame index in the `_pad` field and split the plugin block at event offsets.
+- **Known gap.** `MidiMsg` carries no frame offset; the host applies MIDI at the start of its next 64-frame block, giving roughly 1–11 ms of jitter on plugin playback. *Target:* add a target frame index to `MidiMsg` and split the plugin block at event offsets.
 
 ### 3.3 Shared-memory layout (`surf-plugin::shm`)
 
@@ -379,12 +387,12 @@ offset  size   field
 48      4      helper_alive
 52      4      main_alive
 64      16384 × 2 × f32      audio ring  (~341 ms @ 48 kHz)
-…       1024 × 16 B          MIDI ring   MidiMsg { kind, a, b, _pad } (u32 each)
+…       1024 × 16 B          MIDI ring   MidiMsg { kind, a, b, channel } (u32 each)
 ```
 
 - Indices only increase; the slot is `index % capacity`. Fill level is `write − read`. The producer only writes `write`, the consumer only writes `read`, both with release/acquire ordering.
 - `push_audio` fails (and the host drops the block) when the ring is full; `push_midi` fails when 1024 messages are pending.
-- `MidiKind`: 1 NoteOn(a=key, b=vel), 2 NoteOff(a=key), 3 Sustain(a=down), 4 AllNotesOff, 5 PitchBend (reserved).
+- `MidiKind`: 1 NoteOn(a=key, b=vel), 2 NoteOff(a=key), 3 Sustain(a=down), 4 AllNotesOff, 5 PitchBend (reserved), 6 ControlChange(a=controller, b=value). `channel` is the MIDI channel 0–15; it used to be padding, so an older UI plays everything on channel 1.
 
 ### 3.4 Control protocol (stdin/stdout JSON)
 
@@ -396,7 +404,7 @@ One JSON object per line, tagged with serde (`"cmd"` for requests, `"event"` for
 | `CloseEditor` | — | `EditorClosed` |
 | `SaveState` | `path` | `StateSaved { bytes, path }` \| `Error` |
 | `LoadState` | `path` | `StateLoaded` \| `Error` |
-| `Render` | `output, sample_rate, notes: [RenderNote], duration, tail_secs` | `RenderDone { path, duration, peak }` \| `Error` |
+| `Render` | `output, sample_rate, notes: [RenderNote], duration, tail_secs, controls: [(channel, cc, value)]` | `RenderDone { path, duration, peak }` \| `Error` |
 | `Ping` | — | `Pong` |
 | `Shutdown` | — | (process exits) |
 
@@ -431,7 +439,7 @@ The computer keyboard (`A W S E D F T G Y H U J K O L P ;` → C4–E5 today, C3
 
 ### 3.8 Offline rendering
 
-- **Built-in:** `render_timeline_to_wav` on a worker thread; the UI polls `render_rx`.
+- **Stems:** export renders each instrument slot on its own: built-in pianos with `render_timeline_to_wav` on a worker thread, plugins in their host. `mix_stems` then sums them with each slot's gain and the master volume; the UI polls `render_rx`.
 - **Plugin:** the UI sends `Render` to the host. The host saves the live instance's state, creates a **fresh** instance, sets `ProcessMode::Offline`, loads the state, then runs the render loop.
 - **Loop:** 64-frame blocks. Total frames = `(duration + tail) × sr + latency`. The first `latency_samples()` frames are discarded, so plugin delay doesn't shift the file. Samples are clamped to ±1 and written as 24-bit integers (`× 8 388 607`), stereo. The default tail is 3 s.
 - **Known gaps:** the plugin render blocks the UI thread (`VstClient::render` waits synchronously), and it doesn't pump messages, so the editor freezes too. Creating a second instance doubles memory and load time, which is about 80 s for Kontakt. *Target:* async with progress events, and optionally reuse the live instance (pause live output, switch to offline mode, render, switch back).
@@ -440,6 +448,7 @@ The computer keyboard (`A W S E D F T G Y H U J K O L P ;` → C4–E5 today, C3
 
 - State is an opaque blob from `getState` (VST3: component + controller; VST2: chunk). Path: `data_dir()/vst-<hash>.state`, where the hash is a 64-bit `DefaultHasher` of the plugin path. Moving the plugin changes the hash.
 - On load, the state is applied if the file exists and `SURF_NO_STATE` is not set.
+- When the last track lets a plugin go, Surf parks its state in a temp file and stops the host. Undo starts it again from that state, so undoing a change of instrument brings Kontakt back as it was.
 - Kontakt has no "load NKI" API. The supported workflow is: load the instrument in Kontakt's own editor, save state from Surf, and restore it on the next load or render.
 - *Target:* state blobs live inside the project file, per track. The hash-named files become a cache for "last used state".
 
@@ -501,6 +510,6 @@ Each of these comes from a reproduced failure; details are in [troubleshooting.m
 |---|---|---|
 | 1 ✅ | Workspace split + platform layer; macOS builds and runs built-in synth + MIDI + playback; Windows behavior unchanged | §1.6, §1.7, §2.7 |
 | 2 ✅ | `surf-core` model + commands + undo; Logic-style shell; editing in Tracks and Piano Roll; Perform view in GPUI | §2.1, §2.6, §3.1 |
-| 3 | Piano Roll, Event List, Mixer with multi-track engine; sample-accurate plugin MIDI; async export | §2.3, §3.2, §3.8 |
+| 3 | Per-track instruments ✅ (Kontakt shared by MIDI channel ✅, stem export ✅); sample-accurate plugin MIDI; async export | §2.3, §2.6, §3.2, §3.8 |
 | 4 | `surf-visual` stage renderer, video export | §2.8 |
 | ongoing | VST3 editors on macOS/Linux, CLAP backend, settings persistence | §1.6, §2.4, §3.12 |

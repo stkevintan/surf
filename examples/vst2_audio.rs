@@ -13,7 +13,7 @@ mod probe {
         println!("name={} outputs={}", plugin.name, plugin.output_channels);
         let mut instrument = plugin.instrument();
         std::thread::sleep(std::time::Duration::from_millis(300));
-        instrument.note_on(60, 110);
+        instrument.note_on(0, 60, 110);
         let mut buffer = [0.0f32; 128];
         let mut peak = 0.0f32;
         for _ in 0..2_000 {
@@ -23,7 +23,7 @@ mod probe {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        instrument.note_off(60);
+        instrument.note_off(0, 60);
         println!("peak={:.1}%", peak * 100.0);
         Ok(())
     }

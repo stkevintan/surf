@@ -1,4 +1,5 @@
-//! Library: the plugin browser. Picking a row loads it as the instrument.
+//! Library: the plugin browser. Picking a row puts that instrument on the
+//! selected track; tracks that pick the same plugin share one instance.
 
 use gpui::{Context, FontWeight, IntoElement, ParentElement, Styled, div, prelude::*, px, svg};
 
@@ -9,7 +10,13 @@ use crate::widgets::button;
 
 pub fn render(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
     let s = &app.session;
-    let loaded = s.vst.as_ref().map(|v| v.path.clone());
+    let track = app
+        .ui
+        .edit
+        .track
+        .and_then(|t| s.project.track(t))
+        .or_else(|| s.project.tracks.first());
+    let loaded = track.and_then(|t| t.instrument.clone());
     let using_builtin = loaded.is_none();
 
     let mut vst3 = Vec::new();
@@ -46,7 +53,7 @@ pub fn render(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
                     div()
                         .text_size(px(font::SMALL))
                         .text_color(color::TEXT_TERTIARY)
-                        .child("Instrument"),
+                        .child(track.map_or("Instrument".to_string(), |t| t.name.clone())),
                 ),
         )
         .child(
