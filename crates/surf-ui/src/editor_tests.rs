@@ -310,42 +310,44 @@ fn scissors_split_and_join_put_it_back(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn copy_and_paste_notes_at_the_playhead(cx: &mut TestAppContext) {
+fn pasted_notes_land_one_grid_step_after_the_copied_ones(cx: &mut TestAppContext) {
     let mut app = app(cx);
     let region = &app.session.project.tracks[0].regions[0];
-    let picked: Vec<_> = region.notes.iter().take(3).cloned().collect();
+    let picked: Vec<_> = region.notes.iter().skip(4).take(3).cloned().collect();
     let count = region.notes.len();
-    let first = picked.iter().map(|n| n.start).min().unwrap();
     app.ui.edit.focus = Focus::Roll;
     app.ui.edit.notes = picked.iter().map(|n| n.id).collect();
     editing::copy(&mut app.session, &mut app.ui.edit);
+    // The playhead doesn't matter for notes.
+    let far = app.session.project.tick_to_sec(5000);
+    set_playhead(&mut app, far);
+    let grid = app.ui.edit.roll_snap.ticks(&app.session.project);
 
-    let bar = app.session.project.ticks_per_bar();
-    let at = app.session.project.tick_to_sec(2 * bar + 7);
-    set_playhead(&mut app, at);
-    editing::paste(&mut app.session, &mut app.ui.edit);
-
-    let notes = &app.session.project.tracks[0].regions[0].notes;
-    assert_eq!(notes.len(), count + 3);
-    assert_eq!(app.ui.edit.notes.len(), 3, "the pasted notes are selected");
-    for n in &picked {
-        let pasted = notes
-            .iter()
-            .find(|m| {
-                app.ui.edit.notes.contains(&m.id)
-                    && m.key == n.key
-                    && m.start == 2 * bar + n.start - first
-            })
-            .expect("a copy on the snapped playhead");
-        assert_ne!(pasted.id, n.id, "copies get fresh ids");
+    for step in 1..=2 {
+        editing::paste(&mut app.session, &mut app.ui.edit);
+        let notes = &app.session.project.tracks[0].regions[0].notes;
+        assert_eq!(notes.len(), count + 3 * step as usize);
+        assert_eq!(app.ui.edit.notes.len(), 3, "the pasted notes are selected");
+        for n in &picked {
+            let pasted = notes
+                .iter()
+                .find(|m| {
+                    app.ui.edit.notes.contains(&m.id)
+                        && m.key == n.key
+                        && m.start == n.start + step * grid
+                })
+                .expect("a copy one step further on per paste");
+            assert_ne!(pasted.id, n.id, "copies get fresh ids");
+        }
     }
     assert_eq!(app.session.history.undo_label(), Some("Paste"));
+    app.session.undo();
     app.session.undo();
     assert_eq!(app.session.project.tracks[0].regions[0].notes.len(), count);
 }
 
 #[gpui::test]
-fn cut_removes_notes_in_one_step_and_paste_brings_them_back(cx: &mut TestAppContext) {
+fn cut_notes_paste_back_where_they_were(cx: &mut TestAppContext) {
     let mut app = app(cx);
     let before = app.session.project.clone();
     let n = first_note(&app);
@@ -356,17 +358,19 @@ fn cut_removes_notes_in_one_step_and_paste_brings_them_back(cx: &mut TestAppCont
     assert!(region.note(n.id).is_none());
     assert_eq!(app.session.history.undo_label(), Some("Cut"));
 
-    let at = app.session.project.tick_to_sec(n.start);
-    set_playhead(&mut app, at);
     editing::paste(&mut app.session, &mut app.ui.edit);
     let region = &app.session.project.tracks[0].regions[0];
-    let grid = app.ui.edit.roll_snap.ticks(&app.session.project);
-    assert!(
-        region
-            .notes
-            .iter()
-            .any(|m| m.key == n.key && m.start == n.start / grid * grid && m.len == n.len)
-    );
+    let back: Vec<_> = region
+        .notes
+        .iter()
+        .map(|m| (m.key, m.start, m.len, m.velocity))
+        .collect();
+    let orig: Vec<_> = before.tracks[0].regions[0]
+        .notes
+        .iter()
+        .map(|m| (m.key, m.start, m.len, m.velocity))
+        .collect();
+    assert_eq!(back, orig, "cut then paste puts the note back");
     app.session.undo();
     app.session.undo();
     assert_eq!(app.session.project.tracks, before.tracks);

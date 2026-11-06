@@ -134,7 +134,7 @@ pane header 右侧的分段控件切换。
 | `Cmd+Z` / `Shift+Cmd+Z` | 撤销 / 重做 | `Cmd+A` | 全选 |
 | `Cmd+T` | 在播放头处切开 | `Cmd+J` | 合并 region |
 | `Cmd+K` | Musical Typing | `Delete` | 删除选中项 |
-| `Cmd+C` / `Cmd+X` | 复制 / 剪切 | `Cmd+V` | 粘贴到播放头（按网格对齐） |
+| `Cmd+C` / `Cmd+X` | 复制 / 剪切 | `Cmd+V` | 粘贴：音符贴在原音符后一格，region 贴到播放头 |
 
 Musical Typing 开启时，`A W S E D F T G Y H U J K O L P ;` 弹 C3 到 E4（Logic 规则：C3 = MIDI 60），`Z` / `X` 换八度。这时字母键不再触发上表中的快捷键。
 

@@ -94,11 +94,13 @@ pub struct Editing {
     pub clipboard: Option<Clipboard>,
 }
 
-/// What ⌘C / ⌘X copied. Starts are relative to the earliest item, so a
-/// paste lands at the playhead.
+/// What ⌘C / ⌘X copied. Starts are relative to the earliest item.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Clipboard {
-    Notes(Vec<Note>),
+    /// Notes, and where the next paste starts in the region: one grid step
+    /// after the copied notes (or right where cut notes were), moving on by
+    /// a step with each paste so copies don't stack.
+    Notes { notes: Vec<Note>, next: u64 },
     /// Each region with its track offset from the topmost copied track.
     Regions(Vec<(usize, Region)>),
 }
@@ -276,7 +278,8 @@ pub fn copy(s: &mut Session, e: &mut Editing) -> bool {
             for n in &mut notes {
                 n.start -= first;
             }
-            Clipboard::Notes(notes)
+            let next = first + e.roll_snap.ticks(p);
+            Clipboard::Notes { notes, next }
         }
         Focus::Tracks => {
             let mut regions: Vec<(usize, Region)> = p
@@ -302,7 +305,7 @@ pub fn copy(s: &mut Session, e: &mut Editing) -> bool {
         }
     };
     let (n, what) = match &clip {
-        Clipboard::Notes(n) => (n.len(), "note"),
+        Clipboard::Notes { notes, .. } => (notes.len(), "note"),
         Clipboard::Regions(r) => (r.len(), "region"),
     };
     s.status = format!("Copied {n} {what}{}", if n == 1 { "" } else { "s" });
@@ -315,27 +318,35 @@ pub fn cut(s: &mut Session, e: &mut Editing) {
     if !copy(s, e) {
         return;
     }
+    // Cut notes paste back where they were first.
+    let grid = e.roll_snap.ticks(&s.project);
+    if let Some(Clipboard::Notes { next, .. }) = &mut e.clipboard {
+        *next -= grid;
+    }
     if let Some((_, edit)) = removal(e) {
         s.apply("Cut", edit);
         clear_selection(s, e);
     }
 }
 
-/// Paste the clipboard at the playhead, snapped to the grid: notes into the
-/// edited region, regions onto the selected track and the ones below it.
+/// Paste the clipboard: notes into the edited region next to where they were
+/// copied, regions at the playhead (snapped to the grid) onto the selected
+/// track and the ones below it.
 /// The pasted items get fresh ids and become the selection.
 pub fn paste(s: &mut Session, e: &mut Editing) {
     let playhead = s.project.sec_to_tick(s.position());
     match e.clipboard.clone() {
         None => s.status = "Nothing to paste".to_string(),
-        Some(Clipboard::Notes(notes)) => {
+        Some(Clipboard::Notes { notes, next: at }) => {
             let Some((_, r)) = e.edit_region(&s.project) else {
                 s.status = "Open a region in the Piano Roll to paste notes".to_string();
                 return;
             };
-            let (region, region_start, region_len) = (r.id, r.start, r.len);
+            let (region, region_len) = (r.id, r.len);
             let grid = e.roll_snap.ticks(&s.project);
-            let at = playhead.saturating_sub(region_start) / grid * grid;
+            if let Some(Clipboard::Notes { next, .. }) = &mut e.clipboard {
+                *next = at + grid;
+            }
             let copies: Vec<Note> = notes
                 .into_iter()
                 .map(|mut n| {
