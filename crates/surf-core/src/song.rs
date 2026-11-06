@@ -42,6 +42,9 @@ pub struct TimedNote {
     pub key: u8,
     pub velocity: u8,
     pub channel: u8,
+    /// Index of the project track it plays on, which picks its instrument.
+    /// 0 for a plain song.
+    pub track: u16,
     pub start: f64,
     pub end: f64,
 }
@@ -56,7 +59,7 @@ impl TimedNote {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Timeline {
     pub notes: Vec<TimedNote>,
     pub duration: f64,
@@ -272,6 +275,7 @@ impl Song {
                 key: n.key,
                 velocity: n.velocity,
                 channel: n.channel,
+                track: 0,
                 start: self.tick_to_sec(n.start_tick),
                 end: self.tick_to_sec(n.end_tick()),
             })

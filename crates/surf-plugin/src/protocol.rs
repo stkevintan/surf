@@ -33,6 +33,10 @@ pub enum HelperRequest {
         notes: Vec<RenderNote>,
         duration: f64,
         tail_secs: f64,
+        /// (channel, controller, value) sent before the first note: the
+        /// channel volumes of tracks that share the plugin.
+        #[serde(default)]
+        controls: Vec<(u8, u8, u8)>,
     },
     Ping,
     Shutdown,

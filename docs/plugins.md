@@ -4,6 +4,8 @@ Surf plays through its built-in piano by default. It can also host VST3 and VST2
 
 ## Loading an instrument
 
+Every track has its own instrument. Picking a plugin puts it on the **selected track** (the track header and the Inspector show which instrument each track plays). Changing a track's instrument is undoable with ⌘Z. A new track starts on the instrument of the track it was added after.
+
 There are three ways to pick a plugin:
 
 1. **`SCAN`** (sidebar). Lists everything installed in the standard folders. Click a row to load it. Scanning only reads the file system and never loads a plugin, so it is safe to run at any time. Press `Esc` or `CLOSE` to dismiss the list.
@@ -23,6 +25,18 @@ There are three ways to pick a plugin:
 
 On Apple silicon, an Intel-only VST2 plugin cannot load: the plugin host is an arm64 process. Use a universal or arm64 build of the plugin.
 
+## Several tracks on one Kontakt
+
+Tracks that pick the same plugin share a single instance, the way Kontakt's multi works. Each track plays on its own MIDI channel, set with the channel stepper in the Inspector. Open MIDI files get one track per channel, so a multi-channel file lines up with a Kontakt multi from the start.
+
+1. Select the first track and pick Kontakt in the Library. Kontakt's editor opens.
+2. Select each other track and pick Kontakt again. It loads instantly, since the instance is already running.
+3. In Kontakt's editor, load one instrument per MIDI channel (channel 1 for the first track, 2 for the second, …), then `SAVE STATE`.
+
+The faders still work: Surf sends each track's volume to Kontakt as CC 7 (channel volume), because Kontakt returns all its instruments already mixed. Mute and solo work as usual. When no track uses a plugin any more, its instance stops; undo starts it again with the sound it had.
+
+Opening another MIDI file keeps the loaded instruments: each new track takes the instrument of the old track on the same channel.
+
 ## Plugin state
 
 `SAVE STATE` (or `Ctrl+S`) stores the plugin's complete state, the same blob a DAW saves in a project. The next time that plugin loads, Surf restores it automatically. Set `SURF_NO_STATE=1` to skip the restore.
@@ -36,7 +50,7 @@ Kontakt has no API for loading an `.nki` directly. Load the instrument in Kontak
 1. Load **Kontakt 8** with `SCAN`. The official Native Access install is a single file, `C:\Program Files\Common Files\VST3\Kontakt 8.vst3`.
 2. Kontakt's editor opens in the plugin host. Load your instrument, library, or multi there.
 3. Click `SAVE STATE` in Surf.
-4. Click `EXPORT WAV`. The plugin host creates a fresh Kontakt instance, switches it to offline mode, restores the saved state, renders the song, adds a 3-second tail, and writes a 24-bit / 48 kHz WAV.
+4. Click `EXPORT WAV`. Each instrument renders its own tracks: the plugin host creates a fresh Kontakt instance, switches it to offline mode, restores the saved state and renders, while built-in piano tracks render alongside. Surf mixes them with the faders, adds a 3-second tail, and writes a 24-bit WAV at the output's sample rate.
 
 Notes:
 
@@ -46,8 +60,9 @@ Notes:
 
 ## Current limitations
 
-- One plugin instance at a time. Multi-track instruments are planned (see [architecture.md](architecture.md)).
-- If the plugin host crashes, the current sound and any unsaved state are lost and the plugin has to be reloaded.
+- Up to 31 instruments at once; tracks beyond that share a spare built-in piano. Tracks on a shared plugin count once.
+- If a plugin host crashes, its tracks fall back to the built-in piano and any unsaved state is lost. Pick the plugin again to reload it.
+- Plugin choices are not saved with the MIDI file yet; there is no project file.
 - Only the plugin's main stereo output is used.
 - Live playback through a plugin is not latency-compensated. Exported audio is.
 - WAV export through a plugin blocks the UI until it finishes.

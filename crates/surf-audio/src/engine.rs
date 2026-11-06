@@ -21,17 +21,40 @@ const CHUNK: usize = 64;
 const MAX_BLOCK: usize = 8192;
 const SILENT_BLOCK: usize = 240; // 5 ms at 48 kHz
 
+/// Instrument slots the engine mixes. Slot 0 is the shared built-in piano
+/// that tracks fall back to; the session assigns the others.
+pub const MAX_SLOTS: usize = 32;
+
+/// Where a track's notes go: an instrument slot and the MIDI channel on it.
+/// Tracks that share a plugin (Kontakt) share its slot on different channels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Route {
+    pub slot: u8,
+    pub channel: u8,
+}
+
 pub enum Command {
+    /// Live input, played on the input track's route (see `SetInput`).
     NoteOn { key: u8, velocity: u8 },
     NoteOff { key: u8 },
     Sustain(bool),
     AllNotesOff,
-    SetInstrument {
-        instrument: Box<dyn Instrument>,
+    /// Put an instrument in a slot, or empty it.
+    SetSlot {
+        slot: u8,
+        instrument: Option<Box<dyn Instrument>>,
         /// Signalled after the old instrument has been dropped on the audio
         /// thread, so the UI can safely release the last plugin reference.
         ack: Option<crossbeam_channel::Sender<()>>,
     },
+    /// The route of every track, by track index (`TimedNote::track`).
+    SetRoutes(Vec<Route>),
+    /// Linear output gain of a slot: the track's fader, or for a shared
+    /// plugin the loudest of its tracks.
+    SetSlotGain { slot: u8, gain: f32 },
+    /// The track live input plays, by index.
+    SetInput(u16),
+    ControlChange { slot: u8, channel: u8, controller: u8, value: u8 },
     Play { timeline: Timeline, from: f64 },
     Pause,
     Resume,
@@ -63,6 +86,8 @@ pub struct EngineStatus {
     pub position: f64,
     pub duration: f64,
     pub peak: f32,
+    /// Peak of each slot after its gain, for the track meters.
+    pub slot_peaks: [f32; MAX_SLOTS],
     pub sample_rate: u32,
     pub output: String,
     pub sample_accurate: bool,
@@ -75,23 +100,32 @@ struct Shared {
     duration_frames: AtomicU64,
     playing: AtomicBool,
     peak: AtomicU32,
+    slot_peaks: [AtomicU32; MAX_SLOTS],
     sample_rate: AtomicU32,
     glitches: AtomicU32,
 }
 
 struct ActiveNote {
+    route: Route,
     key: u8,
     end_frame: u64,
 }
 
 struct Core {
-    instrument: Box<dyn Instrument>,
+    slots: Vec<Option<Box<dyn Instrument>>>,
+    gains: [f32; MAX_SLOTS],
+    routes: Vec<Route>,
+    input: u16,
+    /// Where each live key went, so its note-off follows it even if the
+    /// input track changes while the key is down.
+    held: [Option<Route>; 128],
+    sustain: bool,
     timeline: Option<Timeline>,
     next_note: usize,
     active: Vec<ActiveNote>,
-    /// Scratch for keys released in the current chunk. Preallocated so the
+    /// Scratch for notes released in the current chunk. Preallocated so the
     /// audio callback never allocates.
-    ended: Vec<u8>,
+    ended: Vec<(Route, u8)>,
     pos_frames: u64,
     duration_frames: u64,
     playing: bool,
@@ -99,14 +133,20 @@ struct Core {
     volume: f32,
     sample_rate: f64,
     scratch: Vec<f32>,
+    /// One slot's output for the current chunk, before it is mixed.
+    slot_buf: Vec<f32>,
     shared: Arc<Shared>,
 }
 
 impl Core {
-    fn new(mut instrument: Box<dyn Instrument>, sample_rate: u32, shared: Arc<Shared>) -> Self {
-        instrument.set_sample_rate(sample_rate as f32);
+    fn new(sample_rate: u32, shared: Arc<Shared>) -> Self {
         Self {
-            instrument,
+            slots: std::iter::repeat_with(|| None).take(MAX_SLOTS).collect(),
+            gains: [1.0; MAX_SLOTS],
+            routes: Vec::new(),
+            input: 0,
+            held: [None; 128],
+            sustain: false,
             timeline: None,
             next_note: 0,
             active: Vec::with_capacity(256),
@@ -118,25 +158,103 @@ impl Core {
             volume: 0.9,
             sample_rate: sample_rate as f64,
             scratch: vec![0.0; MAX_BLOCK * 2],
+            slot_buf: vec![0.0; CHUNK * 2],
             shared,
         }
     }
 
+    fn route(&self, track: u16) -> Route {
+        self.routes.get(track as usize).copied().unwrap_or_default()
+    }
+
+    fn slot(&mut self, route: Route) -> Option<&mut Box<dyn Instrument>> {
+        self.slots.get_mut(route.slot as usize).and_then(Option::as_mut)
+    }
+
+    fn all_notes_off(&mut self) {
+        for instrument in self.slots.iter_mut().flatten() {
+            instrument.all_notes_off();
+        }
+        self.held = [None; 128];
+        self.sustain = false;
+    }
+
     fn apply(&mut self, command: Command) {
         match command {
-            Command::NoteOn { key, velocity } => self.instrument.note_on(key, velocity),
-            Command::NoteOff { key } => self.instrument.note_off(key),
-            Command::Sustain(down) => self.instrument.set_sustain(down),
-            Command::AllNotesOff => self.instrument.all_notes_off(),
-            Command::SetInstrument { instrument, ack } => {
-                self.instrument.all_notes_off();
-                self.instrument = instrument;
+            Command::NoteOn { key, velocity } => {
+                let route = self.route(self.input);
+                self.held[key as usize & 127] = Some(route);
+                if let Some(i) = self.slot(route) {
+                    i.note_on(route.channel, key, velocity);
+                }
+            }
+            Command::NoteOff { key } => {
+                let route = self.held[key as usize & 127]
+                    .take()
+                    .unwrap_or_else(|| self.route(self.input));
+                if let Some(i) = self.slot(route) {
+                    i.note_off(route.channel, key);
+                }
+            }
+            Command::Sustain(down) => {
+                self.sustain = down;
+                let route = self.route(self.input);
+                if let Some(i) = self.slot(route) {
+                    i.set_sustain(route.channel, down);
+                }
+            }
+            Command::AllNotesOff => self.all_notes_off(),
+            Command::SetSlot {
+                slot,
+                instrument,
+                ack,
+            } => {
+                if let Some(cell) = self.slots.get_mut(slot as usize) {
+                    if let Some(old) = cell.as_mut() {
+                        old.all_notes_off();
+                    }
+                    *cell = instrument.map(|mut i| {
+                        i.set_sample_rate(self.sample_rate as f32);
+                        i
+                    });
+                    // Notes on the old instrument are gone with it.
+                    self.active.retain(|n| n.route.slot != slot);
+                }
                 if let Some(ack) = ack {
                     let _ = ack.send(());
                 }
             }
+            Command::SetRoutes(routes) => self.routes = routes,
+            Command::SetSlotGain { slot, gain } => {
+                if let Some(g) = self.gains.get_mut(slot as usize) {
+                    *g = gain.clamp(0.0, 2.0);
+                }
+            }
+            Command::SetInput(track) => {
+                let (old, new) = (self.route(self.input), self.route(track));
+                self.input = track;
+                // Hand the pedal over to the new instrument.
+                if self.sustain && old != new {
+                    if let Some(i) = self.slot(old) {
+                        i.set_sustain(old.channel, false);
+                    }
+                    if let Some(i) = self.slot(new) {
+                        i.set_sustain(new.channel, true);
+                    }
+                }
+            }
+            Command::ControlChange {
+                slot,
+                channel,
+                controller,
+                value,
+            } => {
+                if let Some(i) = self.slot(Route { slot, channel }) {
+                    i.control_change(channel, controller, value);
+                }
+            }
             Command::Play { timeline, from } => {
-                self.instrument.all_notes_off();
+                self.all_notes_off();
                 self.duration_frames = (timeline.duration * self.sample_rate).ceil() as u64;
                 self.pos_frames = (from.max(0.0) * self.sample_rate) as u64;
                 self.next_note = timeline.notes.partition_point(|n| n.start < from.max(0.0));
@@ -150,7 +268,7 @@ impl Core {
             }
             Command::Pause => {
                 self.playing = false;
-                self.instrument.all_notes_off();
+                self.all_notes_off();
                 self.shared.playing.store(false, Ordering::Release);
             }
             Command::Resume => {
@@ -164,7 +282,7 @@ impl Core {
                 self.pos_frames = 0;
                 self.next_note = 0;
                 self.active.clear();
-                self.instrument.all_notes_off();
+                self.all_notes_off();
                 self.shared.playing.store(false, Ordering::Release);
                 self.shared.position_frames.store(0, Ordering::Release);
             }
@@ -172,7 +290,7 @@ impl Core {
                 let sec = sec.max(0.0);
                 self.pos_frames = (sec * self.sample_rate) as u64;
                 self.active.clear();
-                self.instrument.all_notes_off();
+                self.all_notes_off();
                 if let Some(timeline) = &self.timeline {
                     self.next_note = timeline.notes.partition_point(|n| n.start < sec);
                     self.shared
@@ -189,7 +307,7 @@ impl Core {
         self.pos_frames = 0;
         self.next_note = 0;
         self.active.clear();
-        self.instrument.all_notes_off();
+        self.all_notes_off();
         self.shared.position_frames.store(0, Ordering::Release);
     }
 
@@ -198,6 +316,7 @@ impl Core {
         let frames = frames.min(MAX_BLOCK);
         let mut done = 0usize;
         let mut peak = 0.0f32;
+        let mut slot_peaks = [0.0f32; MAX_SLOTS];
 
         while done < frames {
             let chunk = CHUNK.min(frames - done);
@@ -211,7 +330,7 @@ impl Core {
                     } else {
                         self.pos_frames = self.duration_frames;
                         self.playing = false;
-                        self.instrument.all_notes_off();
+                        self.all_notes_off();
                         self.shared.playing.store(false, Ordering::Release);
                     }
                 } else {
@@ -220,7 +339,20 @@ impl Core {
             }
 
             let out = &mut self.scratch[done * 2..(done + chunk) * 2];
-            self.instrument.process(out, chunk);
+            out.fill(0.0);
+            let buf = &mut self.slot_buf[..chunk * 2];
+            for (index, cell) in self.slots.iter_mut().enumerate() {
+                let Some(instrument) = cell else { continue };
+                // Every slot runs each chunk, even a silent one: a plugin
+                // host's audio ring has to keep draining.
+                instrument.process(buf, chunk);
+                let gain = self.gains[index];
+                for (mix, sample) in out.iter_mut().zip(buf.iter()) {
+                    let s = sample * gain;
+                    slot_peaks[index] = slot_peaks[index].max(s.abs());
+                    *mix += s;
+                }
+            }
             for sample in out.iter_mut() {
                 *sample = (*sample * self.volume).clamp(-1.0, 1.0);
                 peak = peak.max(sample.abs());
@@ -232,6 +364,9 @@ impl Core {
             .position_frames
             .store(self.pos_frames, Ordering::Release);
         self.shared.peak.store(peak.to_bits(), Ordering::Relaxed);
+        for (cell, p) in self.shared.slot_peaks.iter().zip(slot_peaks) {
+            cell.store(p.to_bits(), Ordering::Relaxed);
+        }
         &self.scratch[..frames * 2]
     }
 
@@ -245,14 +380,16 @@ impl Core {
         ended.clear();
         self.active.retain(|note| {
             if note.end_frame <= end {
-                ended.push(note.key);
+                ended.push((note.route, note.key));
                 false
             } else {
                 true
             }
         });
-        for &key in &self.ended {
-            self.instrument.note_off(key);
+        for &(route, key) in &self.ended {
+            if let Some(i) = self.slots.get_mut(route.slot as usize).and_then(Option::as_mut) {
+                i.note_off(route.channel, key);
+            }
         }
 
         while self.next_note < timeline.notes.len() {
@@ -265,9 +402,18 @@ impl Core {
             if note_start < start {
                 continue;
             }
-            self.instrument.note_on(note.key, note.velocity);
+            let route = self
+                .routes
+                .get(note.track as usize)
+                .copied()
+                .unwrap_or_default();
+            let Some(i) = self.slots.get_mut(route.slot as usize).and_then(Option::as_mut) else {
+                continue;
+            };
+            i.note_on(route.channel, note.key, note.velocity);
             let note_end = ((note.end * self.sample_rate) as u64).max(note_start + 1);
             self.active.push(ActiveNote {
+                route,
                 key: note.key,
                 end_frame: note_end,
             });
@@ -301,12 +447,15 @@ pub struct AudioEngine {
 }
 
 impl AudioEngine {
-    pub fn new(instrument: Box<dyn Instrument>) -> Self {
+    /// Open the default output. Every instrument slot starts empty; fill
+    /// them with [`AudioEngine::set_slot`].
+    pub fn new() -> Self {
         let shared = Arc::new(Shared {
             position_frames: AtomicU64::new(0),
             duration_frames: AtomicU64::new(0),
             playing: AtomicBool::new(false),
             peak: AtomicU32::new(0),
+            slot_peaks: std::array::from_fn(|_| AtomicU32::new(0)),
             sample_rate: AtomicU32::new(48_000),
             glitches: AtomicU32::new(0),
         });
@@ -317,11 +466,7 @@ impl AudioEngine {
         match open_output() {
             Ok((device, sample_rate, channels, name)) => {
                 shared.sample_rate.store(sample_rate, Ordering::Relaxed);
-                let core = Arc::new(Mutex::new(Core::new(
-                    instrument,
-                    sample_rate,
-                    shared.clone(),
-                )));
+                let core = Arc::new(Mutex::new(Core::new(sample_rate, shared.clone())));
                 let callback_core = core.clone();
                 let err_shared = shared.clone();
                 let err_fn = move |err: cpal::Error| {
@@ -386,11 +531,7 @@ impl AudioEngine {
                 eprintln!("no audio output device ({err}); running silent clock");
                 let sample_rate = 48_000;
                 shared.sample_rate.store(sample_rate, Ordering::Relaxed);
-                let core = Arc::new(Mutex::new(Core::new(
-                    instrument,
-                    sample_rate,
-                    shared.clone(),
-                )));
+                let core = Arc::new(Mutex::new(Core::new(sample_rate, shared.clone())));
                 let stop = Arc::new(AtomicBool::new(false));
                 let thread_core = core.clone();
                 let thread_stop = stop.clone();
@@ -445,6 +586,9 @@ impl AudioEngine {
             duration: self.shared.duration_frames.load(Ordering::Relaxed) as f64
                 / sample_rate.max(1) as f64,
             peak: f32::from_bits(self.shared.peak.load(Ordering::Relaxed)),
+            slot_peaks: std::array::from_fn(|i| {
+                f32::from_bits(self.shared.slot_peaks[i].load(Ordering::Relaxed))
+            }),
             sample_rate,
             output: self.output.lock().clone(),
             sample_accurate: self.sample_accurate,
@@ -522,16 +666,23 @@ impl AudioEngine {
         self.send(Command::SetVolume(volume));
     }
 
-    pub fn set_instrument(&self, instrument: Box<dyn Instrument>) {
+    /// Put `instrument` in `slot` (None empties it). Waits for the audio
+    /// thread to release the previous one, so the caller may then drop the
+    /// last reference to its plugin host on the UI thread.
+    pub fn set_slot(&self, slot: u8, instrument: Option<Box<dyn Instrument>>) {
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
-        let _ = self.tx.send(Command::SetInstrument {
+        let _ = self.tx.send(Command::SetSlot {
+            slot,
             instrument,
             ack: Some(ack_tx),
         });
-        // Wait for the audio thread to release the previous instrument; the
-        // caller may then drop the last Arc<Plugin> on the UI thread.  Kontakt
-        // must not be destroyed on the audio thread.
         let _ = ack_rx.recv_timeout(Duration::from_millis(750));
+    }
+}
+
+impl Default for AudioEngine {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -580,6 +731,110 @@ fn open_output() -> Result<(cpal::Device, u32, u16, String)> {
 mod tests {
     use super::*;
     use cpal::ErrorKind;
+    use surf_core::song::TimedNote;
+
+    type Log = Arc<parking_lot::Mutex<Vec<(u8, u8, bool)>>>;
+
+    /// Records (channel, key, on) and outputs a constant 0.5.
+    struct Probe(Log);
+
+    impl Instrument for Probe {
+        fn note_on(&mut self, channel: u8, key: u8, _velocity: u8) {
+            self.0.lock().push((channel, key, true));
+        }
+        fn note_off(&mut self, channel: u8, key: u8) {
+            self.0.lock().push((channel, key, false));
+        }
+        fn all_notes_off(&mut self) {}
+        fn set_sustain(&mut self, _channel: u8, _down: bool) {}
+        fn process(&mut self, out: &mut [f32], frames: usize) {
+            out[..frames * 2].fill(0.5);
+        }
+        fn name(&self) -> &str {
+            "probe"
+        }
+    }
+
+    fn core() -> Core {
+        let shared = Arc::new(Shared {
+            position_frames: AtomicU64::new(0),
+            duration_frames: AtomicU64::new(0),
+            playing: AtomicBool::new(false),
+            peak: AtomicU32::new(0),
+            slot_peaks: std::array::from_fn(|_| AtomicU32::new(0)),
+            sample_rate: AtomicU32::new(48_000),
+            glitches: AtomicU32::new(0),
+        });
+        Core::new(48_000, shared)
+    }
+
+    fn note(track: u16, key: u8, start: f64) -> TimedNote {
+        TimedNote {
+            key,
+            velocity: 100,
+            channel: 0,
+            track,
+            start,
+            end: start + 0.01,
+        }
+    }
+
+    #[test]
+    fn tracks_play_on_their_slot_and_channel_with_their_gain() {
+        let mut c = core();
+        let (piano, kontakt): (Log, Log) = Default::default();
+        for (slot, log) in [(1u8, &piano), (2, &kontakt)] {
+            c.apply(Command::SetSlot {
+                slot,
+                instrument: Some(Box::new(Probe(log.clone()))),
+                ack: None,
+            });
+        }
+        // Track 0 on its own piano; tracks 1 and 2 share Kontakt on ch 2 and 3.
+        c.apply(Command::SetRoutes(vec![
+            Route { slot: 1, channel: 0 },
+            Route { slot: 2, channel: 1 },
+            Route { slot: 2, channel: 2 },
+        ]));
+        c.apply(Command::SetSlotGain { slot: 1, gain: 0.5 });
+        c.apply(Command::SetVolume(1.0));
+        c.apply(Command::Play {
+            timeline: Timeline {
+                notes: vec![note(0, 60, 0.0), note(1, 40, 0.0), note(2, 72, 0.0)],
+                duration: 1.0,
+            },
+            from: 0.0,
+        });
+        let out = c.render(2048).to_vec();
+        assert_eq!(*piano.lock(), vec![(0, 60, true), (0, 60, false)]);
+        assert_eq!(
+            *kontakt.lock(),
+            vec![(1, 40, true), (2, 72, true), (1, 40, false), (2, 72, false)]
+        );
+        // 0.5 * 0.5 from the piano plus 0.5 from Kontakt.
+        assert!((out[0] - 0.75).abs() < 1e-6, "{}", out[0]);
+        let peaks = &c.shared.slot_peaks;
+        assert_eq!(f32::from_bits(peaks[1].load(Ordering::Relaxed)), 0.25);
+        assert_eq!(f32::from_bits(peaks[2].load(Ordering::Relaxed)), 0.5);
+    }
+
+    #[test]
+    fn live_note_off_follows_its_note_on_after_the_input_moves() {
+        let mut c = core();
+        let (a, b): (Log, Log) = Default::default();
+        c.apply(Command::SetSlot { slot: 0, instrument: Some(Box::new(Probe(a.clone()))), ack: None });
+        c.apply(Command::SetSlot { slot: 1, instrument: Some(Box::new(Probe(b.clone()))), ack: None });
+        c.apply(Command::SetRoutes(vec![
+            Route { slot: 0, channel: 0 },
+            Route { slot: 1, channel: 4 },
+        ]));
+        c.apply(Command::SetInput(1));
+        c.apply(Command::NoteOn { key: 60, velocity: 90 });
+        c.apply(Command::SetInput(0));
+        c.apply(Command::NoteOff { key: 60 });
+        assert!(a.lock().is_empty());
+        assert_eq!(*b.lock(), vec![(4, 60, true), (4, 60, false)]);
+    }
 
     #[test]
     fn route_changes_and_glitches_are_not_reported_as_errors() {

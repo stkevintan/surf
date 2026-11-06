@@ -241,6 +241,7 @@ impl VstClient {
         duration: f64,
         sample_rate: u32,
         tail_secs: f64,
+        controls: Vec<(u8, u8, u8)>,
     ) -> Result<(String, f64, f32)> {
         let output = std::path::absolute(output).unwrap_or_else(|_| output.to_path_buf());
         self.request(&HelperRequest::Render {
@@ -249,6 +250,7 @@ impl VstClient {
             notes,
             duration,
             tail_secs,
+            controls,
         })?;
         match self.wait_event(Duration::from_secs(600), |ev| {
             matches!(ev, HelperEvent::RenderDone { .. })

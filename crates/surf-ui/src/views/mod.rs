@@ -22,14 +22,43 @@ pub fn track_color(t: &surf_core::project::Track) -> Rgba {
     color::TRACKS[t.color % color::TRACKS.len()]
 }
 
-/// The instrument every track plays through today. Multi-instrument routing
-/// (one plugin per track, or Kontakt shared across channels) comes with the
-/// multi-track engine; until then all tracks share the loaded instrument.
-pub fn instrument_name(s: &Session) -> String {
-    match &s.vst {
-        Some(vst) => vst.name.clone(),
+/// What a track plays: its plugin's name, or the built-in piano. A plugin
+/// that would not load says so, since its track falls back to the piano.
+pub fn instrument_name(s: &Session, track: &surf_core::project::Track) -> String {
+    match &track.instrument {
         None => "Surf Piano".to_string(),
+        Some(path) => {
+            let name = s
+                .rack
+                .host(path)
+                .map(|h| h.client.name.clone())
+                .unwrap_or_else(|| {
+                    path.file_stem()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                });
+            if s.rack.failed.contains(path) {
+                format!("{name} (offline)")
+            } else {
+                name
+            }
+        }
     }
+}
+
+/// Meter level of a track: its slot's peak, which a shared plugin's tracks
+/// have in common.
+pub fn track_peak(s: &Session, track: &surf_core::project::Track) -> f32 {
+    if !s.project.audible(track) {
+        return 0.0;
+    }
+    let plan = crate::rack::plan(&s.project, &s.rack.slots, &s.rack.failed);
+    s.project
+        .tracks
+        .iter()
+        .position(|t| t.id == track.id)
+        .and_then(|i| plan.routes.get(i))
+        .map_or(0.0, |r| s.engine.slot_peaks[r.slot as usize])
 }
 
 /// Song length in whole bars, at least 1.
@@ -56,8 +85,8 @@ pub fn track_strip(
         name: track.name.clone(),
         track_color: track_color(track),
         instrument: Some((
-            instrument_name(s),
-            if s.vst.is_some() {
+            instrument_name(s, track),
+            if track.instrument.is_some() {
                 color::SLOT_INST_PLUGIN
             } else {
                 color::SLOT_INST_BUILTIN
@@ -66,11 +95,7 @@ pub fn track_strip(
         effects: Vec::new(),
         output: "Stereo Out",
         volume: track.volume,
-        peak: if s.project.audible(track) {
-            s.engine.peak
-        } else {
-            0.0
-        },
+        peak: track_peak(s, track),
         mute: track.mute,
         solo: track.solo,
         selected: app.ui.edit.track == Some(track.id),

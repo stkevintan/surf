@@ -28,7 +28,7 @@ fn main() -> anyhow::Result<()> {
             end: n.end,
         })
         .collect();
-    let (path, secs, peak) = client.render(out.as_ref(), notes, timeline.duration, 48_000, 1.0)?;
+    let (path, secs, peak) = client.render(out.as_ref(), notes, timeline.duration, 48_000, 1.0, Vec::new())?;
     println!("{path} · {secs:.2}s · peak {:.1}%", peak * 100.0);
     Ok(())
 }

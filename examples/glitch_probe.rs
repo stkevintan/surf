@@ -36,7 +36,7 @@ fn main() -> anyhow::Result<()> {
 
     // Hold a note so the plugin is genuinely producing audio; silence would hide
     // underruns rather than expose them.
-    instrument.note_on(60, 110);
+    instrument.note_on(0, 60, 110);
 
     let mut buffer = vec![0.0f32; BLOCK * 2];
     let mut short_reads = 0u64;
@@ -69,7 +69,7 @@ fn main() -> anyhow::Result<()> {
             next = now;
         }
     }
-    instrument.note_off(60);
+    instrument.note_off(0, 60);
 
     let avg = (sum_backlog / buffers.max(1) as u128) as f64;
     println!();

@@ -571,6 +571,12 @@ pub fn new_track(s: &mut Session, e: &mut Editing) {
         mute: false,
         solo: false,
         volume: 1.0,
+        // A new track plays what the selected one plays; on a shared plugin
+        // it gets the next free channel.
+        instrument: e
+            .track
+            .and_then(|t| p.track(t))
+            .and_then(|t| t.instrument.clone()),
         regions: Vec::new(),
     };
     s.apply("New Track", Edit::AddTrack { index, track });
@@ -589,6 +595,7 @@ pub fn set_track(s: &mut Session, track: Id, field: TrackField) {
         TrackField::Solo(_) => "Solo",
         TrackField::Volume(_) => "Volume",
         TrackField::Channel(_) => "MIDI Channel",
+        TrackField::Instrument(_) => "Change Instrument",
     };
     s.apply(label, Edit::SetTrack { track, field });
 }

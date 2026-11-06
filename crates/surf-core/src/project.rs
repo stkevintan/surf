@@ -9,6 +9,7 @@
 //! notes. Every object has a stable id so selection and undo survive edits.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use crate::song::{self, Song, Tempo, TimedNote, Timeline};
 
@@ -75,6 +76,10 @@ pub struct Track {
     pub solo: bool,
     /// Linear gain, 0.0..=1.5.
     pub volume: f32,
+    /// The plugin the track plays (a `.vst3` / VST2 path), or None for the
+    /// built-in piano. Tracks naming the same plugin share one instance and
+    /// are told apart by [`Track::channel`].
+    pub instrument: Option<PathBuf>,
     pub regions: Vec<Region>,
 }
 
@@ -177,6 +182,7 @@ impl Project {
                 mute: false,
                 solo: false,
                 volume: 1.0,
+                instrument: None,
                 regions: vec![region],
             });
         }
@@ -220,58 +226,60 @@ impl Project {
         }
     }
 
-    /// What the engine plays: audible tracks only, in seconds.
-    ///
-    /// Until each track has its own instrument and gain stage, a track's
-    /// volume is applied by scaling its note velocities (so a quieter track
-    /// plays softer on the shared instrument).
+    /// What the engine plays: audible tracks only, in seconds. Each note
+    /// carries its track's index and channel, which route it to the track's
+    /// instrument; track volume is the engine's gain stage, not part of this.
     pub fn timeline(&self) -> Timeline {
-        let mut audible = self.clone();
-        let keep: Vec<Id> = self
-            .tracks
-            .iter()
-            .filter(|t| self.audible(t))
-            .map(|t| t.id)
+        let notes = self
+            .placed_notes()
+            .filter(|(i, _)| self.audible(&self.tracks[*i]))
+            .map(|(_, n)| n)
             .collect();
-        audible.tracks.retain(|t| keep.contains(&t.id));
-        for t in &mut audible.tracks {
-            if (t.volume - 1.0).abs() > f32::EPSILON {
-                for n in t.regions.iter_mut().flat_map(|r| r.notes.iter_mut()) {
-                    n.velocity =
-                        ((n.velocity as f32 * t.volume).round() as i32).clamp(1, 127) as u8;
-                }
-            }
-        }
-        let mut tl = audible.to_song().timeline();
         // The song ends where its last region ends, even if that bar is silent.
-        tl.duration = tl.duration.max(self.tick_to_sec(self.end()));
+        let mut tl = Timeline {
+            notes,
+            duration: self.tick_to_sec(self.end()),
+        };
+        tl.notes
+            .sort_by(|a, b| a.start.total_cmp(&b.start).then_with(|| a.key.cmp(&b.key)));
+        tl.duration = tl.notes.iter().map(|n| n.end).fold(tl.duration, f64::max);
         tl
     }
 
     /// Every note at its absolute position, with its track. For drawing.
     pub fn timed_notes(&self) -> Vec<(Id, TimedNote)> {
+        let mut out: Vec<(Id, TimedNote)> = self
+            .placed_notes()
+            .map(|(i, n)| (self.tracks[i].id, n))
+            .collect();
+        out.sort_by(|a, b| a.1.start.total_cmp(&b.1.start));
+        out
+    }
+
+    /// Notes inside their regions, in seconds, with their track index.
+    fn placed_notes(&self) -> impl Iterator<Item = (usize, TimedNote)> + '_ {
         let tempo = self.to_song_tempo();
-        let mut out = Vec::new();
-        for t in &self.tracks {
-            for r in &t.regions {
-                for n in r.notes.iter().filter(|n| n.start < r.len) {
+        self.tracks.iter().enumerate().flat_map(move |(i, t)| {
+            let tempo = tempo.clone();
+            t.regions.iter().flat_map(move |r| {
+                let tempo = tempo.clone();
+                r.notes.iter().filter(|n| n.start < r.len).map(move |n| {
                     let start = r.start + n.start;
-                    let end = start + n.len.min(r.len - n.start);
-                    out.push((
-                        t.id,
+                    let end = start + n.len.min(r.len - n.start).max(1);
+                    (
+                        i,
                         TimedNote {
                             key: n.key,
                             velocity: n.velocity,
                             channel: t.channel,
+                            track: i as u16,
                             start: tempo.tick_to_sec(start),
                             end: tempo.tick_to_sec(end),
                         },
-                    ));
-                }
-            }
-        }
-        out.sort_by(|a, b| a.1.start.total_cmp(&b.1.start));
-        out
+                    )
+                })
+            })
+        })
     }
 
     /// Last region end, in ticks.
@@ -435,26 +443,23 @@ mod tests {
     }
 
     #[test]
-    fn track_volume_scales_playback_velocity_only() {
+    fn timeline_notes_know_their_track() {
         let mut p = Project::from_song(&two_channel_song());
+        // Volume is the engine's gain stage; it leaves velocities alone.
         p.tracks[0].volume = 0.5;
-        let v: Vec<u8> = p
-            .timeline()
-            .notes
-            .iter()
-            .filter(|n| n.channel == 0)
-            .map(|n| n.velocity)
-            .collect();
-        assert_eq!(v, vec![50, 45]);
-        // Export keeps the written velocities.
-        let exported: Vec<u8> = p
-            .to_song()
-            .notes
-            .iter()
-            .filter(|n| n.channel == 0)
-            .map(|n| n.velocity)
-            .collect();
-        assert_eq!(exported, vec![100, 90]);
+        let tl = p.timeline();
+        let by_track = |t: u16| {
+            tl.notes
+                .iter()
+                .filter(|n| n.track == t)
+                .map(|n| (n.key, n.velocity, n.channel))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(by_track(0), vec![(60, 100, 0), (64, 90, 0)]);
+        assert_eq!(by_track(1), vec![(40, 80, 1)]);
+        // A muted track drops out but the others keep their index.
+        p.tracks[0].mute = true;
+        assert!(p.timeline().notes.iter().all(|n| n.track == 1));
     }
 
     #[test]

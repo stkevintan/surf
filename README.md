@@ -13,7 +13,7 @@ A desktop MIDI studio written in Rust with [GPUI](https://www.gpui.rs/). Play a 
 - **Export**: type-1 MIDI files and 24-bit / 48 kHz WAV.
 - **Runs without an audio device**: the timeline and visuals keep working, which is handy over remote desktop or in CI.
 
-> **Status:** early development. Runs on Windows 10/11 and macOS (Apple silicon). Plugin hosting is tested with real instruments on Windows, and on macOS with Kontakt 8 (VST3, including its editor) and VST2 test plugins. VST2 editors only open on Windows so far, and Linux is not tested yet. Multi-track editing and a Logic-style interface are in progress. See the [UI design](docs/design/README.md) and the [roadmap](docs/architecture.md#roadmap-mapping).
+> **Status:** early development. Runs on Windows 10/11 and macOS (Apple silicon). Plugin hosting is tested with real instruments on Windows, and on macOS with Kontakt 8 (VST3, including its editor) and VST2 test plugins. VST2 editors only open on Windows so far, and Linux is not tested yet. Multi-track editing works, with an instrument per track, and several tracks can share one Kontakt on different MIDI channels. See the [UI design](docs/design/README.md) and the [roadmap](docs/architecture.md#roadmap-mapping).
 
 ## Get started
 

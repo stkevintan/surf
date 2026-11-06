@@ -57,7 +57,10 @@ pub fn render(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
     .when(ui.track_open, |d| {
         d.child(
             params()
-                .child(param("Instrument", field(views::instrument_name(s))))
+                .child(param(
+                    "Instrument",
+                    field(track.map_or("–".to_string(), |t| views::instrument_name(s, t))),
+                ))
                 .child(param(
                     "MIDI Channel",
                     channel_stepper(cx, track_id, channel),
@@ -178,7 +181,15 @@ fn param(name: &'static str, value: gpui::Div) -> impl IntoElement {
 /// Plugin controls between the Region and Track sections: open the plugin's
 /// own editor and save its state. Only shown when a plugin is loaded.
 fn instrument_actions(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
-    let loaded = app.session.vst.is_some();
+    let s = &app.session;
+    let loaded = app
+        .ui
+        .edit
+        .track
+        .and_then(|t| s.project.track(t))
+        .or_else(|| s.project.tracks.first())
+        .and_then(|t| t.instrument.as_ref())
+        .is_some_and(|path| s.rack.host(path).is_some());
     div().when(loaded, |d| {
         d.flex()
             .flex_row()

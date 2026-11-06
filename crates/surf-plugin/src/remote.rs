@@ -28,20 +28,26 @@ impl RemoteInstrument {
 }
 
 impl Instrument for RemoteInstrument {
-    fn note_on(&mut self, key: u8, velocity: u8) {
-        let _ = self.map.push_midi(MidiMsg::note_on(key, velocity));
+    fn note_on(&mut self, channel: u8, key: u8, velocity: u8) {
+        let _ = self.map.push_midi(MidiMsg::note_on(channel, key, velocity));
     }
 
-    fn note_off(&mut self, key: u8) {
-        let _ = self.map.push_midi(MidiMsg::note_off(key));
+    fn note_off(&mut self, channel: u8, key: u8) {
+        let _ = self.map.push_midi(MidiMsg::note_off(channel, key));
     }
 
     fn all_notes_off(&mut self) {
         let _ = self.map.push_midi(MidiMsg::all_notes_off());
     }
 
-    fn set_sustain(&mut self, down: bool) {
-        let _ = self.map.push_midi(MidiMsg::sustain(down));
+    fn set_sustain(&mut self, channel: u8, down: bool) {
+        let _ = self.map.push_midi(MidiMsg::sustain(channel, down));
+    }
+
+    fn control_change(&mut self, channel: u8, controller: u8, value: u8) {
+        let _ = self
+            .map
+            .push_midi(MidiMsg::control_change(channel, controller, value));
     }
 
     fn process(&mut self, out: &mut [f32], frames: usize) {

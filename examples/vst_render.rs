@@ -31,6 +31,7 @@ fn main() -> anyhow::Result<()> {
             tail_secs: 1.5,
             gain: 0.9,
         },
+        &[],
     )?;
     println!(
         "wrote {} ({:.2}s, peak {:.1}%)",

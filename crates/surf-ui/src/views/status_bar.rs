@@ -13,9 +13,10 @@ pub fn render(app: &SurfApp, _cx: &mut Context<SurfApp>) -> impl IntoElement {
         engine.output,
         engine.sample_rate as f32 / 1000.0
     );
-    let host = match &s.vst {
-        Some(vst) => format!("Plugin host: {}", vst.name),
-        None => "Built-in piano".to_string(),
+    let host = match s.rack.hosts.len() {
+        0 => "Built-in piano".to_string(),
+        1 => format!("Plugin host: {}", s.rack.hosts[0].client.name),
+        n => format!("{n} plugin hosts"),
     };
     let midi = match s
         .midi

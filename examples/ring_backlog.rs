@@ -47,7 +47,7 @@ fn main() -> anyhow::Result<()> {
     while start.elapsed() < Duration::from_secs(6) {
         // Press a key a second in, like a player would.
         if !note_on && start.elapsed() > Duration::from_secs(1) {
-            instrument.note_on(60, 110);
+            instrument.note_on(0, 60, 110);
             note_on = true;
         }
 
@@ -74,7 +74,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    instrument.note_off(60);
+    instrument.note_off(0, 60);
     let queued = map.audio_backlog();
     println!();
     println!(

@@ -381,6 +381,7 @@ fn main() -> Result<()> {
                     notes,
                     duration,
                     tail_secs,
+                    controls,
                 } => {
                     let state = backend.state().ok();
                     let result = match &backend {
@@ -392,6 +393,7 @@ fn main() -> Result<()> {
                             &output,
                             sample_rate,
                             tail_secs,
+                            &controls,
                         ),
                         Backend::Vst2(_) => render_vst2_to_wav(
                             &args.plugin,
@@ -401,6 +403,7 @@ fn main() -> Result<()> {
                             &output,
                             sample_rate,
                             tail_secs,
+                            &controls,
                         ),
                     };
                     match result {
@@ -611,13 +614,17 @@ fn audio_loop(mut instrument: Box<dyn Instrument>, map: Arc<SharedMap>, stop: Ar
     let mut buffer = [0.0f32; 128];
     while !stop.load(Ordering::Acquire) {
         while let Some(msg) = map.pop_midi() {
+            let ch = (msg.channel & 15) as u8;
             match msg.kind {
                 k if k == MidiKind::NoteOn as u32 => {
-                    instrument.note_on(msg.a as u8, msg.b as u8)
+                    instrument.note_on(ch, msg.a as u8, msg.b as u8)
                 }
-                k if k == MidiKind::NoteOff as u32 => instrument.note_off(msg.a as u8),
-                k if k == MidiKind::Sustain as u32 => instrument.set_sustain(msg.a != 0),
+                k if k == MidiKind::NoteOff as u32 => instrument.note_off(ch, msg.a as u8),
+                k if k == MidiKind::Sustain as u32 => instrument.set_sustain(ch, msg.a != 0),
                 k if k == MidiKind::AllNotesOff as u32 => instrument.all_notes_off(),
+                k if k == MidiKind::ControlChange as u32 => {
+                    instrument.control_change(ch, msg.a as u8, msg.b as u8)
+                }
                 _ => {}
             }
         }
@@ -656,6 +663,7 @@ fn timeline_from_notes(notes: &[RenderNote], duration: f64) -> Timeline {
                 key: n.key,
                 velocity: n.velocity,
                 channel: n.channel,
+                track: 0,
                 start: n.start,
                 end: n.end,
             })
@@ -672,6 +680,7 @@ fn render_to_wav(
     output: &str,
     sample_rate: u32,
     tail_secs: f64,
+    controls: &[(u8, u8, u8)],
 ) -> Result<(String, f64, f32)> {
     let timeline = timeline_from_notes(notes, duration);
     let stats = render_vst_to_wav(
@@ -685,6 +694,7 @@ fn render_to_wav(
             tail_secs,
             gain: 0.9,
         },
+        controls,
     )?;
     Ok((stats.path, stats.duration, stats.peak))
 }
@@ -697,10 +707,14 @@ fn render_vst2_to_wav(
     output: &str,
     sample_rate: u32,
     tail_secs: f64,
+    controls: &[(u8, u8, u8)],
 ) -> Result<(String, f64, f32)> {
     let timeline = timeline_from_notes(notes, duration);
     let vst = Vst2Plugin::load_with_state(plugin, sample_rate, state)?;
     let mut instrument = vst.instrument();
+    for &(channel, controller, value) in controls {
+        instrument.control_change(channel, controller, value);
+    }
     let stats = render_with_instrument(
         &timeline,
         &mut instrument,
