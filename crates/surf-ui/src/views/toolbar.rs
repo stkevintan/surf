@@ -2,7 +2,7 @@
 
 use gpui::{Context, IntoElement, ParentElement, Styled, div, prelude::*, px};
 
-use crate::shell::{self, SurfApp, on_click, on_click_cx};
+use crate::shell::{self, SurfApp, on_click, on_click_cx, on_click_window};
 use crate::theme::{color, size};
 use crate::widgets::{label, separator, text_button};
 
@@ -21,10 +21,19 @@ pub fn render(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
         .border_color(color::LINE)
         .child(
             row()
-                .child(on_click_cx(
-                    text_button("Open MIDI…", false).id("tb-open"),
+                .child(on_click_window(
+                    text_button("Open…", false).id("tb-open"),
                     cx,
-                    |_, cx| shell::open_midi(cx),
+                    |a, window, cx| shell::open_file(a, window, cx),
+                ))
+                .child(on_click_cx(
+                    text_button(
+                        if app.session.is_dirty() { "Save •" } else { "Save" },
+                        false,
+                    )
+                    .id("tb-save"),
+                    cx,
+                    |a, cx| shell::save_project(a, cx, false),
                 ))
                 .child(on_click(
                     text_button("Demo", false).id("tb-demo"),

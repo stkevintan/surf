@@ -39,7 +39,9 @@ Opening another MIDI file keeps the loaded instruments: each new track takes the
 
 ## Plugin state
 
-`SAVE STATE` (or `Ctrl+S`) stores the plugin's complete state, the same blob a DAW saves in a project. The next time that plugin loads, Surf restores it automatically. Set `SURF_NO_STATE=1` to skip the restore.
+**Save your project** with `⌘S` (`Ctrl+S` on Windows and Linux). The `.surf` file keeps the tracks, which instrument each track plays, and every plugin's complete state, the same blob a DAW saves in a project. Opening it with `⌘O` brings Kontakt back with the instruments you loaded, on the same channels. `⇧⌘S` saves a copy under a new name. Surf asks before closing or opening another file if there are unsaved changes.
+
+`SAVE STATE` in the Inspector is separate: it stores the plugin's current sound as its default, which new projects start with. Set `SURF_NO_STATE=1` to skip that default.
 
 State files are stored in the data directory as `vst-<hash>.state`, keyed by the plugin path. The data directory is `%APPDATA%\Surf`; if that is not writable, Surf falls back to `.surf\` in the repository. The status bar shows the path it actually used. If you move the plugin, its saved state no longer matches.
 
@@ -62,7 +64,7 @@ Notes:
 
 - Up to 31 instruments at once; tracks beyond that share a spare built-in piano. Tracks on a shared plugin count once.
 - If a plugin host crashes, its tracks fall back to the built-in piano and any unsaved state is lost. Pick the plugin again to reload it.
-- Plugin choices are not saved with the MIDI file yet; there is no project file.
+- A project opened on a machine without one of its plugins plays the built-in piano on those tracks. The plugin and its state stay in the file and come back once it's installed. Plugins are found by their full path.
 - Only the plugin's main stereo output is used.
 - Live playback through a plugin is not latency-compensated. Exported audio is.
 - WAV export through a plugin blocks the UI until it finishes.

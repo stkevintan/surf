@@ -69,6 +69,44 @@ pub fn save(
     .detach();
 }
 
+/// What the user chose when asked about unsaved changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unsaved {
+    Save,
+    Discard,
+    Cancel,
+}
+
+/// Ask "Save changes to …?" with Save / Don't Save / Cancel, then run
+/// `then` with the answer on the app. Callers ask only when
+/// [`crate::session::Session::is_dirty`].
+pub fn confirm_unsaved(
+    window: &mut gpui::Window,
+    cx: &mut Context<SurfApp>,
+    name: &str,
+    then: impl FnOnce(&mut SurfApp, Unsaved, &mut Context<SurfApp>) + 'static,
+) {
+    let rx = window.prompt(
+        gpui::PromptLevel::Warning,
+        &format!("Save changes to “{name}”?"),
+        Some("Your changes will be lost if you don't save them."),
+        &["Save", "Don't Save", "Cancel"],
+        cx,
+    );
+    cx.spawn(async move |this, cx| {
+        let answer = match rx.await {
+            Ok(0) => Unsaved::Save,
+            Ok(1) => Unsaved::Discard,
+            _ => Unsaved::Cancel,
+        };
+        let _ = this.update(cx, |app, cx| {
+            then(app, answer, cx);
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
 fn default_dir() -> PathBuf {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))

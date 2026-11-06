@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use surf_audio::render::{RenderOptions, RenderStats, mix_stems, render_timeline_to_wav};
 use surf_audio::{AudioEngine, Command, EngineStatus, OutputEvent, Synth};
+use surf_core::document::{self, Document};
 use surf_core::recorder::Recorder;
 use surf_core::edit::{Edit, History, TrackField};
 use surf_core::project::{Id, Project};
@@ -62,6 +63,11 @@ pub struct Session {
     pub record_arm: Option<Id>,
     /// Track whose instrument live input plays: the selected track.
     input_track: Option<Id>,
+    /// The `.surf` file the project was opened from or last saved to.
+    pub project_path: Option<PathBuf>,
+    /// Plugin states from the opened project, used when each plugin's host
+    /// first starts.
+    project_states: std::collections::BTreeMap<PathBuf, Vec<u8>>,
     /// The last recorded region, so the editor can open it.
     pub record_region: Option<Id>,
 }
@@ -114,6 +120,8 @@ impl Session {
             sustained_keys: HashSet::new(),
             record_arm: None,
             input_track: None,
+            project_path: None,
+            project_states: Default::default(),
             record_region: None,
             loop_playback: false,
             volume: 0.9,
@@ -256,6 +264,7 @@ impl Session {
         self.history.clear();
         self.record_arm = None;
         self.record_region = None;
+        self.project_path = None;
         self.project_changed();
     }
 
@@ -371,6 +380,11 @@ impl Session {
     fn start_host(&mut self, path: &Path) -> Option<VstClient> {
         let parked = rack::parked_state_path(path);
         let saved = vst_state_path_for(path);
+        // The opened project's state wins over the last one saved for the
+        // plugin; it goes through the parked file, which the host reads.
+        if let Some(blob) = self.project_states.remove(path) {
+            let _ = std::fs::write(&parked, blob);
+        }
         let state = if parked.exists() {
             Some(parked)
         } else if std::env::var_os("SURF_NO_STATE").is_none() && saved.exists() {
@@ -464,7 +478,7 @@ impl Session {
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case("mid") || e.eq_ignore_ascii_case("midi"));
         if !is_midi {
-            self.status = format!("{} is not a .mid or .midi file", path.display());
+            self.status = format!("{} is not a .surf, .mid or .midi file", path.display());
             return;
         }
         match surf_midi::smf::load(path) {
@@ -483,6 +497,140 @@ impl Session {
             }
             Err(err) => self.status = format!("Could not load MIDI: {err:#}"),
         }
+    }
+
+    /// Save the project and every plugin's state to `path` (a `.surf` file).
+    pub fn save_project_to(&mut self, path: PathBuf) {
+        let mut plugin_states = std::collections::BTreeMap::new();
+        let mut failed = Vec::new();
+        for host in &mut self.rack.hosts {
+            let tmp = rack::parked_state_path(&host.path).with_extension("save");
+            match host.client.save_state(&tmp).and_then(|_| Ok(std::fs::read(&tmp)?)) {
+                Ok(blob) => {
+                    plugin_states.insert(host.path.clone(), blob);
+                }
+                Err(err) => failed.push(format!("{}: {err:#}", host.client.name)),
+            }
+            let _ = std::fs::remove_file(&tmp);
+        }
+        // Plugins no track plays right now, or that failed to load, keep the
+        // state they were opened with.
+        for t in &self.project.tracks {
+            if let Some(p) = &t.instrument
+                && !plugin_states.contains_key(p)
+            {
+                if let Some(blob) = self.project_states.get(p) {
+                    plugin_states.insert(p.clone(), blob.clone());
+                } else if let Ok(blob) = std::fs::read(rack::parked_state_path(p)) {
+                    plugin_states.insert(p.clone(), blob);
+                }
+            }
+        }
+        let doc = Document {
+            project: self.project.clone(),
+            plugin_states,
+        };
+        match doc.save(&path) {
+            Ok(()) => {
+                self.history.mark_saved();
+                self.status = format!("Saved {}", path.display());
+                if !failed.is_empty() {
+                    self.status
+                        .push_str(&format!(" · without plugin state for {}", failed.join(", ")));
+                }
+                self.project_path = Some(path);
+            }
+            Err(err) => self.status = format!("Could not save: {err:#}"),
+        }
+    }
+
+    /// Save to the file the project came from; false if it has none yet.
+    pub fn save_project(&mut self) -> bool {
+        match self.project_path.clone() {
+            Some(path) => {
+                self.save_project_to(path);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Open a `.surf` project: its tracks, their instruments, and each
+    /// plugin's saved sound.
+    pub fn open_project(&mut self, path: &Path) {
+        let doc = match Document::load(path) {
+            Ok(doc) => doc,
+            Err(err) => {
+                self.status = format!("Could not open {}: {err:#}", path.display());
+                return;
+            }
+        };
+        self.audio.stop();
+        // Every plugin restarts from the project's state.
+        let hosts: Vec<u8> = self.rack.hosts.iter().map(|h| h.slot).collect();
+        for slot in hosts {
+            self.audio.set_slot(slot, None);
+            self.rack.slots[slot as usize] = None;
+        }
+        self.rack.hosts.clear();
+        self.rack.sent_cc7.clear();
+        self.rack.failed.clear();
+        self.project_states = doc.plugin_states;
+        for p in self.project_states.keys() {
+            let _ = std::fs::remove_file(rack::parked_state_path(p));
+        }
+        self.project = doc.project;
+        self.history.clear();
+        self.record_arm = None;
+        self.record_region = None;
+        self.project_path = Some(path.to_path_buf());
+        self.status = format!("Opening {}…", path.display());
+        self.project_changed();
+        let missing: Vec<String> = self
+            .project
+            .tracks
+            .iter()
+            .filter_map(|t| t.instrument.as_ref())
+            .filter(|p| self.rack.failed.contains(*p))
+            .map(|p| {
+                p.file_stem()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        self.status = if missing.is_empty() {
+            format!(
+                "Opened {} · {} track{}",
+                self.project.name,
+                self.project.tracks.len(),
+                if self.project.tracks.len() == 1 { "" } else { "s" }
+            )
+        } else {
+            format!(
+                "Opened {} · {} not available here, playing the piano instead",
+                self.project.name,
+                missing.join(", ")
+            )
+        };
+    }
+
+    /// Open either kind of file the Open dialog offers.
+    pub fn open_path(&mut self, path: &Path) {
+        let is_project = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case(document::EXTENSION));
+        if is_project {
+            self.open_project(path);
+        } else {
+            self.load_midi_path(path);
+        }
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.history.is_dirty()
     }
 
     /// Suggested file name for an export, without extension.
@@ -1201,7 +1349,7 @@ mod tests {
         std::fs::write(&txt, b"hi").unwrap();
         session.load_midi_path(&txt);
         assert_eq!(session.timeline.notes.len(), 2);
-        assert!(session.status.contains("not a .mid"));
+        assert!(session.status.contains("is not a .surf"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1364,6 +1512,79 @@ mod tests {
         assert!(s.rack.hosts.is_empty(), "no track uses it: the host stops");
         s.undo();
         assert_eq!(s.rack.hosts.len(), 1, "undo brings it back");
+
+        // Saved and reopened, both tracks are on one Kontakt again, started
+        // from the state in the file. (Undo put only track 2 back.)
+        s.set_input_track(Some(ids[0]));
+        s.load_vst_path(kontakt.clone());
+        let path = temp_project("kontakt");
+        s.save_project_to(path.clone());
+        let doc = Document::load(&path).unwrap();
+        assert!(doc.plugin_states.get(&kontakt).is_some_and(|b| !b.is_empty()));
+        let mut t = Session::new();
+        t.open_project(&path);
+        assert!(t.status.starts_with("Opened"), "status: {}", t.status);
+        assert_eq!(t.rack.hosts.len(), 1);
+        assert!(t.project.tracks.iter().all(|tr| tr.instrument.as_ref() == Some(&kontakt)));
+        std::fs::remove_file(path).ok();
+    }
+
+    fn temp_project(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("surf-{tag}-{}.surf", std::process::id()))
+    }
+
+    /// Save, edit, reopen: the file brings back the tracks and mix as saved,
+    /// with a clean undo stack.
+    #[test]
+    fn a_saved_project_opens_as_it_was() {
+        let path = temp_project("roundtrip");
+        let mut s = two_tracks();
+        let t = s.project.tracks[1].id;
+        s.apply("Volume", Edit::SetTrack { track: t, field: TrackField::Volume(0.3) });
+        assert!(s.is_dirty());
+        s.save_project_to(path.clone());
+        assert!(!s.is_dirty(), "status: {}", s.status);
+        let saved = s.project.clone();
+
+        s.apply("Mute", Edit::SetTrack { track: t, field: TrackField::Mute(true) });
+        assert!(s.is_dirty());
+        s.open_path(&path);
+        assert_eq!(s.project, saved, "status: {}", s.status);
+        assert!(!s.is_dirty());
+        assert_eq!(s.history.undo_label(), None);
+        assert_eq!(s.project_path.as_deref(), Some(path.as_path()));
+        assert_eq!(pianos(&s).len(), 2);
+
+        // ⌘S goes back to the same file.
+        s.apply("Mute", Edit::SetTrack { track: t, field: TrackField::Mute(true) });
+        assert!(s.save_project());
+        assert!(Document::load(&path).unwrap().project.tracks[1].mute);
+        std::fs::remove_file(path).ok();
+    }
+
+    /// A project whose plugin isn't installed opens on the piano, keeps the
+    /// plugin on the track, and saves its state back untouched.
+    #[test]
+    fn a_missing_plugin_plays_the_piano_and_keeps_its_state() {
+        let path = temp_project("missing");
+        let ghost = PathBuf::from("/nonexistent/Ghost.vst3");
+        let mut project = two_tracks().project;
+        project.tracks[0].instrument = Some(ghost.clone());
+        let doc = Document {
+            project,
+            plugin_states: [(ghost.clone(), vec![7, 7, 7])].into(),
+        };
+        doc.save(&path).unwrap();
+
+        let mut s = Session::new();
+        s.open_project(&path);
+        assert!(s.status.contains("Ghost not available"), "status: {}", s.status);
+        assert_eq!(s.project.tracks[0].instrument.as_ref(), Some(&ghost));
+        assert!(s.rack.failed.contains(&ghost));
+        s.save_project_to(path.clone());
+        let back = Document::load(&path).unwrap();
+        assert_eq!(back.plugin_states.get(&ghost), Some(&vec![7, 7, 7]));
+        std::fs::remove_file(path).ok();
     }
 
     /// Export writes every track, on its own channel.
