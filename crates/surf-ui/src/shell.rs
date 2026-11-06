@@ -21,11 +21,15 @@ use std::time::Instant;
 
 use gpui::{
     AnyElement, Bounds, ClickEvent, Context, FocusHandle, KeyDownEvent, KeyUpEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, Window, div, prelude::*, px,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Window, div, prelude::*,
+    px,
 };
 
 use surf_midi::LiveEvent;
 
+use surf_core::project::Id;
+
+use crate::editing::{self, Editing, Focus};
 use crate::session::Session;
 use crate::theme::{color, font, size};
 use crate::views;
@@ -82,6 +86,55 @@ pub struct Ui {
     pub perform_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// Key held down with the mouse on an on-screen keyboard.
     pub mouse_key: Option<u8>,
+    /// Selection, focus, tools and snap for the editors.
+    pub edit: Editing,
+    /// Pointer drag in the Tracks area or Piano Roll.
+    pub drag: Option<Drag>,
+    /// Rubber-band selection rectangle in window coordinates.
+    pub marquee: Option<(Point<Pixels>, Point<Pixels>)>,
+    /// Pencil hover cell in the piano roll: (tick, key).
+    pub pencil_hover: Option<(u64, u8)>,
+}
+
+/// What a pointer drag is doing, with the state it started from.
+#[derive(Clone, Debug)]
+pub enum Drag {
+    /// Moving notes (or copying, with ⌥). The lead note's start tick and key
+    /// anchor snapping, so the dragged note lands on the grid.
+    MoveNotes {
+        x0: f32,
+        y0: f32,
+        lead_tick: u64,
+        lead_key: u8,
+        copy: bool,
+        notes: Vec<Id>,
+    },
+    ResizeNotes {
+        x0: f32,
+        notes: Vec<Id>,
+    },
+    Velocity {
+        y0: f32,
+        base: Vec<(Id, u8)>,
+    },
+    MoveRegions {
+        x0: f32,
+        y0: f32,
+        lead_tick: u64,
+        copy: bool,
+        regions: Vec<Id>,
+    },
+    ResizeRegion {
+        x0: f32,
+        region: Id,
+        len0: u64,
+    },
+    Marquee {
+        tracks: bool,
+    },
+    Scrub {
+        tracks: bool,
+    },
 }
 
 impl Default for Ui {
@@ -115,6 +168,10 @@ impl Default for Ui {
             roll_bounds: Rc::default(),
             perform_bounds: Rc::default(),
             mouse_key: None,
+            edit: Editing::default(),
+            drag: None,
+            marquee: None,
+            pencil_hover: None,
         }
     }
 }
@@ -132,8 +189,14 @@ impl SurfApp {
         if std::env::var_os("SURF_UI").is_none() {
             window.focus(&focus);
         }
+        Self::with_session(Session::new(), focus)
+    }
+
+    /// Build the app around a session, without touching a window. Used by
+    /// [`SurfApp::new`] and by headless tests of the editors.
+    pub fn with_session(session: Session, focus: FocusHandle) -> Self {
         let mut app = Self {
-            session: Session::new(),
+            session,
             ui: Ui::default(),
             focus,
             started: Instant::now(),
@@ -152,6 +215,29 @@ impl SurfApp {
                     "no-inspector" => app.ui.show_inspector = false,
                     "track" => app.ui.track_open = true,
                     "play" => app.session.toggle_play(),
+                    // Two tracks from the demo (bass notes on channel 2) and a
+                    // note selection, so editing state shows in screenshots.
+                    "duet" => {
+                        let mut song = surf_core::song::Song::demo();
+                        for n in song.notes.iter_mut().filter(|n| n.key < 55) {
+                            n.channel = 1;
+                        }
+                        app.session
+                            .set_project(surf_core::project::Project::from_song(&song));
+                        app.ui.edit.reconcile(&app.session.project);
+                        let ids: Vec<_> = app.session.project.tracks[0].regions[0]
+                            .notes
+                            .iter()
+                            .take(4)
+                            .map(|n| n.id)
+                            .collect();
+                        app.ui.edit.notes = ids.into_iter().collect();
+                        app.ui
+                            .edit
+                            .regions
+                            .insert(app.session.project.tracks[0].regions[0].id);
+                        app.center_roll_on_song();
+                    }
                     _ => {}
                 }
             }
@@ -161,7 +247,15 @@ impl SurfApp {
 
     /// Scroll the piano roll so the song's notes are in view.
     pub fn center_roll_on_song(&mut self) {
-        let keys = self.session.timeline.notes.iter().map(|n| n.key);
+        self.ui.edit.reconcile(&self.session.project);
+        let region = self
+            .ui
+            .edit
+            .edit_region(&self.session.project)
+            .map(|(_, r)| r);
+        let keys = region
+            .into_iter()
+            .flat_map(|r| r.notes.iter().map(|n| n.key));
         let (lo, hi) = keys.fold((127u8, 0u8), |(lo, hi), k| (lo.min(k), hi.max(k)));
         if lo <= hi {
             // Rows that fit in the default editor height.
@@ -220,7 +314,38 @@ impl SurfApp {
         if event.is_held {
             return;
         }
+        let alt = ks.modifiers.alt;
+        let shift = ks.modifiers.shift;
+        let tracks_focus = self.ui.edit.focus == Focus::Tracks;
         match (cmd, key.as_str()) {
+            (true, "z") if shift => self.session.redo(),
+            (true, "z") => self.session.undo(),
+            (true, "a") => editing::select_all(&self.session, &mut self.ui.edit),
+            (true, "t") => editing::split_at_playhead(&mut self.session, &mut self.ui.edit),
+            (true, "j") => editing::join(&mut self.session, &mut self.ui.edit),
+            (false, "backspace" | "delete") => {
+                editing::delete(&mut self.session, &mut self.ui.edit)
+            }
+            (false, "q") => editing::quantize(&mut self.session, &self.ui.edit),
+            (false, "up") if alt => {
+                editing::transpose(&mut self.session, &self.ui.edit, if shift { 12 } else { 1 })
+            }
+            (false, "down") if alt => editing::transpose(
+                &mut self.session,
+                &self.ui.edit,
+                if shift { -12 } else { -1 },
+            ),
+            (false, "up") if tracks_focus => self.select_adjacent_track(-1),
+            (false, "down") if tracks_focus => self.select_adjacent_track(1),
+            (false, "escape") => {
+                if self.ui.drag.take().is_some() {
+                    self.session.history.cancel(&mut self.session.project);
+                    self.session.project_changed();
+                }
+                self.ui.marquee = None;
+            }
+            (false, "m") => self.toggle_selected_track(true),
+            (false, "s") => self.toggle_selected_track(false),
             (true, "k") => self.toggle_typing(),
             (true, "s") => self.session.save_vst_state(),
             // ⌘O is handled in render, which has the context a dialog needs.
@@ -256,6 +381,35 @@ impl SurfApp {
             self.session
                 .handle_live(LiveEvent::NoteOff { key: note }, Instant::now(), true);
         }
+    }
+
+    fn select_adjacent_track(&mut self, step: i32) {
+        let p = &self.session.project;
+        if p.tracks.is_empty() {
+            return;
+        }
+        let i = self
+            .ui
+            .edit
+            .track
+            .and_then(|t| p.tracks.iter().position(|x| x.id == t))
+            .unwrap_or(0) as i32;
+        let next = (i + step).clamp(0, p.tracks.len() as i32 - 1) as usize;
+        self.ui.edit.track = Some(p.tracks[next].id);
+    }
+
+    /// M / S on the selected track.
+    fn toggle_selected_track(&mut self, mute: bool) {
+        let Some(id) = self.ui.edit.track else { return };
+        let Some(t) = self.session.project.track(id) else {
+            return;
+        };
+        let field = if mute {
+            surf_core::edit::TrackField::Mute(!t.mute)
+        } else {
+            surf_core::edit::TrackField::Solo(!t.solo)
+        };
+        editing::set_track(&mut self.session, id, field);
     }
 
     pub fn toggle_typing(&mut self) {
@@ -340,6 +494,12 @@ impl Render for SurfApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.request_animation_frame();
         self.session.tick();
+        self.ui.edit.reconcile(&self.session.project);
+        if let Some(region) = self.session.record_region.take() {
+            self.ui
+                .edit
+                .select_region(&self.session.project, region, false);
+        }
 
         let main_view: AnyElement = match self.ui.main {
             MainView::Tracks => views::tracks::render(self, cx).into_any_element(),
@@ -387,7 +547,10 @@ impl Render for SurfApp {
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, _| {
                     this.ui.splitter_drag = None;
-                    this.ui.fader_drag = None;
+                    // A fader released outside its strip still ends its drag.
+                    if this.ui.fader_drag.take().is_some() {
+                        this.session.commit();
+                    }
                 }),
             )
             .child(views::control_bar::render(self, cx))
@@ -495,7 +658,9 @@ pub fn export_wav(app: &mut SurfApp, cx: &mut Context<SurfApp>) {
 }
 
 pub fn pick_plugin_folder(cx: &mut Context<SurfApp>) {
-    crate::dialogs::open(cx, "Choose", true, |app, path| app.session.load_vst_folder(&path));
+    crate::dialogs::open(cx, "Choose", true, |app, path| {
+        app.session.load_vst_folder(&path)
+    });
 }
 
 /// Like [`on_click`], for actions that also need the context (dialogs).

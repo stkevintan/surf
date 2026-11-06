@@ -19,6 +19,8 @@ pub const STRIP_MIN_H: f32 = 400.0;
 
 pub struct StripModel {
     pub id: &'static str,
+    /// The track this strip controls; `None` for Stereo Out.
+    pub track: Option<surf_core::project::Id>,
     pub name: String,
     pub track_color: Rgba,
     pub instrument: Option<(String, SlotColors)>,
@@ -71,6 +73,7 @@ pub fn render(
 ) -> impl IntoElement {
     let is_master = model.master;
     let id = model.id;
+    let track = model.track;
     let pos = gain_to_pos(model.volume);
     let peak = model.peak.clamp(0.0, 1.0);
     let bounds_out = model.fader_bounds.clone();
@@ -154,17 +157,20 @@ pub fn render(
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, e: &MouseDownEvent, window, cx| {
-                set_from_pointer(this, e.position.y, window, id);
+                set_from_pointer(this, e.position.y, window, id, track);
                 this.ui.fader_drag = Some(id);
                 cx.notify();
             }),
         )
         .on_mouse_move(cx.listener(move |this, e: &MouseMoveEvent, window, cx| {
             if this.ui.fader_drag == Some(id) && e.pressed_button == Some(MouseButton::Left) {
-                set_from_pointer(this, e.position.y, window, id);
+                set_from_pointer(this, e.position.y, window, id, track);
                 cx.notify();
-            } else if e.pressed_button.is_none() {
+            } else if e.pressed_button.is_none() && this.ui.fader_drag == Some(id) {
                 this.ui.fader_drag = None;
+                if track.is_some() {
+                    this.session.commit();
+                }
             }
         }));
 
@@ -242,8 +248,10 @@ pub fn render(
                 .flex_row()
                 .justify_center()
                 .gap(px(3.0))
-                .child(msr("M", Tone::Mute, model.mute))
-                .when(!is_master, |d| d.child(msr("S", Tone::Solo, model.solo))),
+                .child(toggle(cx, track, "M", Tone::Mute, model.mute))
+                .when(!is_master, |d| {
+                    d.child(toggle(cx, track, "S", Tone::Solo, model.solo))
+                }),
         )
         .child(
             div()
@@ -265,14 +273,31 @@ pub fn render(
         )
 }
 
-fn set_from_pointer(app: &mut SurfApp, y: gpui::Pixels, window: &gpui::Window, id: &'static str) {
+fn set_from_pointer(
+    app: &mut SurfApp,
+    y: gpui::Pixels,
+    window: &gpui::Window,
+    id: &'static str,
+    track: Option<surf_core::project::Id>,
+) {
     // Map the pointer through the bounds the fader was painted at last frame.
     let bounds = app.ui.fader_bounds.borrow().get(id).copied();
     if let Some(bounds) = bounds {
         let top = f32::from(bounds.origin.y);
         let h = f32::from(bounds.size.height).max(1.0);
         let pos = 1.0 - ((f32::from(y) - top - 15.0) / (h - 30.0).max(1.0));
-        app.session.set_volume(pos_to_gain(pos));
+        let gain = pos_to_gain(pos);
+        match track {
+            // A drag previews, then commits on mouse-up as one undo step.
+            Some(t) => app.session.preview(
+                "Volume",
+                surf_core::edit::Edit::SetTrack {
+                    track: t,
+                    field: surf_core::edit::TrackField::Volume(gain),
+                },
+            ),
+            None => app.session.set_volume(gain),
+        }
     }
     let _ = window;
 }
@@ -340,6 +365,31 @@ fn caption(text: &'static str) -> impl IntoElement {
         .text_size(px(font::CAPTION))
         .text_color(color::TEXT_TERTIARY)
         .child(text.to_uppercase())
+}
+
+fn toggle(
+    cx: &mut Context<SurfApp>,
+    track: Option<surf_core::project::Id>,
+    letter: &'static str,
+    tone: Tone,
+    on: bool,
+) -> impl IntoElement {
+    let id = gpui::ElementId::Name(format!("strip-{letter}-{}", track.map_or(0, |t| t.0)).into());
+    msr(letter, tone, on)
+        .id(id)
+        .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+            let Some(t) = track else {
+                this.planned("Master mute");
+                return;
+            };
+            let field = if letter == "M" {
+                surf_core::edit::TrackField::Mute(!on)
+            } else {
+                surf_core::edit::TrackField::Solo(!on)
+            };
+            crate::editing::set_track(&mut this.session, t, field);
+            cx.notify();
+        }))
 }
 
 #[cfg(test)]

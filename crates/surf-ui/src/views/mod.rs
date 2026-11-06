@@ -17,36 +17,25 @@ use crate::session::Session;
 use crate::shell::SurfApp;
 use crate::theme::color;
 
-/// The song shown as a track. There is one until the multi-track model lands.
-pub struct TrackModel {
-    pub name: String,
-    pub instrument: String,
-    pub plugin: bool,
-    pub color: Rgba,
+/// Palette color for a track.
+pub fn track_color(t: &surf_core::project::Track) -> Rgba {
+    color::TRACKS[t.color % color::TRACKS.len()]
 }
 
-pub fn track_model(s: &Session) -> TrackModel {
+/// The instrument every track plays through today. Multi-instrument routing
+/// (one plugin per track, or Kontakt shared across channels) comes with the
+/// multi-track engine; until then all tracks share the loaded instrument.
+pub fn instrument_name(s: &Session) -> String {
     match &s.vst {
-        Some(vst) => TrackModel {
-            name: vst.name.clone(),
-            instrument: vst.name.clone(),
-            plugin: true,
-            color: color::TRACKS[0],
-        },
-        None => TrackModel {
-            name: "Grand Piano".to_string(),
-            instrument: "Surf Piano".to_string(),
-            plugin: false,
-            color: color::TRACKS[0],
-        },
+        Some(vst) => vst.name.clone(),
+        None => "Surf Piano".to_string(),
     }
 }
 
 /// Song length in whole bars, at least 1.
 pub fn song_bars(s: &Session) -> u64 {
-    let (num, _) = s.time_signature();
-    let beats = s.timeline.duration * s.bpm().max(1.0) / 60.0;
-    ((beats / num.max(1) as f64).ceil() as u64).max(1)
+    let bar = s.project.ticks_per_bar().max(1);
+    s.project.end().div_ceil(bar).max(1)
 }
 
 /// Seconds per beat at the song's tempo.
@@ -54,16 +43,21 @@ pub fn beat_secs(s: &Session) -> f64 {
     60.0 / s.bpm().max(1.0)
 }
 
-pub fn track_strip(app: &SurfApp, selected: bool) -> strip::StripModel {
+/// Channel strip for a track. `index` is its position, for a stable id.
+pub fn track_strip(
+    app: &SurfApp,
+    track: &surf_core::project::Track,
+    index: usize,
+) -> strip::StripModel {
     let s = &app.session;
-    let t = track_model(s);
     strip::StripModel {
-        id: "track-1",
-        name: t.name,
-        track_color: t.color,
+        id: strip_id(index),
+        track: Some(track.id),
+        name: track.name.clone(),
+        track_color: track_color(track),
         instrument: Some((
-            t.instrument,
-            if t.plugin {
+            instrument_name(s),
+            if s.vst.is_some() {
                 color::SLOT_INST_PLUGIN
             } else {
                 color::SLOT_INST_BUILTIN
@@ -71,20 +65,35 @@ pub fn track_strip(app: &SurfApp, selected: bool) -> strip::StripModel {
         )),
         effects: Vec::new(),
         output: "Stereo Out",
-        volume: s.volume,
-        peak: s.engine.peak,
-        mute: false,
-        solo: false,
-        selected,
+        volume: track.volume,
+        peak: if s.project.audible(track) {
+            s.engine.peak
+        } else {
+            0.0
+        },
+        mute: track.mute,
+        solo: track.solo,
+        selected: app.ui.edit.track == Some(track.id),
         master: false,
         fader_bounds: app.ui.fader_bounds.clone(),
     }
+}
+
+/// Fader ids must be `'static`; tracks beyond this share the last id.
+fn strip_id(index: usize) -> &'static str {
+    const IDS: [&str; 16] = [
+        "track-1", "track-2", "track-3", "track-4", "track-5", "track-6", "track-7", "track-8",
+        "track-9", "track-10", "track-11", "track-12", "track-13", "track-14", "track-15",
+        "track-16",
+    ];
+    IDS[index.min(IDS.len() - 1)]
 }
 
 pub fn master_strip(app: &SurfApp) -> strip::StripModel {
     let s = &app.session;
     strip::StripModel {
         id: "master",
+        track: None,
         name: "Stereo Out".to_string(),
         track_color: color::TEXT_TERTIARY,
         instrument: None,
