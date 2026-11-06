@@ -59,13 +59,19 @@ pub fn render(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
     let beat_secs = views::beat_secs(s);
     let (per_bar, _) = s.time_signature();
     let active = s.active_keys();
-    let track = views::track_model(s).color;
-    let song: Vec<(f64, f64, u8)> = s
-        .timeline
-        .notes
+    // Song notes with their track's color, muted and soloed-out tracks dropped.
+    let p = &s.project;
+    let colors: std::collections::HashMap<_, _> = p
+        .tracks
         .iter()
-        .filter(|n| n.end > position && n.start < position + LOOK_AHEAD)
-        .map(|n| (n.start, n.end, n.key))
+        .filter(|t| p.audible(t))
+        .map(|t| (t.id, views::track_color(t)))
+        .collect();
+    let song: Vec<(f64, f64, u8, gpui::Rgba)> = p
+        .timed_notes()
+        .into_iter()
+        .filter(|(_, n)| n.end > position && n.start < position + LOOK_AHEAD)
+        .filter_map(|(t, n)| colors.get(&t).map(|c| (n.start, n.end, n.key, *c)))
         .collect();
     let now = Instant::now();
     let live: Vec<(f32, Option<f32>, u8)> = s
@@ -109,7 +115,8 @@ pub fn render(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
             ));
         }
         // Song notes falling onto the keys.
-        for (start, end, key) in &song {
+        for (start, end, key, track) in &song {
+            let track = *track;
             let g = keys[*key as usize];
             let bottom = (hit - (*start - position) as f32 * px_per_sec).min(hit);
             let top = hit - (*end - position) as f32 * px_per_sec;

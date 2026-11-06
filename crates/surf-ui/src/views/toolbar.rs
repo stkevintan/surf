@@ -38,12 +38,26 @@ pub fn render(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
         .child(separator())
         .child(
             row()
-                // Editing commands need the multi-track model (next step);
-                // the buttons hold their place.
-                .child(planned("tb-quantize", "Quantize", cx))
-                .child(planned("tb-split", "Split at Playhead", cx))
-                .child(planned("tb-join", "Join", cx))
-                .child(planned("tb-newtrack", "New Track", cx)),
+                .child(on_click(
+                    text_button("Quantize", false).id("tb-quantize"),
+                    cx,
+                    |a| crate::editing::quantize(&mut a.session, &a.ui.edit),
+                ))
+                .child(on_click(
+                    text_button("Split at Playhead", false).id("tb-split"),
+                    cx,
+                    |a| crate::editing::split_at_playhead(&mut a.session, &mut a.ui.edit),
+                ))
+                .child(on_click(
+                    text_button("Join", false).id("tb-join"),
+                    cx,
+                    |a| crate::editing::join(&mut a.session, &mut a.ui.edit),
+                ))
+                .child(on_click(
+                    text_button("New Track", false).id("tb-newtrack"),
+                    cx,
+                    |a| crate::editing::new_track(&mut a.session, &mut a.ui.edit),
+                )),
         )
         .child(separator())
         .child(

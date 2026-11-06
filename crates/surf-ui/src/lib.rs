@@ -5,6 +5,7 @@
 //! - [`theme`] holds the design tokens; [`widgets`] the shared controls.
 
 pub mod dialogs;
+pub mod editing;
 pub mod fonts;
 pub mod icons;
 pub mod session;
@@ -15,3 +16,6 @@ pub mod widgets;
 
 pub use icons::Assets;
 pub use shell::SurfApp;
+
+#[cfg(test)]
+mod editor_tests;

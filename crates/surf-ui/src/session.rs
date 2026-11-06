@@ -13,6 +13,8 @@ use std::time::Instant;
 use surf_audio::render::{RenderOptions, render_timeline_to_wav};
 use surf_audio::{AudioEngine, Command, EngineStatus, OutputEvent, Synth};
 use surf_core::recorder::Recorder;
+use surf_core::edit::{Edit, History};
+use surf_core::project::{Id, Project};
 use surf_core::song::{Song, Timeline};
 use surf_midi::{LiveEvent, MidiHub, NoteSink, PortChange};
 use surf_plugin::client::{RenderNote, VstClient, helper_log_path};
@@ -30,9 +32,12 @@ pub struct Session {
     pub audio: AudioEngine,
     pub midi: MidiHub,
     recorder: Recorder,
-    pub song: Option<Song>,
+    /// The tracks, regions and notes being edited.
+    pub project: Project,
+    pub history: History,
+    /// What the engine plays: the project's audible tracks, flattened.
+    /// Rebuilt after every edit by [`Session::project_changed`].
     pub timeline: Timeline,
-    pub song_name: String,
     pub live_notes: Vec<LiveNote>,
     pub vst: Option<VstClient>,
     render_rx: Option<Receiver<anyhow::Result<surf_audio::render::RenderStats>>>,
@@ -50,6 +55,10 @@ pub struct Session {
     /// Keys whose note-off arrived while the pedal was down. They sound until the
     /// pedal lifts, so the keyboard should keep showing them as ringing.
     pub sustained_keys: HashSet<u8>,
+    /// Track armed for recording (the R button); None means the first track.
+    pub record_arm: Option<Id>,
+    /// The last recorded region, so the editor can open it.
+    pub record_region: Option<Id>,
 }
 
 impl Session {
@@ -71,9 +80,8 @@ impl Session {
         let midi = MidiHub::new(sink);
         // Start with a short demo loaded (paused) so the piano roll has
         // something to show before the user opens their own file.
-        let demo = Song::demo();
-        let timeline = demo.timeline();
-        let song_name = demo.name.clone();
+        let project = Project::from_song(&Song::demo());
+        let timeline = project.timeline();
         // The status bar already shows the output device and MIDI port.
         let status = if midi.ports().is_empty() {
             "No MIDI input · press ⌘K for Musical Typing, or open a MIDI file".to_string()
@@ -88,9 +96,9 @@ impl Session {
             audio,
             midi,
             recorder: Recorder::new(),
-            song: Some(demo),
+            project,
+            history: History::new(),
             timeline,
-            song_name,
             live_notes: Vec::new(),
             vst: None,
             render_rx: None,
@@ -99,6 +107,8 @@ impl Session {
             plugin_scan,
             sustain: false,
             sustained_keys: HashSet::new(),
+            record_arm: None,
+            record_region: None,
             loop_playback: false,
             volume: 0.9,
             status,
@@ -107,8 +117,8 @@ impl Session {
     }
 
     pub fn toggle_play(&mut self) {
-        if self.song.is_none() {
-            self.status = "Load a MIDI file before pressing play".to_string();
+        if self.timeline.notes.is_empty() && self.timeline.duration <= 0.0 {
+            self.status = "Nothing to play yet · open a MIDI file or record a take".to_string();
             return;
         }
         let status = self.audio.status();
@@ -149,17 +159,13 @@ impl Session {
     pub fn toggle_record(&mut self) {
         if self.recorder.is_recording() {
             let notes = self.recorder.finish(Instant::now());
+            self.audio.stop();
             if notes.is_empty() {
                 self.status = "Recording stopped: no notes captured".to_string();
                 return;
             }
-            let name = format!("Take {}", self.song_name_or("Untitled"));
-            let song = Song::from_recorded(name, &notes);
-            self.timeline = song.timeline();
-            self.song = Some(song);
-            self.song_name = format!("Recorded take · {} notes", notes.len());
-            self.audio.stop();
-            self.status = format!("Recorded {} notes — press play or export MIDI", notes.len());
+            let take = Song::from_recorded("Take", &notes);
+            self.add_take(&take);
         } else {
             self.recorder.start(Instant::now());
             self.live_notes.clear();
@@ -168,21 +174,110 @@ impl Session {
         }
     }
 
-    fn song_name_or(&self, fallback: &str) -> String {
-        self.song
-            .as_ref()
-            .map(|s| s.name.clone())
-            .unwrap_or_else(|| fallback.to_string())
+    /// Put a recorded take on the record track as a new region, starting at
+    /// bar 1 (the transport always records from the start for now).
+    fn add_take(&mut self, take: &Song) {
+        let Some(track) = self.record_track() else { return };
+        let bar = self.project.ticks_per_bar().max(1);
+        // The recorder works at 480 PPQ; rescale to the project's resolution.
+        let scale = self.project.ppq.max(1) as f64 / take.ppq.max(1) as f64;
+        let mut notes = Vec::new();
+        for n in &take.notes {
+            notes.push(surf_core::project::Note {
+                id: self.project.alloc(),
+                key: n.key,
+                velocity: n.velocity,
+                start: (n.start_tick as f64 * scale).round() as u64,
+                len: ((n.duration_ticks as f64 * scale).round() as u64).max(1),
+            });
+        }
+        let end = notes.iter().map(|n| n.end()).max().unwrap_or(bar);
+        let index = self.project.track(track).map_or(0, |t| t.regions.len());
+        let takes = self
+            .project
+            .tracks
+            .iter()
+            .flat_map(|t| &t.regions)
+            .filter(|r| r.name.starts_with("Take"))
+            .count();
+        let region = surf_core::project::Region {
+            id: self.project.alloc(),
+            name: format!("Take {}", takes + 1),
+            start: 0,
+            len: end.div_ceil(bar) * bar,
+            notes,
+        };
+        let count = region.notes.len();
+        let id = region.id;
+        self.history.apply(&mut self.project, "Record", Edit::InsertRegion { track, index, region });
+        self.project_changed();
+        self.record_region = Some(id);
+        self.status = format!("Recorded {count} notes into a new take");
+    }
+
+    /// Track that recording goes to: the armed one, else the first.
+    pub fn record_track(&self) -> Option<Id> {
+        self.record_arm.or_else(|| self.project.tracks.first().map(|t| t.id))
     }
 
     pub fn load_demo(&mut self) {
-        let song = Song::demo();
-        self.timeline = song.timeline();
-        self.song_name = song.name.clone();
-        self.song = Some(song);
-        self.audio.stop();
+        self.set_project(Project::from_song(&Song::demo()));
         self.audio.play(self.timeline.clone(), 0.0);
         self.status = "Demo loaded — 4 bars of Am–F–C–G".to_string();
+    }
+
+    /// Replace the whole project (a new file). Clears undo history.
+    pub fn set_project(&mut self, project: Project) {
+        self.audio.stop();
+        self.project = project;
+        self.history.clear();
+        self.record_arm = None;
+        self.record_region = None;
+        self.project_changed();
+    }
+
+    /// Call after every change to the project, so playback hears it.
+    pub fn project_changed(&mut self) {
+        let position = self.position();
+        let playing = self.engine.playing;
+        self.timeline = self.project.timeline();
+        if playing {
+            self.audio.play(self.timeline.clone(), position);
+        }
+    }
+
+    /// Apply an edit as one undo step and refresh playback.
+    pub fn apply(&mut self, label: &str, edit: Edit) {
+        self.history.apply(&mut self.project, label, edit);
+        self.project_changed();
+    }
+
+    /// Apply a drag's current state; see [`History::preview`].
+    pub fn preview(&mut self, label: &str, edit: Edit) {
+        self.history.preview(&mut self.project, label, edit);
+        self.timeline = self.project.timeline();
+    }
+
+    /// End a drag started with [`Session::preview`].
+    pub fn commit(&mut self) {
+        self.history.commit();
+        self.project_changed();
+    }
+
+    pub fn undo(&mut self) {
+        self.status = match self.history.undo(&mut self.project) {
+            Some(label) => format!("Undo {label}"),
+            None => "Nothing to undo".to_string(),
+        };
+        self.project_changed();
+    }
+
+    pub fn redo(&mut self) {
+        self.status = match self.history.redo(&mut self.project) {
+            Some(label) => format!("Redo {label}"),
+            None => "Nothing to redo".to_string(),
+        };
+        self.project_changed();
     }
 
     /// Open a MIDI file and start playing it.
@@ -201,16 +296,16 @@ impl Session {
         }
         match surf_midi::smf::load(path) {
             Ok(song) => {
-                self.timeline = song.timeline();
-                self.song_name = song.name.clone();
                 let notes = song.note_count();
-                let duration = self.timeline.duration;
-                self.song = Some(song);
-                self.audio.stop();
+                self.set_project(Project::from_song(&song));
                 self.audio.play(self.timeline.clone(), 0.0);
                 self.status = format!(
-                    "Loaded {} · {} notes · {:.1}s",
-                    self.song_name, notes, duration
+                    "Loaded {} · {} notes on {} track{} · {:.1}s",
+                    self.project.name,
+                    notes,
+                    self.project.tracks.len(),
+                    if self.project.tracks.len() == 1 { "" } else { "s" },
+                    self.timeline.duration
                 );
             }
             Err(err) => self.status = format!("Could not load MIDI: {err:#}"),
@@ -219,7 +314,7 @@ impl Session {
 
     /// Suggested file name for an export, without extension.
     pub fn export_stem(&self) -> String {
-        let name = self.song.as_ref().map(|s| s.name.as_str()).unwrap_or("surf-export");
+        let name = if self.project.name.is_empty() { "surf-export" } else { self.project.name.as_str() };
         let clean: String = name
             .chars()
             .map(|c| if c.is_alphanumeric() || " -_".contains(c) { c } else { '_' })
@@ -228,18 +323,16 @@ impl Session {
     }
 
     pub fn can_export_midi(&mut self) -> bool {
-        if self.song.is_none() {
+        let any = self.project.tracks.iter().any(|t| t.regions.iter().any(|r| !r.notes.is_empty()));
+        if !any {
             self.status = "Nothing to export yet".to_string();
         }
-        self.song.is_some()
+        any
     }
 
     pub fn export_midi_to(&mut self, path: &Path) {
-        let Some(song) = &self.song else {
-            self.status = "Nothing to export yet".to_string();
-            return;
-        };
-        match surf_midi::smf::save(song, path) {
+        let song = self.project.to_song();
+        match surf_midi::smf::save(&song, path) {
             Ok(()) => self.status = format!("MIDI exported to {}", path.display()),
             Err(err) => self.status = format!("MIDI export failed: {err:#}"),
         }
@@ -666,15 +759,11 @@ impl Session {
 
     /// Tempo at the start of the song.
     pub fn bpm(&self) -> f64 {
-        self.song
-            .as_ref()
-            .and_then(|s| s.tempos.first())
-            .map(|t| t.bpm)
-            .unwrap_or(120.0)
+        self.project.tempos.first().map(|t| t.bpm).unwrap_or(120.0)
     }
 
     pub fn time_signature(&self) -> (u8, u8) {
-        self.song.as_ref().map(|s| s.time_signature).unwrap_or((4, 4))
+        self.project.time_signature
     }
 
     pub fn seek(&mut self, secs: f64) {
@@ -826,7 +915,7 @@ mod tests {
 
         let mut session = Session::new();
         session.load_midi_path(&path);
-        assert_eq!(session.song_name, "Two Notes", "status: {}", session.status);
+        assert_eq!(session.project.name, "Two Notes", "status: {}", session.status);
         assert_eq!(session.timeline.notes.len(), 2);
 
         // A file that is not MIDI is refused with a message, not loaded.
@@ -835,6 +924,76 @@ mod tests {
         session.load_midi_path(&txt);
         assert_eq!(session.timeline.notes.len(), 2);
         assert!(session.status.contains("not a .mid"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An edit reaches playback, and undo puts playback back.
+    #[test]
+    fn edits_and_undo_refresh_what_plays() {
+        let mut s = Session::new();
+        let region = s.project.tracks[0].regions[0].id;
+        let first = s.project.tracks[0].regions[0].notes[0].clone();
+        let before = s.timeline.notes.len();
+        s.apply("Delete Note", Edit::DeleteNotes { region, notes: vec![first.id] });
+        assert_eq!(s.timeline.notes.len(), before - 1);
+        assert_eq!(s.history.undo_label(), Some("Delete Note"));
+        s.undo();
+        assert_eq!(s.timeline.notes.len(), before);
+        assert!(s.status.contains("Undo Delete Note"));
+        s.redo();
+        assert_eq!(s.timeline.notes.len(), before - 1);
+    }
+
+    /// Muting a track takes its notes out of playback (undoably).
+    #[test]
+    fn mute_changes_playback() {
+        let mut s = Session::new();
+        let t = s.project.tracks[0].id;
+        let before = s.timeline.notes.len();
+        assert!(before > 0);
+        s.apply("Mute", Edit::SetTrack { track: t, field: surf_core::edit::TrackField::Mute(true) });
+        assert_eq!(s.timeline.notes.len(), 0);
+        s.undo();
+        assert_eq!(s.timeline.notes.len(), before);
+    }
+
+    /// A recorded take lands as a new region on the record track.
+    #[test]
+    fn recording_adds_a_take_region() {
+        let mut s = Session::new();
+        let track = s.project.tracks[0].id;
+        let regions = s.project.tracks[0].regions.len();
+        let mut take = Song::empty();
+        take.notes.push(surf_core::song::Note { key: 64, velocity: 100, channel: 0, start_tick: 0, duration_ticks: 240 });
+        s.add_take(&take);
+        let t = s.project.track(track).unwrap();
+        assert_eq!(t.regions.len(), regions + 1);
+        let new = t.regions.last().unwrap();
+        assert_eq!(new.name, "Take 1");
+        assert_eq!(new.notes.len(), 1);
+        assert_eq!(s.record_region, Some(new.id));
+        s.undo();
+        assert_eq!(s.project.track(track).unwrap().regions.len(), regions);
+    }
+
+    /// Export writes every track, on its own channel.
+    #[test]
+    fn export_round_trips_tracks() {
+        let dir = std::env::temp_dir().join(format!("surf-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = Session::new();
+        let mut song = Song::demo();
+        for n in song.notes.iter_mut().filter(|n| n.key < 55) {
+            n.channel = 1;
+        }
+        s.set_project(Project::from_song(&song));
+        assert_eq!(s.project.tracks.len(), 2);
+        let path = dir.join("out.mid");
+        s.export_midi_to(&path);
+        let back = Project::from_song(&surf_midi::smf::load(&path).unwrap());
+        assert_eq!(back.tracks.len(), 2);
+        let count = |p: &Project| p.tracks.iter().map(|t| t.regions[0].notes.len()).collect::<Vec<_>>();
+        assert_eq!(count(&back), count(&s.project));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

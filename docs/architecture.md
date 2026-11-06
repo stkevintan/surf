@@ -103,7 +103,7 @@ UiState ─ selection (regions | notes), focus area, edit region, zoom/scroll   
 
 Positions are stored in **ticks** (PPQ 960 in the target; 480 today) and converted to seconds or frames through the tempo map only at the edges: playback scheduling, rendering, drawing.
 
-*Current:* `Song` holds a flat note list with ticks; `Timeline` is a flattened `Vec<TimedNote>` in seconds. There are no tracks or regions yet.
+*Current:* `surf-core::project::Project` holds tracks → regions → notes, in ticks at the file's PPQ (480 for files Surf writes). Note starts are relative to their region, so moving a region moves its notes. Every object has a stable `Id`, so selection and undo survive edits. Mixer fields are `volume`, `mute`, `solo` and `channel`. There is no per-track instrument yet: all tracks play through the one loaded instrument (§2.3). `Song` remains the MIDI-file form; `Project::from_song` makes one track per MIDI channel, and `Project::to_song` / `timeline()` flatten it back for export and playback.
 
 ### 1.6 Cross-platform strategy
 
@@ -162,8 +162,7 @@ The app binary does not link `vst3-host` or `vst`; only the host does (`cargo tr
 *Still to come*
 
 ```
-crates/surf-core/          + Project/Track/Region, commands, undo, quantize (phase 2)
-crates/surf-ui/            split app.rs into shell, tracks, roll, mixer, … + theme.rs (phase 2–3)
+crates/surf-audio/         per-track instruments and gain (Kontakt shared by MIDI channel) (phase 3)
 crates/surf-visual/        wgpu stage renderer (phase 4)
 ```
 
@@ -183,7 +182,7 @@ Where the original files went:
 | `audio/vst_scan.rs` | `surf-plugin::scan` |
 | `paths.rs` | `surf-platform::dirs` |
 | `bin/vst_helper.rs` | `apps/surf-plugin-host` (MMCSS code moved to `surf-platform::rt`) |
-| `app.rs` | `surf-ui::app` (unchanged view; split in phase 2) |
+| `app.rs` | `surf-ui::{session, shell, views/*}` |
 
 ---
 
@@ -191,36 +190,22 @@ Where the original files went:
 
 Each module is listed with its responsibility, public surface, and implementation notes.
 
-### 2.1 `surf-core` — project model *(target; today `song.rs` + `recorder.rs`)*
+### 2.1 `surf-core` — project model and edits
 
-**Responsibility:** the single source of truth for musical data and every operation that edits it.
+**Responsibility:** the single source of truth for musical data, and every operation that changes it.
 
-**Public surface (target):**
+- `project.rs`: `Project { tempos, time_signature, tracks: Vec<Track> }`, `Track { channel, mute, solo, volume, regions }`, `Region { start, len, notes }`, `Note { key, velocity, start, len }`, all with `Id`s. Conversions: `from_song`, `to_song`, `timeline()`. `timeline()` drops tracks that are muted or soloed out, and scales velocity by track volume until each track gets a real gain stage. Notes past a region's end are kept but don't play.
+- `edit.rs`: `Edit`, an enum covering every change:
+  - notes: move, resize, velocity, add, delete, quantize;
+  - regions: move (across tracks), resize, split, join, insert, remove;
+  - tracks: add, remove, set field;
+  - `Batch` for compound steps.
 
-```rust
-pub struct Project { pub tempo: TempoMap, pub tracks: Vec<Track>, pub master: Mixer }
-pub struct Track   { pub id: TrackId, pub name: String, pub color: TrackColor,
-                     pub instrument: InstrumentRef, pub mixer: Mixer, pub regions: Vec<Region> }
-pub struct Region  { pub id: RegionId, pub name: String, pub start: Tick, pub len: Tick, pub notes: Vec<Note> }
-pub struct Note    { pub id: NoteId, pub key: u8, pub vel: u8, pub start: Tick, pub len: Tick } // start is region-relative
+  `Edit::apply(&mut Project) -> Edit` returns the exact inverse. Clamped moves restore the original notes rather than applying the opposite offset.
+- `History`: undo/redo stacks of labelled steps. A drag calls `preview()` on each pointer move, which replaces the previous preview instead of stacking a new step, and `commit()` on pointer-up, so one gesture is one ⌘Z. `cancel()` (Esc) restores the state before the drag.
+- `recorder.rs`: live `(event, Instant)` pairs → notes, independent of the audio clock. The UI turns a finished take into a new `Take N` region on the record-armed track.
 
-pub enum Command { MoveRegions{..}, ResizeRegion{..}, SplitRegion{..}, JoinRegions{..},
-                   AddNotes{..}, MoveNotes{..}, ResizeNotes{..}, SetVelocity{..}, Quantize{..},
-                   DeleteNotes{..}, SetMixer{..}, SetInstrument{..}, AddTrack{..}, Record{..}, … }
-pub struct History { /* applied commands with their inverses */ }
-impl History { fn apply(&mut self, p: &mut Project, c: Command); fn undo(..); fn redo(..); fn label(..) }
-
-pub fn playback_events(p: &Project, from: Tick, to: Tick) -> impl Iterator<Item = ScheduledNote>;
-```
-
-**Implementation notes:**
-
-- Commands are invertible. `apply` returns the inverse, which is pushed to the undo stack. A drag commits one command when it starts and updates its payload until pointer-up, so one gesture is one undo step (the prototype behaves the same way).
-- `TempoMap` stores sorted tempo events and converts tick ↔ seconds by integrating over segments. That conversion exists today in `Song::tick_to_sec` / `sec_to_tick`.
-- Mute/solo resolution (`audible(track) = any_solo ? solo : !mute`) lives here so the audio engine and the views agree.
-- Recording logic from `recorder.rs` moves here unchanged in spirit: it takes `(event, Instant)` pairs and a start instant, and produces notes. It stays independent of the audio clock.
-
-**Current:** `Song { ppq: 480, tempos, time_signature, notes: Vec<Note> }` with `timeline() -> Timeline` producing seconds. `Recorder` builds `RecordedNote`s from live events, holding note-offs while the pedal is down.
+Tests apply every edit kind and undo it, asserting the project is bit-for-bit unchanged. They also cover: split then join restoring the notes, partial-strength quantize, a 10-step drag undoing in one step, and cancel.
 
 ### 2.2 `surf-midi` — MIDI I/O and files
 
@@ -233,7 +218,7 @@ pub fn playback_events(p: &Project, from: Tick, to: Tick) -> impl Iterator<Item 
 
 **Files** (`song.rs` today):
 - Import with `midly`: accept metrical or SMPTE timing (SMPTE falls back to the default PPQ), read tempo and time-signature meta events, pair note on/off per `(channel, key)` with a stack (an overlapping same-key note-off closes the most recent note-on), drop drum channel 10 and keys above 127, then extend durations under sustain (L3 §3.6).
-- Export as a type-1 SMF: a conductor track (tempo map + time signature), then note tracks. Target: one MTrk per Surf track, with the channel taken from the track.
+- Export as a type-1 SMF: a conductor track (tempo map + time signature), then the notes, each on its track's MIDI channel (`Project::to_song`). Re-importing gives the same tracks back, one per channel.
 
 ### 2.3 `surf-audio` — engine, instruments, render
 
@@ -515,7 +500,7 @@ Each of these comes from a reproduced failure; details are in [troubleshooting.m
 | Phase | Scope | Main sections |
 |---|---|---|
 | 1 ✅ | Workspace split + platform layer; macOS builds and runs built-in synth + MIDI + playback; Windows behavior unchanged | §1.6, §1.7, §2.7 |
-| 2 | `surf-core` model + commands + new transport; Logic-style shell; Perform view in GPUI | §2.1, §2.6, §3.1 |
+| 2 ✅ | `surf-core` model + commands + undo; Logic-style shell; editing in Tracks and Piano Roll; Perform view in GPUI | §2.1, §2.6, §3.1 |
 | 3 | Piano Roll, Event List, Mixer with multi-track engine; sample-accurate plugin MIDI; async export | §2.3, §3.2, §3.8 |
 | 4 | `surf-visual` stage renderer, video export | §2.8 |
 | ongoing | VST3 editors on macOS/Linux, CLAP backend, settings persistence | §1.6, §2.4, §3.12 |

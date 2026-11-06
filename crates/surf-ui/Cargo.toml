@@ -23,3 +23,7 @@ windows = { workspace = true, features = ["Win32_Globalization"] }
 # than just the Command Line Tools. `font-kit` backs the macOS text system.
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui = { workspace = true, features = ["runtime_shaders", "font-kit"] }
+
+[dev-dependencies]
+# TestAppContext for headless tests of the editors' pointer handling.
+gpui = { workspace = true, features = ["test-support"] }
