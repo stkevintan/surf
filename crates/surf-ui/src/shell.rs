@@ -497,7 +497,11 @@ fn typing_note(key: &str, octave: i8) -> Option<u8> {
 
 impl Render for SurfApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        window.request_animation_frame();
+        // Pause the frame loop while a file picker is up; see `dialogs`.
+        // Closing the picker notifies, which restarts it.
+        if !crate::dialogs::is_open() {
+            window.request_animation_frame();
+        }
         self.session.tick();
         self.ui.edit.reconcile(&self.session.project);
         // Live input and the instrument commands follow the selected track.
