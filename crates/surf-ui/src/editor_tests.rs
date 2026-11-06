@@ -415,3 +415,64 @@ fn pasting_regions_keeps_their_track_layout(cx: &mut TestAppContext) {
     assert_eq!(copy_b.notes.len(), b.notes.len());
     assert_eq!(app.ui.edit.regions, [copy_a.id, copy_b.id].into());
 }
+
+/// A real window with the menu bindings, focused, with two tracks.
+fn window(cx: &mut TestAppContext) -> (gpui::Entity<SurfApp>, &mut gpui::VisualTestContext) {
+    cx.update(crate::menu::init);
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus = cx.focus_handle();
+        window.focus(&focus);
+        let mut song = Song::demo();
+        for n in song.notes.iter_mut().filter(|n| n.key < 55) {
+            n.channel = 1;
+        }
+        let mut session = Session::new();
+        session.set_project(Project::from_song(&song));
+        let mut app = SurfApp::with_session(session, focus);
+        app.ui.edit.reconcile(&app.session.project);
+        app
+    });
+    vcx.run_until_parked();
+    (view, vcx)
+}
+
+/// A shortcut runs its menu action once: ⌘N-style chords and bare letters
+/// alike go through the action, not also through the old key handler.
+#[gpui::test]
+fn shortcuts_run_their_menu_action_once(cx: &mut TestAppContext) {
+    let (view, vcx) = window(cx);
+    let tracks = |vcx: &mut gpui::VisualTestContext| {
+        view.read_with(vcx, |a, _| a.session.project.tracks.len())
+    };
+    let n = tracks(vcx);
+    vcx.simulate_keystrokes("secondary-alt-n");
+    assert_eq!(tracks(vcx), n + 1, "New Track once");
+    vcx.simulate_keystrokes("secondary-z");
+    assert_eq!(tracks(vcx), n, "one undo undoes it");
+    vcx.simulate_keystrokes("secondary-shift-z");
+    assert_eq!(tracks(vcx), n + 1);
+
+    let shown = view.read_with(vcx, |a, _| a.ui.show_inspector);
+    vcx.simulate_keystrokes("i");
+    assert_eq!(view.read_with(vcx, |a, _| a.ui.show_inspector), !shown);
+}
+
+/// With Musical Typing on, letters that are shortcuts play notes instead.
+#[gpui::test]
+fn musical_typing_letters_are_notes_not_shortcuts(cx: &mut TestAppContext) {
+    let (view, vcx) = window(cx);
+    vcx.simulate_keystrokes("secondary-k");
+    assert!(view.read_with(vcx, |a, _| a.ui.musical_typing));
+    let editor = view.read_with(vcx, |a, _| a.ui.show_editor);
+    // E is D#3 in Musical Typing, and Toggle Editor otherwise.
+    vcx.simulate_keystrokes("e");
+    view.read_with(vcx, |a, _| {
+        assert_eq!(a.ui.show_editor, editor, "E did not toggle the editor");
+        assert!(a.ui.typing_keys.contains_key("e"), "E is a held note");
+    });
+    // ⌘ chords still work while typing.
+    vcx.simulate_keystrokes("secondary-k");
+    assert!(!view.read_with(vcx, |a, _| a.ui.musical_typing));
+    vcx.simulate_keystrokes("e");
+    assert_eq!(view.read_with(vcx, |a, _| a.ui.show_editor), !editor);
+}

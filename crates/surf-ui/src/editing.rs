@@ -588,6 +588,20 @@ pub fn new_track(s: &mut Session, e: &mut Editing) {
     );
 }
 
+/// Delete the selected track (undoable). The selection moves to the track
+/// below, or the one above if it was the last.
+pub fn delete_track(s: &mut Session, e: &mut Editing) {
+    let Some(track) = e.track else { return };
+    let Some(i) = s.project.tracks.iter().position(|t| t.id == track) else {
+        return;
+    };
+    s.apply("Delete Track", Edit::RemoveTrack { track });
+    let p = &s.project;
+    e.track = p.tracks.get(i).or_else(|| p.tracks.last()).map(|t| t.id);
+    e.regions.clear();
+    e.reconcile(p);
+}
+
 pub fn set_track(s: &mut Session, track: Id, field: TrackField) {
     let label = match &field {
         TrackField::Name(_) => "Rename Track",

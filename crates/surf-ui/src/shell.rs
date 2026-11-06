@@ -31,6 +31,7 @@ use surf_core::project::Id;
 
 use crate::dialogs::Unsaved;
 use crate::editing::{self, Editing, Focus};
+use crate::menu;
 use crate::session::Session;
 use crate::theme::{color, font, size};
 use crate::views;
@@ -228,26 +229,64 @@ impl SurfApp {
 
     fn confirm_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let handle = window.window_handle();
+        self.leave(window, cx, move |app, cx| {
+            app.ui.closing = true;
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        });
+    }
+
+    /// File ▸ Close: through the same unsaved-changes check as the close
+    /// button.
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session.is_dirty() {
+            self.confirm_close(window, cx);
+        } else {
+            self.ui.closing = true;
+            window.remove_window();
+        }
+    }
+
+    fn quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session.is_dirty() {
+            self.leave(window, cx, |_, cx| cx.quit());
+        } else {
+            cx.quit();
+        }
+    }
+
+    /// Run `then` once unsaved changes are dealt with: right away if there
+    /// are none, else after Save / Don't Save (not after Cancel). An
+    /// untitled project opens a Save panel first; `then` waits for the next
+    /// try, so two panels never stack.
+    fn leave(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut SurfApp, &mut Context<SurfApp>) + 'static,
+    ) {
+        if !self.session.is_dirty() {
+            return then(self, cx);
+        }
         crate::dialogs::confirm_unsaved(window, cx, &self.project_title(), move |app, answer, cx| {
-            let close = match answer {
-                Unsaved::Cancel => false,
-                Unsaved::Discard => true,
+            match answer {
+                Unsaved::Cancel => {}
+                Unsaved::Discard => then(app, cx),
                 Unsaved::Save => {
-                    // An untitled project needs a Save panel first; close
-                    // after it, when the project is clean.
-                    if !app.session.save_project() {
-                        save_project(app, cx, true);
-                        false
+                    if app.session.save_project() {
+                        then(app, cx);
                     } else {
-                        !app.session.is_dirty()
+                        save_project(app, cx, true);
                     }
                 }
-            };
-            if close {
-                app.ui.closing = true;
-                let _ = handle.update(cx, |_, window, _| window.remove_window());
             }
         });
+    }
+
+    /// Reset the editors after the whole project was replaced.
+    pub fn after_project_replaced(&mut self) {
+        self.ui.edit = Editing::default();
+        self.ui.edit.reconcile(&self.session.project);
+        self.center_roll_on_song();
     }
 
     /// Build the app around a session, without touching a window. Used by
@@ -375,21 +414,8 @@ impl SurfApp {
         let alt = ks.modifiers.alt;
         let shift = ks.modifiers.shift;
         let tracks_focus = self.ui.edit.focus == Focus::Tracks;
+        // Everything else is a menu action; see `menu.rs` and `actions`.
         match (cmd, key.as_str()) {
-            (true, "z") if shift => self.session.redo(),
-            (true, "z") => self.session.undo(),
-            (true, "a") => editing::select_all(&self.session, &mut self.ui.edit),
-            (true, "c") => {
-                editing::copy(&mut self.session, &mut self.ui.edit);
-            }
-            (true, "x") => editing::cut(&mut self.session, &mut self.ui.edit),
-            (true, "v") => editing::paste(&mut self.session, &mut self.ui.edit),
-            (true, "t") => editing::split_at_playhead(&mut self.session, &mut self.ui.edit),
-            (true, "j") => editing::join(&mut self.session, &mut self.ui.edit),
-            (false, "backspace" | "delete") => {
-                editing::delete(&mut self.session, &mut self.ui.edit)
-            }
-            (false, "q") => editing::quantize(&mut self.session, &self.ui.edit),
             (false, "up") if alt => {
                 editing::transpose(&mut self.session, &self.ui.edit, if shift { 12 } else { 1 })
             }
@@ -407,23 +433,6 @@ impl SurfApp {
                 }
                 self.ui.marquee = None;
             }
-            (false, "m") => self.toggle_selected_track(true),
-            (false, "s") => self.toggle_selected_track(false),
-            (true, "k") => self.toggle_typing(),
-            // ⌘O and ⌘S are handled in render, which has the context a
-            // dialog needs.
-            (false, "space") => self.session.toggle_play(),
-            (false, "enter") => self.session.seek(0.0),
-            (false, ",") => self.seek_bars(-1.0),
-            (false, ".") => self.seek_bars(1.0),
-            (false, "r") => self.session.toggle_record(),
-            (false, "c") => self.session.toggle_loop(),
-            (false, "k") => self.toggle_metronome(),
-            (false, "i") => self.ui.show_inspector = !self.ui.show_inspector,
-            (false, "y") => self.ui.show_library = !self.ui.show_library,
-            (false, "e") => self.ui.show_editor = !self.ui.show_editor,
-            (false, "p") => self.open_tab(EditorTab::PianoRoll, true),
-            (false, "x") => self.open_tab(EditorTab::Mixer, true),
             // Shift doubles as a sustain pedal when no pedal is plugged in.
             (false, "shift") if !self.session.sustain => {
                 self.session
@@ -591,20 +600,15 @@ impl Render for SurfApp {
             .font_family(font::UI)
             .text_size(px(font::BODY))
             .track_focus(&self.focus)
+            .key_context("Surf")
+            .map(|d| actions(d, cx))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, window, _| window.focus(&this.focus)),
             )
-            .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
-                let ks = &e.keystroke;
-                let cmd = ks.modifiers.secondary() && !e.is_held;
-                if cmd && ks.key.eq_ignore_ascii_case("o") {
-                    open_file(this, window, cx);
-                } else if cmd && ks.key.eq_ignore_ascii_case("s") {
-                    save_project(this, cx, ks.modifiers.shift);
-                } else {
-                    this.key_down(e);
-                }
+            .when(self.ui.musical_typing, |d| d.key_context(menu::TYPING_CONTEXT))
+            .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
+                this.key_down(e);
                 cx.notify();
             }))
             .on_key_up(cx.listener(|this, e: &KeyUpEvent, _, cx| {
@@ -669,6 +673,95 @@ impl Render for SurfApp {
     }
 }
 
+/// The menu commands, handled on the window root. A shortcut and a menu
+/// click land here alike.
+fn actions(d: gpui::Stateful<gpui::Div>, cx: &mut Context<SurfApp>) -> gpui::Stateful<gpui::Div> {
+    use editing as ed;
+    /// An action that only needs the app.
+    fn on<A: gpui::Action>(
+        d: gpui::Stateful<gpui::Div>,
+        cx: &mut Context<SurfApp>,
+        f: impl Fn(&mut SurfApp) + 'static,
+    ) -> gpui::Stateful<gpui::Div> {
+        d.on_action(cx.listener(move |this, _: &A, _, cx| {
+            f(this);
+            cx.notify();
+        }))
+    }
+    /// An action that opens a dialog, so it needs the window.
+    fn on_w<A: gpui::Action>(
+        d: gpui::Stateful<gpui::Div>,
+        cx: &mut Context<SurfApp>,
+        f: impl Fn(&mut SurfApp, &mut Window, &mut Context<SurfApp>) + 'static,
+    ) -> gpui::Stateful<gpui::Div> {
+        d.on_action(cx.listener(move |this, _: &A, window, cx| {
+            f(this, window, cx);
+            cx.notify();
+        }))
+    }
+    let d = on_w::<menu::Quit>(d, cx, |a, w, cx| a.quit(w, cx));
+    let d = on::<menu::About>(d, cx, |a| {
+        a.session.status = format!(
+            "Surf {} · a desktop MIDI studio · github.com/stkevintan/surf",
+            env!("CARGO_PKG_VERSION")
+        )
+    });
+    let d = on_w::<menu::NewProject>(d, cx, new_project);
+    let d = on_w::<menu::OpenFile>(d, cx, open_file);
+    let d = on::<menu::LoadDemo>(d, cx, |a| {
+        a.session.load_demo();
+        a.after_project_replaced();
+    });
+    let d = on_w::<menu::CloseWindow>(d, cx, |a, w, cx| a.close(w, cx));
+    let d = on_w::<menu::SaveProject>(d, cx, |a, _, cx| save_project(a, cx, false));
+    let d = on_w::<menu::SaveProjectAs>(d, cx, |a, _, cx| save_project(a, cx, true));
+    let d = on_w::<menu::ExportWav>(d, cx, |a, _, cx| export_wav(a, cx));
+    let d = on_w::<menu::ExportMidi>(d, cx, |a, _, cx| export_midi(a, cx));
+    let d = on::<menu::Undo>(d, cx, |a| a.session.undo());
+    let d = on::<menu::Redo>(d, cx, |a| a.session.redo());
+    let d = on::<menu::Cut>(d, cx, |a| ed::cut(&mut a.session, &mut a.ui.edit));
+    let d = on::<menu::Copy>(d, cx, |a| {
+        ed::copy(&mut a.session, &mut a.ui.edit);
+    });
+    let d = on::<menu::Paste>(d, cx, |a| ed::paste(&mut a.session, &mut a.ui.edit));
+    let d = on::<menu::Delete>(d, cx, |a| ed::delete(&mut a.session, &mut a.ui.edit));
+    let d = on::<menu::SelectAll>(d, cx, |a| ed::select_all(&a.session, &mut a.ui.edit));
+    let d = on::<menu::Quantize>(d, cx, |a| ed::quantize(&mut a.session, &a.ui.edit));
+    let d = on::<menu::SplitAtPlayhead>(d, cx, |a| {
+        ed::split_at_playhead(&mut a.session, &mut a.ui.edit)
+    });
+    let d = on::<menu::JoinRegions>(d, cx, |a| ed::join(&mut a.session, &mut a.ui.edit));
+    let d = on::<menu::NewTrack>(d, cx, |a| ed::new_track(&mut a.session, &mut a.ui.edit));
+    let d = on::<menu::DeleteTrack>(d, cx, |a| ed::delete_track(&mut a.session, &mut a.ui.edit));
+    let d = on::<menu::ToggleMute>(d, cx, |a| a.toggle_selected_track(true));
+    let d = on::<menu::ToggleSolo>(d, cx, |a| a.toggle_selected_track(false));
+    let d = on::<menu::TogglePlay>(d, cx, |a| a.session.toggle_play());
+    // Logic: Stop while stopped returns to the start.
+    let d = on::<menu::Stop>(d, cx, |a| {
+        if !a.session.engine.playing {
+            a.session.seek(0.0);
+        }
+        a.session.stop_playback();
+    });
+    let d = on::<menu::RewindBar>(d, cx, |a| a.seek_bars(-1.0));
+    let d = on::<menu::ForwardBar>(d, cx, |a| a.seek_bars(1.0));
+    let d = on::<menu::ToggleRecord>(d, cx, |a| a.session.toggle_record());
+    let d = on::<menu::ToggleLoop>(d, cx, |a| a.session.toggle_loop());
+    let d = on::<menu::ToggleMetronome>(d, cx, |a| a.toggle_metronome());
+    let d = on::<menu::ToggleMusicalTyping>(d, cx, |a| a.toggle_typing());
+    let d = on::<menu::ToggleLibrary>(d, cx, |a| a.ui.show_library = !a.ui.show_library);
+    let d = on::<menu::ToggleInspector>(d, cx, |a| a.ui.show_inspector = !a.ui.show_inspector);
+    let d = on::<menu::ToggleToolbar>(d, cx, |a| a.ui.show_toolbar = !a.ui.show_toolbar);
+    let d = on::<menu::ToggleEditor>(d, cx, |a| a.ui.show_editor = !a.ui.show_editor);
+    let d = on::<menu::OpenPianoRoll>(d, cx, |a| a.open_tab(EditorTab::PianoRoll, true));
+    let d = on::<menu::OpenMixer>(d, cx, |a| a.open_tab(EditorTab::Mixer, true));
+    let d = on::<menu::OpenEventList>(d, cx, |a| a.open_tab(EditorTab::EventList, true));
+    let d = on::<menu::ViewTracks>(d, cx, |a| a.ui.main = MainView::Tracks);
+    let d = on::<menu::ViewPerform>(d, cx, |a| a.ui.main = MainView::Perform);
+    let d = on_w::<menu::Minimize>(d, cx, |_, w, _| w.minimize_window());
+    on_w::<menu::Zoom>(d, cx, |_, w, _| w.zoom_window())
+}
+
 fn splitter(cx: &mut Context<SurfApp>) -> impl IntoElement {
     div()
         .id("splitter")
@@ -711,35 +804,23 @@ pub fn pane_header() -> gpui::Div {
         .text_color(color::TEXT_SECONDARY)
 }
 
-/// Open a `.surf` project or a MIDI file through the platform picker,
-/// offering to save unsaved changes first.
-pub fn open_file(app: &SurfApp, window: &mut Window, cx: &mut Context<SurfApp>) {
-    if !app.session.is_dirty() {
-        return pick_and_open(cx);
-    }
-    crate::dialogs::confirm_unsaved(window, cx, &app.project_title(), |app, answer, cx| {
-        match answer {
-            Unsaved::Cancel => {}
-            Unsaved::Discard => pick_and_open(cx),
-            // Saving first; if it needs a Save dialog, open waits for the
-            // next ⌘O so two panels don't stack.
-            Unsaved::Save => {
-                if app.session.save_project() {
-                    pick_and_open(cx);
-                } else {
-                    save_project(app, cx, true);
-                }
-            }
-        }
+/// File ▸ New: an empty project with one track, after unsaved changes.
+pub fn new_project(app: &mut SurfApp, window: &mut Window, cx: &mut Context<SurfApp>) {
+    app.leave(window, cx, |app, _| {
+        app.session.set_project(surf_core::project::Project::empty());
+        app.after_project_replaced();
+        app.session.status = "New project".to_string();
     });
 }
 
-fn pick_and_open(cx: &mut Context<SurfApp>) {
-    crate::dialogs::open(cx, "Open", false, |app, path| {
-        app.session.open_path(&path);
-        app.ui.edit = crate::editing::Editing::default();
-        app.ui.edit.reconcile(&app.session.project);
-        app.center_roll_on_song();
+/// Open a `.surf` project or a MIDI file through the platform picker,
+/// after unsaved changes.
+pub fn open_file(app: &mut SurfApp, window: &mut Window, cx: &mut Context<SurfApp>) {
+    app.leave(window, cx, |_, cx| {
+        crate::dialogs::open(cx, "Open", false, |app, path| {
+            app.session.open_path(&path);
+            app.after_project_replaced();
+        });
     });
 }
 
@@ -791,18 +872,6 @@ pub fn on_click_cx<E: InteractiveElement + StatefulInteractiveElement>(
 ) -> E {
     el.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
         f(this, cx);
-        cx.notify();
-    }))
-}
-
-/// Like [`on_click_cx`], for actions that also need the window (prompts).
-pub fn on_click_window<E: InteractiveElement + StatefulInteractiveElement>(
-    el: E,
-    cx: &mut Context<SurfApp>,
-    f: impl Fn(&mut SurfApp, &mut Window, &mut Context<SurfApp>) + 'static,
-) -> E {
-    el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-        f(this, window, cx);
         cx.notify();
     }))
 }

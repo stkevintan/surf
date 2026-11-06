@@ -118,6 +118,24 @@ impl Project {
         }
     }
 
+    /// A fresh project with one empty track on MIDI channel 1.
+    pub fn empty() -> Self {
+        let mut p = Self::new("Untitled");
+        let id = p.alloc();
+        p.tracks.push(Track {
+            id,
+            name: "Inst 1".into(),
+            color: 0,
+            channel: 0,
+            mute: false,
+            solo: false,
+            volume: 1.0,
+            instrument: None,
+            regions: Vec::new(),
+        });
+        p
+    }
+
     /// Make a project read from a file safe to edit: ids allocate past
     /// every id in use, fields are in range, notes and regions are sorted.
     pub fn repair(&mut self) {
