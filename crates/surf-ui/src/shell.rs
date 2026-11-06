@@ -223,10 +223,7 @@ impl SurfApp {
         match (cmd, key.as_str()) {
             (true, "k") => self.toggle_typing(),
             (true, "s") => self.session.save_vst_state(),
-            (true, "o") => {
-                self.session.load_midi_dialog();
-                self.center_roll_on_song();
-            }
+            // ⌘O is handled in render, which has the context a dialog needs.
             (false, "space") => self.session.toggle_play(),
             (false, "enter") => self.session.seek(0.0),
             (false, ",") => self.seek_bars(-1.0),
@@ -364,7 +361,12 @@ impl Render for SurfApp {
                 cx.listener(|this, _: &MouseDownEvent, window, _| window.focus(&this.focus)),
             )
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
-                this.key_down(e);
+                let ks = &e.keystroke;
+                if ks.modifiers.secondary() && ks.key.eq_ignore_ascii_case("o") && !e.is_held {
+                    open_midi(cx);
+                } else {
+                    this.key_down(e);
+                }
                 cx.notify();
             }))
             .on_key_up(cx.listener(|this, e: &KeyUpEvent, _, cx| {
@@ -466,6 +468,46 @@ pub fn pane_header() -> gpui::Div {
         .border_b_1()
         .border_color(color::LINE)
         .text_color(color::TEXT_SECONDARY)
+}
+
+/// Open a MIDI file through the platform picker.
+pub fn open_midi(cx: &mut Context<SurfApp>) {
+    crate::dialogs::open(cx, "Open", false, |app, path| {
+        app.session.load_midi_path(&path);
+        app.center_roll_on_song();
+    });
+}
+
+pub fn export_midi(app: &mut SurfApp, cx: &mut Context<SurfApp>) {
+    if app.session.can_export_midi() {
+        crate::dialogs::save(cx, app.session.export_stem(), "mid", |app, path| {
+            app.session.export_midi_to(&path)
+        });
+    }
+}
+
+pub fn export_wav(app: &mut SurfApp, cx: &mut Context<SurfApp>) {
+    if app.session.can_export_wav() {
+        crate::dialogs::save(cx, app.session.export_stem(), "wav", |app, path| {
+            app.session.export_wav_to(path)
+        });
+    }
+}
+
+pub fn pick_plugin_folder(cx: &mut Context<SurfApp>) {
+    crate::dialogs::open(cx, "Choose", true, |app, path| app.session.load_vst_folder(&path));
+}
+
+/// Like [`on_click`], for actions that also need the context (dialogs).
+pub fn on_click_cx<E: InteractiveElement + StatefulInteractiveElement>(
+    el: E,
+    cx: &mut Context<SurfApp>,
+    f: impl Fn(&mut SurfApp, &mut Context<SurfApp>) + 'static,
+) -> E {
+    el.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+        f(this, cx);
+        cx.notify();
+    }))
 }
 
 /// Wire a click on `el` to a closure on the app, then repaint.

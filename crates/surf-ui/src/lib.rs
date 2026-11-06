@@ -4,6 +4,7 @@
 //! - [`shell`] is the window and its UI state; [`views`] draws each area.
 //! - [`theme`] holds the design tokens; [`widgets`] the shared controls.
 
+pub mod dialogs;
 pub mod fonts;
 pub mod icons;
 pub mod session;

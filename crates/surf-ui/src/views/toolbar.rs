@@ -2,7 +2,7 @@
 
 use gpui::{Context, IntoElement, ParentElement, Styled, div, prelude::*, px};
 
-use crate::shell::{SurfApp, on_click};
+use crate::shell::{self, SurfApp, on_click, on_click_cx};
 use crate::theme::{color, size};
 use crate::widgets::{label, separator, text_button};
 
@@ -21,13 +21,10 @@ pub fn render(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
         .border_color(color::LINE)
         .child(
             row()
-                .child(on_click(
+                .child(on_click_cx(
                     text_button("Open MIDI…", false).id("tb-open"),
                     cx,
-                    |a| {
-                        a.session.load_midi_dialog();
-                        a.center_roll_on_song();
-                    },
+                    |_, cx| shell::open_midi(cx),
                 ))
                 .child(on_click(
                     text_button("Demo", false).id("tb-demo"),
@@ -60,12 +57,12 @@ pub fn render(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
         .child(
             row()
                 .child(label("Export").mr(px(6.0)))
-                .child(on_click(
+                .child(on_click_cx(
                     text_button("MIDI", false).id("tb-export-midi"),
                     cx,
-                    |a| a.session.export_midi_dialog(),
+                    shell::export_midi,
                 ))
-                .child(on_click(
+                .child(on_click_cx(
                     text_button(
                         if rendering {
                             "Bouncing…"
@@ -76,7 +73,7 @@ pub fn render(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
                     )
                     .id("tb-export-wav"),
                     cx,
-                    |a| a.session.export_wav_dialog(),
+                    shell::export_wav,
                 ))
                 .child(planned("tb-video", "Video", cx)),
         )

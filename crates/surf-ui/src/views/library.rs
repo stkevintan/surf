@@ -3,7 +3,7 @@
 use gpui::{Context, FontWeight, IntoElement, ParentElement, Styled, div, prelude::*, px, svg};
 
 use crate::icons;
-use crate::shell::{SurfApp, on_click, pane_header};
+use crate::shell::{self, SurfApp, on_click, on_click_cx, pane_header};
 use crate::theme::{color, font, radius, size};
 use crate::widgets::button;
 
@@ -97,10 +97,10 @@ pub fn render(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
                     cx,
                     |a| a.session.scan_plugins(),
                 ))
-                .child(on_click(
+                .child(on_click_cx(
                     button("Folder…").id("lib-folder").flex_1(),
                     cx,
-                    |a| a.session.load_vst_dialog(),
+                    |_, cx| shell::pick_plugin_folder(cx),
                 )),
         )
 }

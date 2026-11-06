@@ -13,7 +13,6 @@ surf-platform.workspace = true
 surf-plugin.workspace = true
 anyhow.workspace = true
 gpui = { workspace = true, features = ["windows-manifest"] }
-rfd.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # MultiByteToWideChar, to decode the helper log's ANSI/GBK plugin output.

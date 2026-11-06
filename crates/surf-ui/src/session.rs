@@ -10,8 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Instant;
 
-use rfd::FileDialog;
-
 use surf_audio::render::{RenderOptions, render_timeline_to_wav};
 use surf_audio::{AudioEngine, Command, EngineStatus, OutputEvent, Synth};
 use surf_core::recorder::Recorder;
@@ -187,15 +185,21 @@ impl Session {
         self.status = "Demo loaded — 4 bars of Am–F–C–G".to_string();
     }
 
-    pub fn load_midi_dialog(&mut self) {
-        let Some(path) = FileDialog::new()
-            .add_filter("MIDI", &["mid", "midi"])
-            .set_title("Open a MIDI file")
-            .pick_file()
-        else {
+    /// Open a MIDI file and start playing it.
+    ///
+    /// File pickers live in the shell: GPUI's prompts are asynchronous, and a
+    /// blocking native dialog run from an event handler re-enters GPUI and
+    /// panics ("RefCell already borrowed").
+    pub fn load_midi_path(&mut self, path: &Path) {
+        let is_midi = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("mid") || e.eq_ignore_ascii_case("midi"));
+        if !is_midi {
+            self.status = format!("{} is not a .mid or .midi file", path.display());
             return;
-        };
-        match surf_midi::smf::load(&path) {
+        }
+        match surf_midi::smf::load(path) {
             Ok(song) => {
                 self.timeline = song.timeline();
                 self.song_name = song.name.clone();
@@ -213,38 +217,46 @@ impl Session {
         }
     }
 
-    pub fn export_midi_dialog(&mut self) {
+    /// Suggested file name for an export, without extension.
+    pub fn export_stem(&self) -> String {
+        let name = self.song.as_ref().map(|s| s.name.as_str()).unwrap_or("surf-export");
+        let clean: String = name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || " -_".contains(c) { c } else { '_' })
+            .collect();
+        if clean.trim().is_empty() { "surf-export".to_string() } else { clean }
+    }
+
+    pub fn can_export_midi(&mut self) -> bool {
+        if self.song.is_none() {
+            self.status = "Nothing to export yet".to_string();
+        }
+        self.song.is_some()
+    }
+
+    pub fn export_midi_to(&mut self, path: &Path) {
         let Some(song) = &self.song else {
             self.status = "Nothing to export yet".to_string();
             return;
         };
-        let Some(path) = FileDialog::new()
-            .add_filter("MIDI", &["mid"])
-            .set_file_name(&format!("{}.mid", song.name))
-            .set_title("Export MIDI")
-            .save_file()
-        else {
-            return;
-        };
-        match surf_midi::smf::save(song, &path) {
+        match surf_midi::smf::save(song, path) {
             Ok(()) => self.status = format!("MIDI exported to {}", path.display()),
             Err(err) => self.status = format!("MIDI export failed: {err:#}"),
         }
     }
 
-    pub fn export_wav_dialog(&mut self) {
+    pub fn can_export_wav(&mut self) -> bool {
         if self.timeline.notes.is_empty() {
             self.status = "Nothing to render yet".to_string();
+            return false;
+        }
+        true
+    }
+
+    pub fn export_wav_to(&mut self, path: PathBuf) {
+        if !self.can_export_wav() {
             return;
         }
-        let Some(path) = FileDialog::new()
-            .add_filter("WAV", &["wav"])
-            .set_file_name("surf-export.wav")
-            .set_title("Render audio to WAV")
-            .save_file()
-        else {
-            return;
-        };
         let timeline = self.timeline.clone();
         let sample_rate = self.audio.sample_rate();
         let options = RenderOptions {
@@ -325,15 +337,10 @@ impl Session {
         }
     }
 
-    pub fn load_vst_dialog(&mut self) {
+    /// Load the plugin in `folder`, or list its plugins if there are several.
+    pub fn load_vst_folder(&mut self, folder: &Path) {
         let vst2 = surf_plugin::format::VST2_EXTENSION;
-        let Some(folder) = FileDialog::new()
-            .set_title(format!("Pick a folder containing a .vst3 or .{vst2} plugin"))
-            .pick_folder()
-        else {
-            return;
-        };
-        let mut found = vst_scan::scan_folder(&folder);
+        let mut found = vst_scan::scan_folder(folder);
         match found.len() {
             0 => {
                 self.status = format!(
@@ -798,3 +805,36 @@ fn vst_state_path_for(plugin_path: &Path) -> PathBuf {
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The path the file picker hands back is loaded, played and named.
+    #[test]
+    fn loading_a_midi_path_replaces_the_song() {
+        let dir = std::env::temp_dir().join(format!("surf-session-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Two Notes.mid");
+        let mut song = Song::empty();
+        song.name = "Two Notes".into();
+        song.notes = vec![
+            surf_core::song::Note { key: 60, velocity: 100, channel: 0, start_tick: 0, duration_ticks: 480 },
+            surf_core::song::Note { key: 67, velocity: 90, channel: 0, start_tick: 480, duration_ticks: 480 },
+        ];
+        surf_midi::smf::save(&song, &path).unwrap();
+
+        let mut session = Session::new();
+        session.load_midi_path(&path);
+        assert_eq!(session.song_name, "Two Notes", "status: {}", session.status);
+        assert_eq!(session.timeline.notes.len(), 2);
+
+        // A file that is not MIDI is refused with a message, not loaded.
+        let txt = dir.join("notes.txt");
+        std::fs::write(&txt, b"hi").unwrap();
+        session.load_midi_path(&txt);
+        assert_eq!(session.timeline.notes.len(), 2);
+        assert!(session.status.contains("not a .mid"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
