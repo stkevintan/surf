@@ -29,6 +29,7 @@ use surf_midi::LiveEvent;
 
 use surf_core::project::Id;
 
+use crate::dialogs::Unsaved;
 use crate::editing::{self, Editing, Focus};
 use crate::session::Session;
 use crate::theme::{color, font, size};
@@ -51,6 +52,11 @@ pub enum EditorTab {
 
 /// UI-only state: what is shown and how. Not part of the project file.
 pub struct Ui {
+    /// The close was confirmed; let the window go.
+    pub closing: bool,
+    /// What was last sent to the window, so it is only set on change.
+    pub window_title: String,
+    pub window_edited: bool,
     pub show_library: bool,
     pub show_inspector: bool,
     pub show_toolbar: bool,
@@ -169,6 +175,9 @@ impl Default for Ui {
             perform_bounds: Rc::default(),
             mouse_key: None,
             edit: Editing::default(),
+            closing: false,
+            window_title: String::new(),
+            window_edited: false,
             drag: None,
             marquee: None,
             pencil_hover: None,
@@ -189,7 +198,56 @@ impl SurfApp {
         if std::env::var_os("SURF_UI").is_none() {
             window.focus(&focus);
         }
+        // Closing with unsaved changes asks first. The close is refused and
+        // redone once the user has answered.
+        let entity = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            let Some(entity) = entity.upgrade() else {
+                return true;
+            };
+            let (dirty, closing) = entity.read_with(cx, |app, _| (app.session.is_dirty(), app.ui.closing));
+            if !dirty || closing {
+                return true;
+            }
+            entity.update(cx, |app, cx| app.confirm_close(window, cx));
+            false
+        });
         Self::with_session(Session::new(), focus)
+    }
+
+    /// The project's name for titles and prompts.
+    pub fn project_title(&self) -> String {
+        if self.session.project_path.is_none() && self.session.project.name.is_empty() {
+            "Untitled".to_string()
+        } else if let Some(stem) = self.session.project_path.as_ref().and_then(|p| p.file_stem()) {
+            stem.to_string_lossy().into_owned()
+        } else {
+            self.session.project.name.clone()
+        }
+    }
+
+    fn confirm_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = window.window_handle();
+        crate::dialogs::confirm_unsaved(window, cx, &self.project_title(), move |app, answer, cx| {
+            let close = match answer {
+                Unsaved::Cancel => false,
+                Unsaved::Discard => true,
+                Unsaved::Save => {
+                    // An untitled project needs a Save panel first; close
+                    // after it, when the project is clean.
+                    if !app.session.save_project() {
+                        save_project(app, cx, true);
+                        false
+                    } else {
+                        !app.session.is_dirty()
+                    }
+                }
+            };
+            if close {
+                app.ui.closing = true;
+                let _ = handle.update(cx, |_, window, _| window.remove_window());
+            }
+        });
     }
 
     /// Build the app around a session, without touching a window. Used by
@@ -352,8 +410,8 @@ impl SurfApp {
             (false, "m") => self.toggle_selected_track(true),
             (false, "s") => self.toggle_selected_track(false),
             (true, "k") => self.toggle_typing(),
-            (true, "s") => self.session.save_vst_state(),
-            // ⌘O is handled in render, which has the context a dialog needs.
+            // ⌘O and ⌘S are handled in render, which has the context a
+            // dialog needs.
             (false, "space") => self.session.toggle_play(),
             (false, "enter") => self.session.seek(0.0),
             (false, ",") => self.seek_bars(-1.0),
@@ -498,6 +556,16 @@ fn typing_note(key: &str, octave: i8) -> Option<u8> {
 impl Render for SurfApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.request_animation_frame();
+        let title = format!("{} — Surf", self.project_title());
+        if self.ui.window_title != title {
+            window.set_window_title(&title);
+            self.ui.window_title = title;
+        }
+        let dirty = self.session.is_dirty();
+        if self.ui.window_edited != dirty {
+            window.set_window_edited(dirty);
+            self.ui.window_edited = dirty;
+        }
         self.session.tick();
         self.ui.edit.reconcile(&self.session.project);
         // Live input and the instrument commands follow the selected track.
@@ -527,10 +595,13 @@ impl Render for SurfApp {
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, window, _| window.focus(&this.focus)),
             )
-            .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
                 let ks = &e.keystroke;
-                if ks.modifiers.secondary() && ks.key.eq_ignore_ascii_case("o") && !e.is_held {
-                    open_midi(cx);
+                let cmd = ks.modifiers.secondary() && !e.is_held;
+                if cmd && ks.key.eq_ignore_ascii_case("o") {
+                    open_file(this, window, cx);
+                } else if cmd && ks.key.eq_ignore_ascii_case("s") {
+                    save_project(this, cx, ks.modifiers.shift);
                 } else {
                     this.key_down(e);
                 }
@@ -640,11 +711,53 @@ pub fn pane_header() -> gpui::Div {
         .text_color(color::TEXT_SECONDARY)
 }
 
-/// Open a MIDI file through the platform picker.
-pub fn open_midi(cx: &mut Context<SurfApp>) {
+/// Open a `.surf` project or a MIDI file through the platform picker,
+/// offering to save unsaved changes first.
+pub fn open_file(app: &SurfApp, window: &mut Window, cx: &mut Context<SurfApp>) {
+    if !app.session.is_dirty() {
+        return pick_and_open(cx);
+    }
+    crate::dialogs::confirm_unsaved(window, cx, &app.project_title(), |app, answer, cx| {
+        match answer {
+            Unsaved::Cancel => {}
+            Unsaved::Discard => pick_and_open(cx),
+            // Saving first; if it needs a Save dialog, open waits for the
+            // next ⌘O so two panels don't stack.
+            Unsaved::Save => {
+                if app.session.save_project() {
+                    pick_and_open(cx);
+                } else {
+                    save_project(app, cx, true);
+                }
+            }
+        }
+    });
+}
+
+fn pick_and_open(cx: &mut Context<SurfApp>) {
     crate::dialogs::open(cx, "Open", false, |app, path| {
-        app.session.load_midi_path(&path);
+        app.session.open_path(&path);
+        app.ui.edit = crate::editing::Editing::default();
+        app.ui.edit.reconcile(&app.session.project);
         app.center_roll_on_song();
+    });
+}
+
+/// ⌘S: save to the project's file, or ask where the first time.
+/// ⇧⌘S (`save_as`) always asks.
+pub fn save_project(app: &mut SurfApp, cx: &mut Context<SurfApp>, save_as: bool) {
+    if !save_as && app.session.save_project() {
+        return;
+    }
+    let stem = app
+        .session
+        .project_path
+        .as_ref()
+        .and_then(|p| p.file_stem())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| app.session.export_stem());
+    crate::dialogs::save(cx, stem, surf_core::document::EXTENSION, |app, path| {
+        app.session.save_project_to(path)
     });
 }
 
@@ -678,6 +791,18 @@ pub fn on_click_cx<E: InteractiveElement + StatefulInteractiveElement>(
 ) -> E {
     el.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
         f(this, cx);
+        cx.notify();
+    }))
+}
+
+/// Like [`on_click_cx`], for actions that also need the window (prompts).
+pub fn on_click_window<E: InteractiveElement + StatefulInteractiveElement>(
+    el: E,
+    cx: &mut Context<SurfApp>,
+    f: impl Fn(&mut SurfApp, &mut Window, &mut Context<SurfApp>) + 'static,
+) -> E {
+    el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+        f(this, window, cx);
         cx.notify();
     }))
 }

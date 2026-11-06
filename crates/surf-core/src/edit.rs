@@ -459,6 +459,7 @@ struct Step {
     label: String,
     undo: Edit,
     redo: Edit,
+    serial: u64,
 }
 
 /// Undo / redo stacks of labelled steps.
@@ -469,6 +470,11 @@ pub struct History {
     /// The step currently being previewed by a drag, if any.
     open: bool,
     limit: usize,
+    /// Serial of the next step pushed. Steps keep theirs through undo and
+    /// redo, so the top of `past` says which state the project is in.
+    next_serial: u64,
+    /// The top step when the project was last saved (None: saved empty).
+    saved: Option<u64>,
 }
 
 impl History {
@@ -477,6 +483,18 @@ impl History {
             limit: 500,
             ..Default::default()
         }
+    }
+
+    /// Changes since the last [`mark_saved`](Self::mark_saved): false right
+    /// after a save, true after any edit, and false again if undo walks back
+    /// to the saved step.
+    pub fn is_dirty(&self) -> bool {
+        self.past.last().map(|s| s.serial) != self.saved
+    }
+
+    pub fn mark_saved(&mut self) {
+        self.commit();
+        self.saved = self.past.last().map(|s| s.serial);
     }
 
     /// Apply an edit as one undo step.
@@ -524,6 +542,7 @@ impl History {
             label: step.label,
             undo: step.redo,
             redo,
+            serial: step.serial,
         });
         Some(label)
     }
@@ -537,6 +556,7 @@ impl History {
             label: step.label,
             undo,
             redo: step.undo,
+            serial: step.serial,
         });
         Some(label)
     }
@@ -550,14 +570,23 @@ impl History {
         self.future.last().map(|s| s.label.as_str())
     }
 
+    /// Forget every step. The current state counts as saved, as when a
+    /// file has just been opened.
     pub fn clear(&mut self) {
         self.past.clear();
         self.future.clear();
         self.open = false;
+        self.saved = None;
     }
 
     fn push(&mut self, label: String, undo: Edit, redo: Edit) {
-        self.past.push(Step { label, undo, redo });
+        self.next_serial += 1;
+        self.past.push(Step {
+            label,
+            undo,
+            redo,
+            serial: self.next_serial,
+        });
         if self.past.len() > self.limit.max(1) {
             self.past.remove(0);
         }
@@ -861,5 +890,30 @@ mod tests {
         h.cancel(&mut p);
         assert_eq!(p, original);
         assert!(h.undo_label().is_none());
+    }
+
+    #[test]
+    fn dirty_follows_the_saved_step_through_undo_and_redo() {
+        let mut p = Project::from_song(&crate::song::Song::demo());
+        let t = p.tracks[0].id;
+        let mute = |on| Edit::SetTrack {
+            track: t,
+            field: TrackField::Mute(on),
+        };
+        let mut h = History::new();
+        assert!(!h.is_dirty());
+        h.apply(&mut p, "Mute", mute(true));
+        assert!(h.is_dirty());
+        h.mark_saved();
+        assert!(!h.is_dirty());
+        h.undo(&mut p);
+        assert!(h.is_dirty(), "undo past the save");
+        h.redo(&mut p);
+        assert!(!h.is_dirty(), "redo back to it");
+        h.undo(&mut p);
+        h.apply(&mut p, "Mute", mute(false));
+        assert!(h.is_dirty(), "a different branch");
+        h.clear();
+        assert!(!h.is_dirty());
     }
 }

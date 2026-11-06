@@ -8,6 +8,7 @@
 //! - [`song`]: the flat MIDI-file form, for import, export and playback.
 //! - [`recorder`]: turns live MIDI into notes.
 
+pub mod document;
 pub mod edit;
 pub mod project;
 pub mod recorder;

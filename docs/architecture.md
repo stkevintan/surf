@@ -450,7 +450,9 @@ The computer keyboard (`A W S E D F T G Y H U J K O L P ;` → C4–E5 today, C3
 - On load, the state is applied if the file exists and `SURF_NO_STATE` is not set.
 - When the last track lets a plugin go, Surf parks its state in a temp file and stops the host. Undo starts it again from that state, so undoing a change of instrument brings Kontakt back as it was.
 - Kontakt has no "load NKI" API. The supported workflow is: load the instrument in Kontakt's own editor, save state from Surf, and restore it on the next load or render.
-- *Target:* state blobs live inside the project file, per track. The hash-named files become a cache for "last used state".
+- **Project file.** `surf-core::document` saves a `.surf` file: JSON with `format`, `version`, the `Project`, and one base64 state blob per plugin path. Tracks that share a plugin share its blob. Saving asks each running host for its state. Plugins that aren't running (offline, or failed to load) keep the blob they were opened with. Opening restarts every host from the file's blobs (through the parked-state path), then `Project::repair` moves the id counter past every id in use. Writes go to a temp file and are renamed into place. A newer `version` is refused.
+- The hash-named files are the "default sound" for a plugin in a new project.
+- `History` tracks the saved point by step serial, so undoing back to it makes the project clean again. The window title and the macOS edited dot follow `is_dirty()`, and Open and window close ask Save / Don't Save / Cancel.
 
 ### 3.10 Plugin compatibility and safety measures
 
