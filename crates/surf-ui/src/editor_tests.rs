@@ -13,7 +13,7 @@ use gpui::{
 use surf_core::project::Project;
 use surf_core::song::Song;
 
-use crate::editing::{Focus, Tool};
+use crate::editing::{self, Focus, Tool};
 use crate::session::Session;
 use crate::shell::SurfApp;
 use crate::theme::size as sz;
@@ -54,6 +54,12 @@ fn roll_pos(app: &SurfApp, tick: u64, key: u8, dx: f32) -> Point<Pixels> {
         + (app.ui.roll_top_key as f32 - key as f32) * sz::ROLL_ROW_H
         + sz::ROLL_ROW_H / 2.0;
     point(px(ROLL_ORIGIN.0 + x), px(ROLL_ORIGIN.1 + y))
+}
+
+/// Put the playhead at `secs` without a running engine.
+fn set_playhead(app: &mut SurfApp, secs: f64) {
+    app.session.engine.position = secs;
+    app.session.engine.duration = app.session.engine.duration.max(secs + 1.0);
 }
 
 fn down(at: Point<Pixels>, modifiers: Modifiers, clicks: usize) -> MouseDownEvent {
@@ -301,4 +307,107 @@ fn scissors_split_and_join_put_it_back(cx: &mut TestAppContext) {
         r.notes.iter().map(|n| (n.start, n.key)).collect::<Vec<_>>()
     };
     assert_eq!(keys(&joined[0]), keys(&r));
+}
+
+#[gpui::test]
+fn copy_and_paste_notes_at_the_playhead(cx: &mut TestAppContext) {
+    let mut app = app(cx);
+    let region = &app.session.project.tracks[0].regions[0];
+    let picked: Vec<_> = region.notes.iter().take(3).cloned().collect();
+    let count = region.notes.len();
+    let first = picked.iter().map(|n| n.start).min().unwrap();
+    app.ui.edit.focus = Focus::Roll;
+    app.ui.edit.notes = picked.iter().map(|n| n.id).collect();
+    editing::copy(&mut app.session, &mut app.ui.edit);
+
+    let bar = app.session.project.ticks_per_bar();
+    let at = app.session.project.tick_to_sec(2 * bar + 7);
+    set_playhead(&mut app, at);
+    editing::paste(&mut app.session, &mut app.ui.edit);
+
+    let notes = &app.session.project.tracks[0].regions[0].notes;
+    assert_eq!(notes.len(), count + 3);
+    assert_eq!(app.ui.edit.notes.len(), 3, "the pasted notes are selected");
+    for n in &picked {
+        let pasted = notes
+            .iter()
+            .find(|m| {
+                app.ui.edit.notes.contains(&m.id)
+                    && m.key == n.key
+                    && m.start == 2 * bar + n.start - first
+            })
+            .expect("a copy on the snapped playhead");
+        assert_ne!(pasted.id, n.id, "copies get fresh ids");
+    }
+    assert_eq!(app.session.history.undo_label(), Some("Paste"));
+    app.session.undo();
+    assert_eq!(app.session.project.tracks[0].regions[0].notes.len(), count);
+}
+
+#[gpui::test]
+fn cut_removes_notes_in_one_step_and_paste_brings_them_back(cx: &mut TestAppContext) {
+    let mut app = app(cx);
+    let before = app.session.project.clone();
+    let n = first_note(&app);
+    app.ui.edit.focus = Focus::Roll;
+    app.ui.edit.notes = [n.id].into();
+    editing::cut(&mut app.session, &mut app.ui.edit);
+    let region = &app.session.project.tracks[0].regions[0];
+    assert!(region.note(n.id).is_none());
+    assert_eq!(app.session.history.undo_label(), Some("Cut"));
+
+    let at = app.session.project.tick_to_sec(n.start);
+    set_playhead(&mut app, at);
+    editing::paste(&mut app.session, &mut app.ui.edit);
+    let region = &app.session.project.tracks[0].regions[0];
+    let grid = app.ui.edit.roll_snap.ticks(&app.session.project);
+    assert!(
+        region
+            .notes
+            .iter()
+            .any(|m| m.key == n.key && m.start == n.start / grid * grid && m.len == n.len)
+    );
+    app.session.undo();
+    app.session.undo();
+    assert_eq!(app.session.project.tracks, before.tracks);
+}
+
+#[gpui::test]
+fn pasting_regions_keeps_their_track_layout(cx: &mut TestAppContext) {
+    let mut app = app(cx);
+    let p = &app.session.project;
+    let (a, b) = (
+        p.tracks[0].regions[0].clone(),
+        p.tracks[1].regions[0].clone(),
+    );
+    app.ui.edit.focus = Focus::Tracks;
+    app.ui.edit.regions = [a.id, b.id].into();
+    editing::copy(&mut app.session, &mut app.ui.edit);
+
+    let end = app.session.project.end();
+    app.ui.edit.track = Some(app.session.project.tracks[0].id);
+    let at = app.session.project.tick_to_sec(end);
+    set_playhead(&mut app, at);
+    editing::paste(&mut app.session, &mut app.ui.edit);
+
+    let p = &app.session.project;
+    let bar = p.ticks_per_bar();
+    let at = end / bar * bar;
+    let first = a.start.min(b.start);
+    let copy_a = p.tracks[0]
+        .regions
+        .iter()
+        .find(|r| r.start == at + a.start - first);
+    let copy_b = p.tracks[1]
+        .regions
+        .iter()
+        .find(|r| r.start == at + b.start - first);
+    let (copy_a, copy_b) = (
+        copy_a.expect("copy on track 1"),
+        copy_b.expect("copy on track 2"),
+    );
+    assert_ne!(copy_a.id, a.id);
+    assert_eq!(copy_a.notes.len(), a.notes.len());
+    assert_eq!(copy_b.notes.len(), b.notes.len());
+    assert_eq!(app.ui.edit.regions, [copy_a.id, copy_b.id].into());
 }

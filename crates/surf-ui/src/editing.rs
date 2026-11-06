@@ -1,7 +1,7 @@
 //! Editing state and commands shared by the Tracks area and the Piano Roll.
 //!
 //! Two selections, as in Logic: regions in the Tracks area, notes in the
-//! editor. Keyboard commands (Delete, ⌘A, Q, ⌥↑/↓, ⌘T, ⌘J) act on the area
+//! editor. Keyboard commands (Delete, ⌘A, ⌘C/⌘X/⌘V, Q, ⌥↑/↓, ⌘T, ⌘J) act on the area
 //! that was clicked last ([`Focus`]). Every change goes through
 //! [`Session::apply`] or a drag's [`Session::preview`], so it can be undone.
 
@@ -91,6 +91,16 @@ pub struct Editing {
     pub quantize_strength: u8,
     /// Velocity for new notes; follows the last note touched.
     pub new_velocity: u8,
+    pub clipboard: Option<Clipboard>,
+}
+
+/// What ⌘C / ⌘X copied. Starts are relative to the earliest item, so a
+/// paste lands at the playhead.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Clipboard {
+    Notes(Vec<Note>),
+    /// Each region with its track offset from the topmost copied track.
+    Regions(Vec<(usize, Region)>),
 }
 
 impl Default for Editing {
@@ -108,6 +118,7 @@ impl Default for Editing {
             quantize: Snap::Sixteenth,
             quantize_strength: 100,
             new_velocity: 90,
+            clipboard: None,
         }
     }
 }
@@ -184,33 +195,43 @@ impl Editing {
 // ---- commands -------------------------------------------------------------
 
 pub fn delete(s: &mut Session, e: &mut Editing) {
+    if let Some((label, edit)) = removal(e) {
+        s.apply(&label, edit);
+        clear_selection(s, e);
+    }
+}
+
+/// The edit that removes the selection of the focused area, with its label.
+fn removal(e: &Editing) -> Option<(String, Edit)> {
     match e.focus {
         Focus::Roll => {
-            let Some(region) = e.edit_region else { return };
+            let region = e.edit_region?;
             if e.notes.is_empty() {
-                return;
+                return None;
             }
             let notes: Vec<Id> = e.notes.iter().copied().collect();
-            let n = notes.len();
-            s.apply(
-                &plural("Delete Note", n),
-                Edit::DeleteNotes { region, notes },
-            );
-            e.notes.clear();
+            let label = plural("Delete Note", notes.len());
+            Some((label, Edit::DeleteNotes { region, notes }))
         }
         Focus::Tracks => {
             if e.regions.is_empty() {
-                return;
+                return None;
             }
             let edits = e
                 .regions
                 .iter()
                 .map(|r| Edit::RemoveRegion { region: *r })
                 .collect();
-            let n = e.regions.len();
-            s.apply(&plural("Delete Region", n), Edit::Batch(edits));
-            e.regions.clear();
+            let label = plural("Delete Region", e.regions.len());
+            Some((label, Edit::Batch(edits)))
         }
+    }
+}
+
+fn clear_selection(s: &Session, e: &mut Editing) {
+    match e.focus {
+        Focus::Roll => e.notes.clear(),
+        Focus::Tracks => e.regions.clear(),
     }
     e.reconcile(&s.project);
 }
@@ -229,6 +250,150 @@ pub fn select_all(s: &Session, e: &mut Editing) {
                 .iter()
                 .flat_map(|t| t.regions.iter().map(|r| r.id))
                 .collect();
+        }
+    }
+}
+
+/// Copy the selection of the focused area to the clipboard.
+pub fn copy(s: &mut Session, e: &mut Editing) -> bool {
+    let p = &s.project;
+    let clip = match e.focus {
+        Focus::Roll => {
+            let mut notes: Vec<Note> = e
+                .edit_region(p)
+                .map(|(_, r)| {
+                    r.notes
+                        .iter()
+                        .filter(|n| e.notes.contains(&n.id))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let Some(first) = notes.iter().map(|n| n.start).min() else {
+                s.status = "Select notes to copy".to_string();
+                return false;
+            };
+            for n in &mut notes {
+                n.start -= first;
+            }
+            Clipboard::Notes(notes)
+        }
+        Focus::Tracks => {
+            let mut regions: Vec<(usize, Region)> = p
+                .tracks
+                .iter()
+                .enumerate()
+                .flat_map(|(ti, t)| t.regions.iter().map(move |r| (ti, r)))
+                .filter(|(_, r)| e.regions.contains(&r.id))
+                .map(|(ti, r)| (ti, r.clone()))
+                .collect();
+            let (Some(top), Some(first)) = (
+                regions.iter().map(|(t, _)| *t).min(),
+                regions.iter().map(|(_, r)| r.start).min(),
+            ) else {
+                s.status = "Select regions to copy".to_string();
+                return false;
+            };
+            for (t, r) in &mut regions {
+                *t -= top;
+                r.start -= first;
+            }
+            Clipboard::Regions(regions)
+        }
+    };
+    let (n, what) = match &clip {
+        Clipboard::Notes(n) => (n.len(), "note"),
+        Clipboard::Regions(r) => (r.len(), "region"),
+    };
+    s.status = format!("Copied {n} {what}{}", if n == 1 { "" } else { "s" });
+    e.clipboard = Some(clip);
+    true
+}
+
+/// Copy the selection, then remove it as one undo step.
+pub fn cut(s: &mut Session, e: &mut Editing) {
+    if !copy(s, e) {
+        return;
+    }
+    if let Some((_, edit)) = removal(e) {
+        s.apply("Cut", edit);
+        clear_selection(s, e);
+    }
+}
+
+/// Paste the clipboard at the playhead, snapped to the grid: notes into the
+/// edited region, regions onto the selected track and the ones below it.
+/// The pasted items get fresh ids and become the selection.
+pub fn paste(s: &mut Session, e: &mut Editing) {
+    let playhead = s.project.sec_to_tick(s.position());
+    match e.clipboard.clone() {
+        None => s.status = "Nothing to paste".to_string(),
+        Some(Clipboard::Notes(notes)) => {
+            let Some((_, r)) = e.edit_region(&s.project) else {
+                s.status = "Open a region in the Piano Roll to paste notes".to_string();
+                return;
+            };
+            let (region, region_start, region_len) = (r.id, r.start, r.len);
+            let grid = e.roll_snap.ticks(&s.project);
+            let at = playhead.saturating_sub(region_start) / grid * grid;
+            let copies: Vec<Note> = notes
+                .into_iter()
+                .map(|mut n| {
+                    n.id = s.project.alloc();
+                    n.start += at;
+                    n
+                })
+                .collect();
+            let ids = copies.iter().map(|n| n.id).collect();
+            let mut edits = vec![Edit::AddNotes {
+                region,
+                notes: copies.clone(),
+            }];
+            // Grow the region, in whole bars, so the pasted notes play.
+            let end = copies.iter().map(|n| n.end()).max().unwrap_or(0);
+            if end > region_len {
+                let bar = s.project.ticks_per_bar().max(1);
+                let len = end.div_ceil(bar) * bar;
+                edits.push(Edit::ResizeRegion { region, len });
+            }
+            s.apply("Paste", Edit::Batch(edits));
+            e.focus = Focus::Roll;
+            e.notes = ids;
+        }
+        Some(Clipboard::Regions(regions)) => {
+            let p = &mut s.project;
+            if p.tracks.is_empty() {
+                return;
+            }
+            let anchor = e
+                .track
+                .and_then(|t| p.tracks.iter().position(|x| x.id == t))
+                .unwrap_or(0);
+            let grid = e.tracks_snap.ticks(p);
+            let at = playhead / grid * grid;
+            let mut edits = Vec::new();
+            let mut ids = Vec::new();
+            for (dt, mut r) in regions {
+                let target = (anchor + dt).min(p.tracks.len() - 1);
+                r.id = p.alloc();
+                r.start += at;
+                for n in &mut r.notes {
+                    n.id = p.alloc();
+                }
+                ids.push(r.id);
+                edits.push(Edit::InsertRegion {
+                    track: p.tracks[target].id,
+                    index: usize::MAX,
+                    region: r,
+                });
+            }
+            s.apply("Paste", Edit::Batch(edits));
+            e.focus = Focus::Tracks;
+            e.regions = ids.iter().copied().collect();
+            if let Some(first) = ids.first() {
+                e.edit_region = Some(*first);
+                e.notes.clear();
+            }
         }
     }
 }

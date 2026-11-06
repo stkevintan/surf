@@ -321,6 +321,11 @@ impl SurfApp {
             (true, "z") if shift => self.session.redo(),
             (true, "z") => self.session.undo(),
             (true, "a") => editing::select_all(&self.session, &mut self.ui.edit),
+            (true, "c") => {
+                editing::copy(&mut self.session, &mut self.ui.edit);
+            }
+            (true, "x") => editing::cut(&mut self.session, &mut self.ui.edit),
+            (true, "v") => editing::paste(&mut self.session, &mut self.ui.edit),
             (true, "t") => editing::split_at_playhead(&mut self.session, &mut self.ui.edit),
             (true, "j") => editing::join(&mut self.session, &mut self.ui.edit),
             (false, "backspace" | "delete") => {

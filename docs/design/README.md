@@ -98,7 +98,7 @@ pane header 右侧的分段控件切换。
 
 这些规则直接影响 `surf-core` 的设计。
 
-**选择与焦点。** 有两套独立的选择：Tracks 区选的是 region，编辑器里选的是 note。键盘命令（Delete、Quantize、Select All、Transpose）作用于最后被点击的区域（`focusArea`）。`editRegion` 是钢琴卷帘当前打开的 region，选中某个 region 时随之更新。
+**选择与焦点。** 有两套独立的选择：Tracks 区选的是 region，编辑器里选的是 note。键盘命令（Delete、Copy/Cut/Paste、Quantize、Select All、Transpose）作用于最后被点击的区域（`focusArea`）。`editRegion` 是钢琴卷帘当前打开的 region，选中某个 region 时随之更新。
 
 **撤销。** 所有修改项目的操作都可撤销，状态栏显示下一步撤销的名字（如 `Undo: Move Notes`）。拖拽类操作在移动超过 2–3px 时才提交一次，所以一次拖拽对应一步撤销。原型里用快照实现，正式版应该是 `surf-core` 的 command log。
 
@@ -134,6 +134,7 @@ pane header 右侧的分段控件切换。
 | `Cmd+Z` / `Shift+Cmd+Z` | 撤销 / 重做 | `Cmd+A` | 全选 |
 | `Cmd+T` | 在播放头处切开 | `Cmd+J` | 合并 region |
 | `Cmd+K` | Musical Typing | `Delete` | 删除选中项 |
+| `Cmd+C` / `Cmd+X` | 复制 / 剪切 | `Cmd+V` | 粘贴到播放头（按网格对齐） |
 
 Musical Typing 开启时，`A W S E D F T G Y H U J K O L P ;` 弹 C3 到 E4（Logic 规则：C3 = MIDI 60），`Z` / `X` 换八度。这时字母键不再触发上表中的快捷键。
 
