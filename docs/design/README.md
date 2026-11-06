@@ -152,8 +152,8 @@ Musical Typing 开启时，`A W S E D F T G Y H U J K O L P ;` 弹 C3 到 E4（L
 
 ## 7. 落到代码
 
-- **Token。** `surf-ui` 里写一个 `theme.rs`，内容由 `tokens.json` 生成或手抄，所有颜色和尺寸都从这里取，视图代码里不出现字面量颜色。以后要加浅色主题，再出一份同结构的 token 就行。
-- **字体。** IBM Plex Sans / Mono 和 Barlow Condensed 都是 OFL 授权，可以随应用打包。原型从 Google Fonts 加载，离线时会退回系统字体。
+- **Token。** `crates/surf-ui/src/theme.rs` 由 `python3 tools/gen_theme.py` 从 `tokens.json` 生成，不要手改。所有颜色和尺寸都从这里取，视图代码里不出现字面量颜色。以后要加浅色主题，再出一份同结构的 token 就行。
+- **字体。** IBM Plex Sans / Mono 和 Barlow Condensed 都是 OFL 授权，已打包在 `crates/surf-ui/assets/fonts/`（附许可证），启动时通过 `surf_ui::fonts::register` 注册，离线也一致。原型仍从 Google Fonts 加载。
 - **GPUI 分工。** 窗口外框、Inspector、Mixer、Library、各种表单控件用 GPUI 元素；Tracks 时间线、Piano Roll、Perform 用 `canvas` 自绘，因为数量多而且命中检测是自己做的。
 - **数据。** 视图只读 `surf-core::Project`，修改都走 command（同时也是撤销记录）。selection、focusArea、editRegion 放在 UI state 里，不进 Project 文件。
 - **Plugin host。** Instrument 槽显示的「helper running / in process」来自 `surf-plugin` 客户端的状态。内置音色在主进程里跑，VST 每个实例占一个 helper 进程。
