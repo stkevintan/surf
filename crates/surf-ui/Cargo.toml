@@ -23,6 +23,10 @@ windows = { workspace = true, features = ["Win32_Globalization"] }
 # than just the Command Line Tools. `font-kit` backs the macOS text system.
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui = { workspace = true, features = ["runtime_shaders", "font-kit"] }
+# Checkmarks on the native menu bar's items, which GPUI 0.2 has no API for.
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSCell", "NSMenu", "NSMenuItem", "NSResponder"] }
+objc2-foundation = { version = "0.3", features = ["NSString"] }
 
 [dev-dependencies]
 # TestAppContext for headless tests of the editors' pointer handling.

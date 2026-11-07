@@ -20,7 +20,7 @@ pub fn render(app: &SurfApp, window: &mut Window, cx: &mut Context<SurfApp>) -> 
     let titles: Vec<gpui::AnyElement> = menus
         .iter()
         .enumerate()
-        .map(|(i, menu)| title(menu, i, open == Some(i), window, cx).into_any_element())
+        .map(|(i, menu)| title(app, menu, i, open == Some(i), window, cx).into_any_element())
         .collect();
 
     div()
@@ -38,6 +38,7 @@ pub fn render(app: &SurfApp, window: &mut Window, cx: &mut Context<SurfApp>) -> 
 }
 
 fn title(
+    app: &SurfApp,
     menu: &OwnedMenu,
     index: usize,
     open: bool,
@@ -48,7 +49,7 @@ fn title(
         menu.items
             .iter()
             .enumerate()
-            .filter_map(|(i, item)| row(item, index, i, window, cx))
+            .filter_map(|(i, item)| row(app, item, index, i, window, cx))
             .collect()
     } else {
         Vec::new()
@@ -125,6 +126,7 @@ pub fn shortcut(action: &dyn gpui::Action, window: &Window) -> String {
 }
 
 fn row(
+    app: &SurfApp,
     item: &OwnedMenuItem,
     menu: usize,
     index: usize,
@@ -145,6 +147,7 @@ fn row(
             // `keystroke_text_for` falls back to the action's name, which is
             // not a shortcut; show nothing when there is no binding.
             let keys = shortcut(action.as_ref(), window);
+            let check = crate::menu::checked(action.as_ref(), &app.ui, app.session.engine.playing);
             let action = action.boxed_clone();
             Some(
                 div()
@@ -152,12 +155,22 @@ fn row(
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(16.0))
-                    .px(px(10.0))
+                    .gap(px(6.0))
+                    .pl(px(6.0))
+                    .pr(px(10.0))
                     .py(px(3.0))
                     .cursor_pointer()
                     .hover(|d| d.bg(color::ACCENT_BG))
-                    .child(div().flex_1().child(name.clone()))
+                    // A fixed gutter, so names line up whether or not a
+                    // row can be checked.
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(12.0))
+                            .text_color(color::ACCENT_FG)
+                            .child(if check == Some(true) { "✓" } else { "" }),
+                    )
+                    .child(div().flex_1().mr(px(10.0)).child(name.clone()))
                     .when(!keys.is_empty(), |d| {
                         d.child(
                             div()

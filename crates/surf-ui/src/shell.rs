@@ -579,6 +579,10 @@ impl Render for SurfApp {
             window.set_window_title(&title);
             self.ui.window_title = title;
         }
+        if menu::native_menu_bar() {
+            let playing = self.session.engine.playing;
+            menu::sync_native_checks(|action| menu::checked(action, &self.ui, playing));
+        }
         let dirty = self.session.is_dirty();
         if self.ui.window_edited != dirty {
             window.set_window_edited(dirty);

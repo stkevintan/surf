@@ -77,6 +77,42 @@ pub fn native_menu_bar() -> bool {
     cfg!(target_os = "macos") && std::env::var_os("SURF_IN_WINDOW_MENU").is_none()
 }
 
+/// Whether a menu item shows a checkmark: the View items for what is on
+/// screen, and the Navigate toggles. None for items that aren't toggles.
+/// Both menu bars read this, so they always agree.
+pub fn checked(action: &dyn gpui::Action, ui: &crate::shell::Ui, playing: bool) -> Option<bool> {
+    use crate::shell::{EditorTab, MainView};
+    let a = action.as_any();
+    let tab = |t| ui.show_editor && ui.tab == t;
+    Some(if a.is::<ToggleLibrary>() {
+        ui.show_library
+    } else if a.is::<ToggleInspector>() {
+        ui.show_inspector
+    } else if a.is::<ToggleToolbar>() {
+        ui.show_toolbar
+    } else if a.is::<ToggleEditor>() {
+        ui.show_editor
+    } else if a.is::<OpenPianoRoll>() {
+        tab(EditorTab::PianoRoll)
+    } else if a.is::<OpenMixer>() {
+        tab(EditorTab::Mixer)
+    } else if a.is::<OpenEventList>() {
+        tab(EditorTab::EventList)
+    } else if a.is::<ViewTracks>() {
+        ui.main == MainView::Tracks
+    } else if a.is::<ViewPerform>() {
+        ui.main == MainView::Perform
+    } else if a.is::<ToggleMusicalTyping>() {
+        ui.musical_typing
+    } else if a.is::<ToggleMetronome>() {
+        ui.metronome
+    } else if a.is::<TogglePlay>() {
+        playing
+    } else {
+        return None;
+    })
+}
+
 /// The same menus in the form the in-window bar draws from.
 pub fn owned_menus() -> Vec<gpui::OwnedMenu> {
     menus().into_iter().map(Menu::owned).collect()
@@ -237,4 +273,46 @@ mod tests {
         // `KeyBinding::new` panics on a bad keystroke or context.
         assert!(key_bindings().len() > 30);
     }
+}
+
+/// Show `checked` on the native menu bar's items (macOS). GPUI 0.2 builds
+/// the NSMenu without checkmarks, so this finds each item by its title and
+/// sets its state directly. Items are matched by title within their menu,
+/// which is unique in Surf's menus. A no-op where there's no native bar.
+pub fn sync_native_checks(state: impl Fn(&dyn gpui::Action) -> Option<bool>) {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::{NSApplication, NSControlStateValueOff, NSControlStateValueOn};
+        use objc2_foundation::NSString;
+
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let Some(bar) = NSApplication::sharedApplication(mtm).mainMenu() else {
+            return;
+        };
+        for menu in menus() {
+            let Some(top) = bar.itemWithTitle(&NSString::from_str(&menu.name)) else {
+                continue;
+            };
+            let Some(sub) = top.submenu() else { continue };
+            for item in &menu.items {
+                let MenuItem::Action { name, action, .. } = item else {
+                    continue;
+                };
+                let Some(on) = state(action.as_ref()) else {
+                    continue;
+                };
+                if let Some(native) = sub.itemWithTitle(&NSString::from_str(name)) {
+                    let want = if on { NSControlStateValueOn } else { NSControlStateValueOff };
+                    if native.state() != want {
+                        native.setState(want);
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = state;
 }

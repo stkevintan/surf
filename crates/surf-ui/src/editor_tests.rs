@@ -525,3 +525,35 @@ fn the_in_window_menu_bar_mirrors_the_native_one(cx: &mut TestAppContext) {
     vcx.simulate_keystrokes("escape");
     assert_eq!(view.read_with(vcx, |a, _| a.ui.menu_open), None);
 }
+
+/// View items are checked for what's on screen; non-toggles have no check.
+#[gpui::test]
+fn view_menu_checks_follow_what_is_shown(cx: &mut TestAppContext) {
+    use crate::menu::{self, checked};
+    use crate::shell::{EditorTab, MainView};
+    let (view, vcx) = window(cx);
+    let state = |vcx: &mut gpui::VisualTestContext, action: &dyn gpui::Action| {
+        view.read_with(vcx, |a, _| checked(action, &a.ui, a.session.engine.playing))
+    };
+    // Defaults from the design: Inspector open, Library closed, Piano Roll.
+    assert_eq!(state(vcx, &menu::ToggleInspector), Some(true));
+    assert_eq!(state(vcx, &menu::ToggleLibrary), Some(false));
+    assert_eq!(state(vcx, &menu::OpenPianoRoll), Some(true));
+    assert_eq!(state(vcx, &menu::OpenMixer), Some(false));
+    assert_eq!(state(vcx, &menu::ViewTracks), Some(true));
+    assert_eq!(state(vcx, &menu::SaveProject), None, "not a toggle");
+
+    // Toggling through the shortcut flips the check.
+    vcx.simulate_keystrokes("y");
+    assert_eq!(state(vcx, &menu::ToggleLibrary), Some(true));
+    // Opening the Mixer moves the tab check off Piano Roll.
+    view.update(vcx, |a, _| a.open_tab(EditorTab::Mixer, false));
+    assert_eq!(state(vcx, &menu::OpenMixer), Some(true));
+    assert_eq!(state(vcx, &menu::OpenPianoRoll), Some(false));
+    // A closed editor checks no tab.
+    view.update(vcx, |a, _| a.ui.show_editor = false);
+    assert_eq!(state(vcx, &menu::OpenMixer), Some(false));
+    view.update(vcx, |a, _| a.ui.main = MainView::Perform);
+    assert_eq!(state(vcx, &menu::ViewPerform), Some(true));
+    assert_eq!(state(vcx, &menu::ViewTracks), Some(false));
+}
