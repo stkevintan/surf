@@ -264,17 +264,6 @@ fn menus() -> Vec<Menu> {
     ]
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_binding_parses() {
-        // `KeyBinding::new` panics on a bad keystroke or context.
-        assert!(key_bindings().len() > 30);
-    }
-}
-
 /// Show `checked` on the native menu bar's items (macOS). GPUI 0.2 builds
 /// the NSMenu without checkmarks, so this finds each item by its title and
 /// sets its state directly. Items are matched by title within their menu,
@@ -315,4 +304,15 @@ pub fn sync_native_checks(state: impl Fn(&dyn gpui::Action) -> Option<bool>) {
     }
     #[cfg(not(target_os = "macos"))]
     let _ = state;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_binding_parses() {
+        // `KeyBinding::new` panics on a bad keystroke or context.
+        assert!(key_bindings().len() > 30);
+    }
 }
