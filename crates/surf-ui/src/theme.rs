@@ -173,6 +173,10 @@ pub mod size {
     pub const TOOLBAR_H: f32 = 32.0;
     pub const PANE_HEADER_H: f32 = 30.0;
     pub const STATUS_BAR_H: f32 = 24.0;
+    /// In-window menu bar, where the OS doesn't draw one.
+    pub const MENU_BAR_H: f32 = 26.0;
+    /// Width of an open menu in that bar.
+    pub const MENU_W: f32 = 230.0;
     pub const ICON_BUTTON: f32 = 28.0;
     pub const ICON: f32 = 14.0;
     pub const LCD_H: f32 = 36.0;

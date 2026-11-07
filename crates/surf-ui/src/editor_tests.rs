@@ -476,3 +476,52 @@ fn musical_typing_letters_are_notes_not_shortcuts(cx: &mut TestAppContext) {
     vcx.simulate_keystrokes("e");
     assert_eq!(view.read_with(vcx, |a, _| a.ui.show_editor), !editor);
 }
+
+/// The in-window menu bar is built from the same menus macOS gets, and its
+/// items carry the shortcut from the keymap.
+#[gpui::test]
+fn the_in_window_menu_bar_mirrors_the_native_one(cx: &mut TestAppContext) {
+    let (view, vcx) = window(cx);
+    let menus = view.read_with(vcx, |a, _| a.ui.menus.clone());
+    let names: Vec<String> = menus.iter().map(|m| m.name.to_string()).collect();
+    assert_eq!(
+        names,
+        vec!["Surf", "File", "Edit", "Track", "Navigate", "View", "Window"]
+    );
+
+    // Every command in the menus has a handler, so none of them is dead.
+    let actions: Vec<Box<dyn gpui::Action>> = menus
+        .iter()
+        .flat_map(|m| &m.items)
+        .filter_map(|item| match item {
+            gpui::OwnedMenuItem::Action { action, .. } => Some(action.boxed_clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(actions.len() > 30);
+    for action in &actions {
+        assert!(
+            vcx.update(|window, cx| window.is_action_available(action.as_ref(), cx)),
+            "{} has no handler",
+            action.name()
+        );
+    }
+
+    // Items show the shortcut the keymap holds, and nothing when an item
+    // has none (not the action's name, which GPUI falls back to).
+    let mut shortcut = |action: &dyn gpui::Action| {
+        vcx.update(|window, _| crate::views::menu_bar::shortcut(action, window))
+    };
+    let save = shortcut(&crate::menu::SaveProject);
+    assert!(save.to_lowercase().ends_with('s'), "Save shortcut: {save:?}");
+    assert_eq!(shortcut(&crate::menu::OpenEventList), "");
+
+    // The bar draws, with a menu open, and Escape closes it.
+    view.update(vcx, |app, cx| {
+        app.ui.menu_open = Some(1);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("escape");
+    assert_eq!(view.read_with(vcx, |a, _| a.ui.menu_open), None);
+}

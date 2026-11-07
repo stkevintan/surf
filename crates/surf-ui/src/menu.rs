@@ -70,6 +70,18 @@ actions!(
     ]
 );
 
+/// Whether the OS draws the menu bar itself. Elsewhere Surf draws its own
+/// (see `views::menu_bar`). `SURF_IN_WINDOW_MENU=1` forces Surf's own, to
+/// look at it on a Mac.
+pub fn native_menu_bar() -> bool {
+    cfg!(target_os = "macos") && std::env::var_os("SURF_IN_WINDOW_MENU").is_none()
+}
+
+/// The same menus in the form the in-window bar draws from.
+pub fn owned_menus() -> Vec<gpui::OwnedMenu> {
+    menus().into_iter().map(Menu::owned).collect()
+}
+
 pub fn init(cx: &mut App) {
     cx.bind_keys(key_bindings());
     // With no window to handle it, Quit still quits.

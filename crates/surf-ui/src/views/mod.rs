@@ -4,6 +4,7 @@ pub mod control_bar;
 pub mod editor;
 pub mod inspector;
 pub mod library;
+pub mod menu_bar;
 pub mod perform;
 pub mod piano_roll;
 pub mod status_bar;

@@ -52,7 +52,7 @@ pane header 右侧的分段控件切换。
 
 ### 菜单栏
 
-所有命令都在系统菜单栏：Surf、File（New ⌘N、Open ⌘O、Close ⌘W、Save ⌘S、Save As ⇧⌘S、Bounce WAV ⌘B、Export MIDI ⇧⌘E）、Edit、Track、Navigate、View、Window。菜单项旁显示快捷键。单字母快捷键只在 Musical Typing 关闭时生效。Windows 和 Linux 上 GPUI 0.2 还不画菜单栏，快捷键照常可用。
+所有命令都在系统菜单栏：Surf、File（New ⌘N、Open ⌘O、Close ⌘W、Save ⌘S、Save As ⇧⌘S、Bounce WAV ⌘B、Export MIDI ⇧⌘E）、Edit、Track、Navigate、View、Window。菜单项旁显示快捷键。单字母快捷键只在 Musical Typing 关闭时生效。macOS 用系统菜单栏；Windows 和 Linux 上 GPUI 0.2 不画菜单栏，Surf 自己在窗口顶部画一条（26 高，`views::menu_bar`，和系统菜单同一份定义）。`SURF_IN_WINDOW_MENU=1` 可以在 Mac 上强制看自己画的那条。
 - **Perform**：落键视图，占满主区域。隐藏 Tracks 和所有只属于 Tracks 的控件，只留切换按钮。粒子和发光以后由 wgpu stage renderer 实现，这里只画平面音符块。
 
 ### 编辑器标签

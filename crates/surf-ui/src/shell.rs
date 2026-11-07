@@ -53,6 +53,10 @@ pub enum EditorTab {
 
 /// UI-only state: what is shown and how. Not part of the project file.
 pub struct Ui {
+    /// What the in-window menu bar draws; see [`menu::owned_menus`].
+    pub menus: Vec<gpui::OwnedMenu>,
+    /// Open menu in that bar, by index.
+    pub menu_open: Option<usize>,
     /// The close was confirmed; let the window go.
     pub closing: bool,
     /// What was last sent to the window, so it is only set on change.
@@ -176,6 +180,8 @@ impl Default for Ui {
             perform_bounds: Rc::default(),
             mouse_key: None,
             edit: Editing::default(),
+            menus: menu::owned_menus(),
+            menu_open: None,
             closing: false,
             window_title: String::new(),
             window_edited: false,
@@ -311,6 +317,8 @@ impl SurfApp {
                     "no-editor" => app.ui.show_editor = false,
                     "no-inspector" => app.ui.show_inspector = false,
                     "track" => app.ui.track_open = true,
+                    // Opens the File menu of the in-window bar.
+                    "menu" => app.ui.menu_open = Some(1),
                     "play" => app.session.toggle_play(),
                     // Two tracks from the demo (bass notes on channel 2) and a
                     // note selection, so editing state shows in screenshots.
@@ -427,6 +435,7 @@ impl SurfApp {
             (false, "up") if tracks_focus => self.select_adjacent_track(-1),
             (false, "down") if tracks_focus => self.select_adjacent_track(1),
             (false, "escape") => {
+                self.ui.menu_open = None;
                 if self.ui.drag.take().is_some() {
                     self.session.history.cancel(&mut self.session.project);
                     self.session.project_changed();
@@ -604,7 +613,10 @@ impl Render for SurfApp {
             .map(|d| actions(d, cx))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, window, _| window.focus(&this.focus)),
+                cx.listener(|this, _: &MouseDownEvent, window, _| {
+                    this.ui.menu_open = None;
+                    window.focus(&this.focus)
+                }),
             )
             .when(self.ui.musical_typing, |d| d.key_context(menu::TYPING_CONTEXT))
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
@@ -635,6 +647,9 @@ impl Render for SurfApp {
                     }
                 }),
             )
+            .when(!menu::native_menu_bar(), |this| {
+                this.child(views::menu_bar::render(self, window, cx))
+            })
             .child(views::control_bar::render(self, cx))
             .when(self.ui.show_toolbar, |this| {
                 this.child(views::toolbar::render(self, cx))
