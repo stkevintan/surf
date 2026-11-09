@@ -573,7 +573,11 @@ fn typing_note(key: &str, octave: i8) -> Option<u8> {
 
 impl Render for SurfApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        window.request_animation_frame();
+        // Pause the frame loop while a file picker is up; see `dialogs`.
+        // Closing the picker notifies, which restarts it.
+        if !crate::dialogs::is_open() {
+            window.request_animation_frame();
+        }
         let title = format!("{} — Surf", self.project_title());
         if self.ui.window_title != title {
             window.set_window_title(&title);

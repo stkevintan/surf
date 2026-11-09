@@ -5,12 +5,43 @@
 //! is already borrowed for that handler, and GPUI panics with "RefCell already
 //! borrowed". GPUI's prompts open the panel asynchronously and hand the result
 //! back on the main thread once the handler has returned.
+//!
+//! On Windows the picker still runs a modal loop on the UI thread, and that
+//! loop keeps delivering paint messages to our window. If Surf asked for a
+//! frame every vsync, it would re-render the whole UI the whole time the
+//! picker is up, and the picker's folder listing would crawl. [`is_open`] lets
+//! the render loop stop asking for frames until the picker closes.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use gpui::{Context, PathPromptOptions};
 
 use crate::shell::SurfApp;
+
+/// How many pickers are open right now.
+static OPEN: AtomicUsize = AtomicUsize::new(0);
+
+/// True while a file picker is showing.
+pub fn is_open() -> bool {
+    OPEN.load(Ordering::Relaxed) > 0
+}
+
+/// Counts one open picker for as long as it lives.
+struct Showing;
+
+impl Showing {
+    fn new() -> Self {
+        OPEN.fetch_add(1, Ordering::Relaxed);
+        Showing
+    }
+}
+
+impl Drop for Showing {
+    fn drop(&mut self) {
+        OPEN.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Ask for an existing file or folder, then run `then` with it on the app.
 pub fn open(
@@ -19,6 +50,7 @@ pub fn open(
     folders: bool,
     then: impl FnOnce(&mut SurfApp, PathBuf) + 'static,
 ) {
+    let showing = Showing::new();
     let rx = cx.prompt_for_paths(PathPromptOptions {
         files: !folders,
         directories: folders,
@@ -27,14 +59,19 @@ pub fn open(
     });
     cx.spawn(async move |this, cx| {
         let picked = match rx.await {
-            Ok(Ok(Some(mut paths))) if !paths.is_empty() => Ok(paths.remove(0)),
-            Ok(Ok(_)) | Err(_) => return,
-            Ok(Err(err)) => Err(err),
+            Ok(Ok(Some(mut paths))) if !paths.is_empty() => Some(Ok(paths.remove(0))),
+            Ok(Ok(_)) | Err(_) => None,
+            Ok(Err(err)) => Some(Err(err)),
         };
+        drop(showing);
+        // Always notify, even on cancel, so rendering (and the frame loop) resumes.
         let _ = this.update(cx, |app, cx| {
             match picked {
-                Ok(path) => then(app, path),
-                Err(err) => app.session.status = format!("Could not open the file picker: {err:#}"),
+                Some(Ok(path)) => then(app, path),
+                Some(Err(err)) => {
+                    app.session.status = format!("Could not open the file picker: {err:#}")
+                }
+                None => {}
             }
             cx.notify();
         });
@@ -51,17 +88,22 @@ pub fn save(
     then: impl FnOnce(&mut SurfApp, PathBuf) + 'static,
 ) {
     let dir = default_dir();
+    let showing = Showing::new();
     let rx = cx.prompt_for_new_path(&dir, Some(&format!("{stem}.{ext}")));
     cx.spawn(async move |this, cx| {
         let picked = match rx.await {
-            Ok(Ok(Some(path))) => Ok(with_extension(path, ext)),
-            Ok(Ok(None)) | Err(_) => return,
-            Ok(Err(err)) => Err(err),
+            Ok(Ok(Some(path))) => Some(Ok(with_extension(path, ext))),
+            Ok(Ok(None)) | Err(_) => None,
+            Ok(Err(err)) => Some(Err(err)),
         };
+        drop(showing);
         let _ = this.update(cx, |app, cx| {
             match picked {
-                Ok(path) => then(app, path),
-                Err(err) => app.session.status = format!("Could not open the save dialog: {err:#}"),
+                Some(Ok(path)) => then(app, path),
+                Some(Err(err)) => {
+                    app.session.status = format!("Could not open the save dialog: {err:#}")
+                }
+                None => {}
             }
             cx.notify();
         });
@@ -93,12 +135,15 @@ pub fn confirm_unsaved(
         &["Save", "Don't Save", "Cancel"],
         cx,
     );
+    // Also a modal loop on Windows, like the pickers.
+    let showing = Showing::new();
     cx.spawn(async move |this, cx| {
         let answer = match rx.await {
             Ok(0) => Unsaved::Save,
             Ok(1) => Unsaved::Discard,
             _ => Unsaved::Cancel,
         };
+        drop(showing);
         let _ = this.update(cx, |app, cx| {
             then(app, answer, cx);
             cx.notify();
