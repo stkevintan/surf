@@ -180,9 +180,14 @@ fn row(
                                 .child(keys),
                         )
                     })
-                    .on_mouse_down(
+                    // On mouse up, as native menus do. On Windows GPUI holds
+                    // the mouse (SetCapture) from button-down to button-up,
+                    // so an item that opened a file picker on mouse down
+                    // left the picker unable to take clicks.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(move |app, _: &MouseDownEvent, window, cx| {
+                        cx.listener(move |app, _: &gpui::MouseUpEvent, window, cx| {
                             cx.stop_propagation();
                             app.ui.menu_open = None;
                             window.dispatch_action(action.boxed_clone(), cx);
