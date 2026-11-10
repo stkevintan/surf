@@ -246,11 +246,12 @@ pub trait Instrument: Send {          // surf-audio/src/lib.rs
 - The UI sends `Command`s over an unbounded crossbeam channel; the callback drains them at the start of each buffer.
 - `Core::render(frames)` works in 64-frame chunks. For each chunk it triggers note-offs, then note-ons whose start frame falls inside it, each on its track's route. Then it runs **every** filled slot, even a silent one, since a plugin host's audio ring has to keep draining. It scales each slot by its gain, sums the slots, applies master volume and clamping, and tracks the peaks.
 - Live notes remember the route they went to, so a note-off follows its note-on even if the input track changed while the key was down.
+- **Edits during playback.** `Update { timeline }` swaps in an edited timeline without restarting. The position stays. A sounding note that is still in the new timeline (same track by stable id, so adding or deleting other tracks doesn't disturb it; same key; still covering now) keeps sounding, with its end moved to the new end. One that was removed or changed stops. While playing, an edited note that now covers the playhead but wasn't sounding (dragged back under it, or drawn there) starts. Notes ahead of the playhead play from the new timeline. The session sends `Update` after every edit, and on every move of a drag, so a dragged note is heard where it is. The swapped-out timeline goes back to the UI thread over a bounded channel to be freed. If that channel is full, the core holds it in a pre-reserved list and sends it on a later update, so the callback doesn't free a timeline.
 - Status goes out through atomics: `position_frames`, `duration_frames`, `playing`, `peak`, `slot_peaks[]`, `sample_rate`.
 
 **Target changes:**
 - Pan per slot, and effects inserts.
-- `Command::SetProject(Arc<ProjectSnapshot>)` swaps an immutable snapshot after each edit, so editing never locks the audio thread.
+- Diff the timeline instead of rebuilding it whole, once projects get large enough for the rebuild to show up per drag move.
 
 **Output changes:** the cpal error callback classifies stream errors into `OutputEvent`s instead of printing them:
 - `Rerouted { device }`: the default output changed and cpal followed it, for example a USB MIDI keyboard that is also an audio interface;

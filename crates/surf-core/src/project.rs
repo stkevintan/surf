@@ -326,6 +326,7 @@ impl Project {
                             velocity: n.velocity,
                             channel: t.channel,
                             track: i as u16,
+                            track_id: t.id.0,
                             start: tempo.tick_to_sec(start),
                             end: tempo.tick_to_sec(end),
                         },

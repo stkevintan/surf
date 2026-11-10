@@ -270,14 +270,17 @@ impl Session {
 
     /// Call after every change to the project, so playback hears it.
     pub fn project_changed(&mut self) {
-        let position = self.position();
-        let playing = self.engine.playing;
         self.sync_instruments();
+        self.refresh_timeline();
+    }
+
+    /// Hand the engine the edited notes. It swaps them in where it is,
+    /// so playback doesn't restart and notes that weren't touched keep
+    /// sounding. Mixer-only changes leave the timeline as it was.
+    fn refresh_timeline(&mut self) {
         let timeline = self.project.timeline();
-        // Mute, solo and volume changes reach the engine without restarting
-        // the song; only a change in what plays does.
-        if playing && timeline != self.timeline {
-            self.audio.play(timeline.clone(), position);
+        if timeline != self.timeline {
+            self.audio.update(timeline.clone());
         }
         self.timeline = timeline;
     }
@@ -440,8 +443,9 @@ impl Session {
     /// Apply a drag's current state; see [`History::preview`].
     pub fn preview(&mut self, label: &str, edit: Edit) {
         self.history.preview(&mut self.project, label, edit);
-        self.timeline = self.project.timeline();
-        // A fader drag is heard while it moves.
+        // Drags are heard while they move: notes and regions where they are
+        // now, and a fader at its current level.
+        self.refresh_timeline();
         self.send_plan();
     }
 

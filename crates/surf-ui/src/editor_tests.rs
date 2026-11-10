@@ -557,3 +557,33 @@ fn view_menu_checks_follow_what_is_shown(cx: &mut TestAppContext) {
     assert_eq!(state(vcx, &menu::ViewPerform), Some(true));
     assert_eq!(state(vcx, &menu::ViewTracks), Some(false));
 }
+
+/// Review: dragging a note during playback must not audition it. The
+/// audition shares the playing note's voice, so its note-off on release
+/// would cut that note. Stopped, the drag still auditions.
+#[gpui::test]
+fn dragging_a_note_auditions_only_when_stopped(cx: &mut TestAppContext) {
+    let drag_once = |app: &mut SurfApp| {
+        let n = first_note(app);
+        let start = roll_pos(app, n.start, n.key, 6.0);
+        piano_roll::pointer_down(app, &down(start, Modifiers::default(), 1));
+        let heard = app.ui.mouse_key;
+        piano_roll::pointer_move(
+            app,
+            &drag(point(start.x, start.y - px(2.0 * sz::ROLL_ROW_H))),
+        );
+        let heard_moving = app.ui.mouse_key;
+        piano_roll::pointer_up(app);
+        (heard, heard_moving)
+    };
+
+    let mut stopped = app(cx);
+    let (down_key, move_key) = drag_once(&mut stopped);
+    assert!(down_key.is_some() && move_key.is_some(), "stopped: auditioned");
+
+    let mut playing = app(cx);
+    playing.session.engine.playing = true;
+    let (down_key, move_key) = drag_once(&mut playing);
+    assert_eq!((down_key, move_key), (None, None), "playing: no audition");
+    assert_eq!(playing.session.history.undo_label(), Some("Move Notes"));
+}
