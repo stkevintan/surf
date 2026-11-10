@@ -56,6 +56,11 @@ pub enum Command {
     SetInput(u16),
     ControlChange { slot: u8, channel: u8, controller: u8, value: u8 },
     Play { timeline: Timeline, from: f64 },
+    /// Swap in an edited timeline without restarting: the position stays,
+    /// notes still sounding and still in it keep sounding, and only notes
+    /// that were removed or changed stop. Works while paused too, so Resume
+    /// plays the edit.
+    Update { timeline: Timeline },
     Pause,
     Resume,
     Stop,
@@ -106,6 +111,7 @@ struct Shared {
 }
 
 struct ActiveNote {
+    track: u16,
     route: Route,
     key: u8,
     end_frame: u64,
@@ -135,11 +141,18 @@ struct Core {
     scratch: Vec<f32>,
     /// One slot's output for the current chunk, before it is mixed.
     slot_buf: Vec<f32>,
+    /// Replaced timelines go back to the UI thread to be freed, so the audio
+    /// callback doesn't call the allocator.
+    trash: crossbeam_channel::Sender<Timeline>,
     shared: Arc<Shared>,
 }
 
 impl Core {
-    fn new(sample_rate: u32, shared: Arc<Shared>) -> Self {
+    fn new(
+        sample_rate: u32,
+        shared: Arc<Shared>,
+        trash: crossbeam_channel::Sender<Timeline>,
+    ) -> Self {
         Self {
             slots: std::iter::repeat_with(|| None).take(MAX_SLOTS).collect(),
             gains: [1.0; MAX_SLOTS],
@@ -159,6 +172,7 @@ impl Core {
             sample_rate: sample_rate as f64,
             scratch: vec![0.0; MAX_BLOCK * 2],
             slot_buf: vec![0.0; CHUNK * 2],
+            trash,
             shared,
         }
     }
@@ -266,6 +280,7 @@ impl Core {
                     .store(self.duration_frames, Ordering::Relaxed);
                 self.shared.playing.store(true, Ordering::Release);
             }
+            Command::Update { timeline } => self.update(timeline),
             Command::Pause => {
                 self.playing = false;
                 self.all_notes_off();
@@ -300,6 +315,46 @@ impl Core {
             }
             Command::SetLoop(looping) => self.looping = looping,
             Command::SetVolume(volume) => self.volume = volume.clamp(0.0, 2.0),
+        }
+    }
+
+    fn update(&mut self, timeline: Timeline) {
+        let sr = self.sample_rate;
+        let pos = self.pos_frames;
+        let frame = |t: f64| (t * sr) as u64;
+        // Notes that started before now: the ones already triggered.
+        let started = timeline.notes.partition_point(|n| frame(n.start) < pos);
+        let ended = &mut self.ended;
+        ended.clear();
+        self.active.retain_mut(|a| {
+            let same = timeline.notes[..started]
+                .iter()
+                .rev()
+                .find(|n| n.track == a.track && n.key == a.key && frame(n.end) > pos);
+            match same {
+                Some(n) => {
+                    a.end_frame = frame(n.end).max(pos + 1);
+                    true
+                }
+                None => {
+                    ended.push((a.route, a.key));
+                    false
+                }
+            }
+        });
+        for &(route, key) in &self.ended {
+            if let Some(i) = self.slots.get_mut(route.slot as usize).and_then(Option::as_mut) {
+                i.note_off(route.channel, key);
+            }
+        }
+        self.next_note = started;
+        self.duration_frames = (timeline.duration * sr).ceil() as u64;
+        self.shared
+            .duration_frames
+            .store(self.duration_frames, Ordering::Relaxed);
+        if let Some(old) = self.timeline.replace(timeline) {
+            // Full only if the UI stopped draining; then free it here.
+            let _ = self.trash.try_send(old);
         }
     }
 
@@ -413,6 +468,7 @@ impl Core {
             i.note_on(route.channel, note.key, note.velocity);
             let note_end = ((note.end * self.sample_rate) as u64).max(note_start + 1);
             self.active.push(ActiveNote {
+                track: note.track,
                 route,
                 key: note.key,
                 end_frame: note_end,
@@ -444,6 +500,7 @@ pub struct AudioEngine {
     output: parking_lot::Mutex<String>,
     sample_accurate: bool,
     events: crossbeam_channel::Receiver<OutputEvent>,
+    trash: crossbeam_channel::Receiver<Timeline>,
 }
 
 impl AudioEngine {
@@ -461,12 +518,17 @@ impl AudioEngine {
         });
         let (event_tx, events) = crossbeam_channel::unbounded();
         let (tx, rx) = crossbeam_channel::unbounded();
+        let (trash_tx, trash) = crossbeam_channel::bounded(8);
 
         // Try the default output device first.
         match open_output() {
             Ok((device, sample_rate, channels, name)) => {
                 shared.sample_rate.store(sample_rate, Ordering::Relaxed);
-                let core = Arc::new(Mutex::new(Core::new(sample_rate, shared.clone())));
+                let core = Arc::new(Mutex::new(Core::new(
+                    sample_rate,
+                    shared.clone(),
+                    trash_tx.clone(),
+                )));
                 let callback_core = core.clone();
                 let err_shared = shared.clone();
                 let err_fn = move |err: cpal::Error| {
@@ -524,6 +586,7 @@ impl AudioEngine {
                     output: parking_lot::Mutex::new(name),
                     sample_accurate: true,
                     events,
+                    trash,
                 }
             }
             Err(err) => {
@@ -531,7 +594,11 @@ impl AudioEngine {
                 eprintln!("no audio output device ({err}); running silent clock");
                 let sample_rate = 48_000;
                 shared.sample_rate.store(sample_rate, Ordering::Relaxed);
-                let core = Arc::new(Mutex::new(Core::new(sample_rate, shared.clone())));
+                let core = Arc::new(Mutex::new(Core::new(
+                    sample_rate,
+                    shared.clone(),
+                    trash_tx.clone(),
+                )));
                 let stop = Arc::new(AtomicBool::new(false));
                 let thread_core = core.clone();
                 let thread_stop = stop.clone();
@@ -567,6 +634,7 @@ impl AudioEngine {
                     output: parking_lot::Mutex::new("Silent (no audio device)".to_string()),
                     sample_accurate: false,
                     events,
+                    trash,
                 }
             }
         }
@@ -621,6 +689,8 @@ impl AudioEngine {
     }
 
     pub fn send(&self, command: Command) {
+        // Free timelines the audio thread swapped out.
+        while self.trash.try_recv().is_ok() {}
         // The audio side drains at block rate; an unbounded queue keeps the UI
         // responsive even if the device stalls.
         let _ = self.tx.send(command);
@@ -640,6 +710,11 @@ impl AudioEngine {
 
     pub fn play(&self, timeline: Timeline, from: f64) {
         self.send(Command::Play { timeline, from });
+    }
+
+    /// Replace what plays with an edited timeline; see [`Command::Update`].
+    pub fn update(&self, timeline: Timeline) {
+        self.send(Command::Update { timeline });
     }
 
     pub fn pause(&self) {
@@ -765,7 +840,10 @@ mod tests {
             sample_rate: AtomicU32::new(48_000),
             glitches: AtomicU32::new(0),
         });
-        Core::new(48_000, shared)
+        // Tests keep the receiver alive so swapped timelines queue up.
+        let (trash, keep) = crossbeam_channel::bounded(8);
+        std::mem::forget(keep);
+        Core::new(48_000, shared, trash)
     }
 
     fn note(track: u16, key: u8, start: f64) -> TimedNote {
@@ -855,4 +933,112 @@ mod tests {
             OutputEvent::Error(_)
         ));
     }
+
+    fn long(track: u16, key: u8, start: f64, end: f64) -> TimedNote {
+        TimedNote {
+            key,
+            velocity: 100,
+            channel: 0,
+            track,
+            start,
+            end,
+        }
+    }
+
+    /// Render `frames`, in as many callbacks as `render`'s cap needs.
+    fn run(c: &mut Core, mut frames: usize) {
+        while frames > 0 {
+            let n = frames.min(MAX_BLOCK);
+            c.render(n);
+            frames -= n;
+        }
+    }
+
+    fn probe_core() -> (Core, Log) {
+        let mut c = core();
+        let log: Log = Default::default();
+        c.apply(Command::SetSlot {
+            slot: 1,
+            instrument: Some(Box::new(Probe(log.clone()))),
+            ack: None,
+        });
+        c.apply(Command::SetRoutes(vec![
+            Route { slot: 1, channel: 0 },
+            Route { slot: 1, channel: 1 },
+        ]));
+        (c, log)
+    }
+
+    /// An edit while playing keeps the position and leaves sounding notes
+    /// alone; it doesn't restart the song or cut every note.
+    #[test]
+    fn an_edit_while_playing_keeps_sounding_notes() {
+        let (mut c, log) = probe_core();
+        // A held chord (60 + 64) and a later note 67.
+        let a = long(0, 60, 0.0, 1.0);
+        let b = long(1, 64, 0.0, 1.0);
+        let later = long(0, 67, 0.5, 0.6);
+        c.apply(Command::Play {
+            timeline: Timeline { notes: vec![a, b, later], duration: 1.0 },
+            from: 0.0,
+        });
+        c.render(4800); // 0.1 s in: 60 and 64 are sounding
+        let pos = c.pos_frames;
+        log.lock().clear();
+
+        // Delete 64 and move the later note to 0.3 s.
+        let moved = long(0, 67, 0.3, 0.4);
+        c.apply(Command::Update {
+            timeline: Timeline { notes: vec![a, moved], duration: 1.0 },
+        });
+        assert_eq!(c.pos_frames, pos, "position kept");
+        assert_eq!(
+            *log.lock(),
+            vec![(1, 64, false)],
+            "only the deleted note stops; 60 keeps ringing"
+        );
+        log.lock().clear();
+
+        // Play on past 0.5 s: the moved note sounds at its new time, once.
+        run(&mut c, 24_000);
+        let ons: Vec<u8> = log.lock().iter().filter(|e| e.2).map(|e| e.1).collect();
+        assert_eq!(ons, vec![67], "moved note plays once, nothing replays");
+    }
+
+    /// Shortening a sounding note ends it at its new end, not the old one.
+    #[test]
+    fn a_shortened_note_ends_on_time() {
+        let (mut c, log) = probe_core();
+        c.apply(Command::Play {
+            timeline: Timeline { notes: vec![long(0, 60, 0.0, 2.0)], duration: 2.0 },
+            from: 0.0,
+        });
+        c.render(4800); // 0.1 s
+        c.apply(Command::Update {
+            timeline: Timeline { notes: vec![long(0, 60, 0.0, 0.2)], duration: 2.0 },
+        });
+        assert!(log.lock().iter().all(|e| e.2), "still sounding after the edit");
+        c.render(9600); // to 0.3 s
+        assert_eq!(log.lock().last(), Some(&(0, 60, false)), "ended near 0.2 s");
+    }
+
+    /// While paused an update just takes effect for Resume.
+    #[test]
+    fn an_update_while_paused_plays_on_resume() {
+        let (mut c, log) = probe_core();
+        c.apply(Command::Play {
+            timeline: Timeline { notes: vec![long(0, 60, 0.5, 0.6)], duration: 1.0 },
+            from: 0.0,
+        });
+        c.render(4800);
+        c.apply(Command::Pause);
+        c.apply(Command::Update {
+            timeline: Timeline { notes: vec![long(0, 72, 0.5, 0.6)], duration: 1.0 },
+        });
+        c.apply(Command::Resume);
+        run(&mut c, 48_000);
+        let ons: Vec<u8> = log.lock().iter().filter(|e| e.2).map(|e| e.1).collect();
+        assert_eq!(ons, vec![72]);
+    }
+
 }
