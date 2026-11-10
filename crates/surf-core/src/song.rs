@@ -14,7 +14,7 @@ pub const LAST_KEY: u8 = 108;
 pub const KEY_COUNT: usize = (LAST_KEY - FIRST_KEY + 1) as usize;
 pub const DRUM_CHANNEL: u8 = 9;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Tempo {
     pub tick: u64,
     /// Quarter notes per minute.

@@ -415,3 +415,145 @@ fn pasting_regions_keeps_their_track_layout(cx: &mut TestAppContext) {
     assert_eq!(copy_b.notes.len(), b.notes.len());
     assert_eq!(app.ui.edit.regions, [copy_a.id, copy_b.id].into());
 }
+
+/// A real window with the menu bindings, focused, with two tracks.
+fn window(cx: &mut TestAppContext) -> (gpui::Entity<SurfApp>, &mut gpui::VisualTestContext) {
+    cx.update(crate::menu::init);
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus = cx.focus_handle();
+        window.focus(&focus);
+        let mut song = Song::demo();
+        for n in song.notes.iter_mut().filter(|n| n.key < 55) {
+            n.channel = 1;
+        }
+        let mut session = Session::new();
+        session.set_project(Project::from_song(&song));
+        let mut app = SurfApp::with_session(session, focus);
+        app.ui.edit.reconcile(&app.session.project);
+        app
+    });
+    vcx.run_until_parked();
+    (view, vcx)
+}
+
+/// A shortcut runs its menu action once: ⌘N-style chords and bare letters
+/// alike go through the action, not also through the old key handler.
+#[gpui::test]
+fn shortcuts_run_their_menu_action_once(cx: &mut TestAppContext) {
+    let (view, vcx) = window(cx);
+    let tracks = |vcx: &mut gpui::VisualTestContext| {
+        view.read_with(vcx, |a, _| a.session.project.tracks.len())
+    };
+    let n = tracks(vcx);
+    vcx.simulate_keystrokes("secondary-alt-n");
+    assert_eq!(tracks(vcx), n + 1, "New Track once");
+    vcx.simulate_keystrokes("secondary-z");
+    assert_eq!(tracks(vcx), n, "one undo undoes it");
+    vcx.simulate_keystrokes("secondary-shift-z");
+    assert_eq!(tracks(vcx), n + 1);
+
+    let shown = view.read_with(vcx, |a, _| a.ui.show_inspector);
+    vcx.simulate_keystrokes("i");
+    assert_eq!(view.read_with(vcx, |a, _| a.ui.show_inspector), !shown);
+}
+
+/// With Musical Typing on, letters that are shortcuts play notes instead.
+#[gpui::test]
+fn musical_typing_letters_are_notes_not_shortcuts(cx: &mut TestAppContext) {
+    let (view, vcx) = window(cx);
+    vcx.simulate_keystrokes("secondary-k");
+    assert!(view.read_with(vcx, |a, _| a.ui.musical_typing));
+    let editor = view.read_with(vcx, |a, _| a.ui.show_editor);
+    // E is D#3 in Musical Typing, and Toggle Editor otherwise.
+    vcx.simulate_keystrokes("e");
+    view.read_with(vcx, |a, _| {
+        assert_eq!(a.ui.show_editor, editor, "E did not toggle the editor");
+        assert!(a.ui.typing_keys.contains_key("e"), "E is a held note");
+    });
+    // ⌘ chords still work while typing.
+    vcx.simulate_keystrokes("secondary-k");
+    assert!(!view.read_with(vcx, |a, _| a.ui.musical_typing));
+    vcx.simulate_keystrokes("e");
+    assert_eq!(view.read_with(vcx, |a, _| a.ui.show_editor), !editor);
+}
+
+/// The in-window menu bar is built from the same menus macOS gets, and its
+/// items carry the shortcut from the keymap.
+#[gpui::test]
+fn the_in_window_menu_bar_mirrors_the_native_one(cx: &mut TestAppContext) {
+    let (view, vcx) = window(cx);
+    let menus = view.read_with(vcx, |a, _| a.ui.menus.clone());
+    let names: Vec<String> = menus.iter().map(|m| m.name.to_string()).collect();
+    assert_eq!(
+        names,
+        vec!["Surf", "File", "Edit", "Track", "Navigate", "View", "Window"]
+    );
+
+    // Every command in the menus has a handler, so none of them is dead.
+    let actions: Vec<Box<dyn gpui::Action>> = menus
+        .iter()
+        .flat_map(|m| &m.items)
+        .filter_map(|item| match item {
+            gpui::OwnedMenuItem::Action { action, .. } => Some(action.boxed_clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(actions.len() > 30);
+    for action in &actions {
+        assert!(
+            vcx.update(|window, cx| window.is_action_available(action.as_ref(), cx)),
+            "{} has no handler",
+            action.name()
+        );
+    }
+
+    // Items show the shortcut the keymap holds, and nothing when an item
+    // has none (not the action's name, which GPUI falls back to).
+    let mut shortcut = |action: &dyn gpui::Action| {
+        vcx.update(|window, _| crate::views::menu_bar::shortcut(action, window))
+    };
+    let save = shortcut(&crate::menu::SaveProject);
+    assert!(save.to_lowercase().ends_with('s'), "Save shortcut: {save:?}");
+    assert_eq!(shortcut(&crate::menu::OpenEventList), "");
+
+    // The bar draws, with a menu open, and Escape closes it.
+    view.update(vcx, |app, cx| {
+        app.ui.menu_open = Some(1);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("escape");
+    assert_eq!(view.read_with(vcx, |a, _| a.ui.menu_open), None);
+}
+
+/// View items are checked for what's on screen; non-toggles have no check.
+#[gpui::test]
+fn view_menu_checks_follow_what_is_shown(cx: &mut TestAppContext) {
+    use crate::menu::{self, checked};
+    use crate::shell::{EditorTab, MainView};
+    let (view, vcx) = window(cx);
+    let state = |vcx: &mut gpui::VisualTestContext, action: &dyn gpui::Action| {
+        view.read_with(vcx, |a, _| checked(action, &a.ui, a.session.engine.playing))
+    };
+    // Defaults from the design: Inspector open, Library closed, Piano Roll.
+    assert_eq!(state(vcx, &menu::ToggleInspector), Some(true));
+    assert_eq!(state(vcx, &menu::ToggleLibrary), Some(false));
+    assert_eq!(state(vcx, &menu::OpenPianoRoll), Some(true));
+    assert_eq!(state(vcx, &menu::OpenMixer), Some(false));
+    assert_eq!(state(vcx, &menu::ViewTracks), Some(true));
+    assert_eq!(state(vcx, &menu::SaveProject), None, "not a toggle");
+
+    // Toggling through the shortcut flips the check.
+    vcx.simulate_keystrokes("y");
+    assert_eq!(state(vcx, &menu::ToggleLibrary), Some(true));
+    // Opening the Mixer moves the tab check off Piano Roll.
+    view.update(vcx, |a, _| a.open_tab(EditorTab::Mixer, false));
+    assert_eq!(state(vcx, &menu::OpenMixer), Some(true));
+    assert_eq!(state(vcx, &menu::OpenPianoRoll), Some(false));
+    // A closed editor checks no tab.
+    view.update(vcx, |a, _| a.ui.show_editor = false);
+    assert_eq!(state(vcx, &menu::OpenMixer), Some(false));
+    view.update(vcx, |a, _| a.ui.main = MainView::Perform);
+    assert_eq!(state(vcx, &menu::ViewPerform), Some(true));
+    assert_eq!(state(vcx, &menu::ViewTracks), Some(false));
+}

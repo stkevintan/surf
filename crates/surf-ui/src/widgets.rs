@@ -3,7 +3,10 @@
 //! They return plain `Div`s so call sites can add `.id(..)`, `.on_click(..)`
 //! and sizing the same way as any GPUI element.
 
-use gpui::{Div, FontWeight, IntoElement, ParentElement, Rgba, SharedString, Styled, div, px, svg};
+use gpui::{
+    AppContext, Div, FontWeight, InteractiveElement, IntoElement, ParentElement, Rgba, SharedString,
+    Styled, div, prelude::FluentBuilder, px, svg,
+};
 
 use crate::icons;
 use crate::theme::{SlotColors, color, font, radius, size};
@@ -60,6 +63,74 @@ pub fn icon_button(icon: &str, tone: Tone) -> Div {
                 .size(px(size::ICON))
                 .text_color(fg),
         )
+}
+
+/// Small icon button for pane headers, 24 px like the segmented controls.
+pub fn header_icon(icon: &str) -> Div {
+    div()
+        .flex_none()
+        .size(px(24.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(radius::MD - 1.0))
+        .text_color(color::TEXT_SECONDARY)
+        .hover(|d| d.bg(color::HOVER).text_color(color::TEXT_PRIMARY))
+        .cursor_pointer()
+        .child(
+            svg()
+                .path(icons::path(icon))
+                .size(px(size::ICON))
+                .text_color(color::TEXT_SECONDARY),
+        )
+}
+
+/// Hover text: a name and, if it has one, its shortcut.
+pub struct Tooltip {
+    text: SharedString,
+    keys: Option<SharedString>,
+}
+
+impl Tooltip {
+    pub fn view(
+        text: impl Into<SharedString>,
+        keys: Option<&'static str>,
+        cx: &mut gpui::App,
+    ) -> gpui::AnyView {
+        let text = text.into();
+        cx.new(|_| Tooltip {
+            text,
+            keys: keys.map(SharedString::from),
+        })
+        .into()
+    }
+}
+
+impl gpui::Render for Tooltip {
+    fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(8.0))
+            .py(px(4.0))
+            .rounded(px(radius::MD))
+            .bg(color::RAISED)
+            .border_1()
+            .border_color(color::LINE_STRONG)
+            .text_size(px(font::SMALL))
+            .text_color(color::TEXT_PRIMARY)
+            .child(self.text.clone())
+            .when_some(self.keys.clone(), |d, keys| {
+                d.child(
+                    div()
+                        .font_family(font::MONO)
+                        .text_color(color::TEXT_TERTIARY)
+                        .child(keys),
+                )
+            })
+    }
 }
 
 /// Text button for the toolbar and pane headers. `planned` dims it.

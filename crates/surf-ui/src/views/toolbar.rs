@@ -1,10 +1,11 @@
-//! Toolbar: common edit commands, planned features, export.
+//! Toolbar: planned features and export. Edit commands live in the menu
+//! bar and the Tracks header; New Track is in the track list.
 
 use gpui::{Context, IntoElement, ParentElement, Styled, div, prelude::*, px};
 
 use crate::shell::{self, SurfApp, on_click, on_click_cx};
 use crate::theme::{color, size};
-use crate::widgets::{label, separator, text_button};
+use crate::widgets::{label, text_button};
 
 pub fn render(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
     let rendering = app.session.rendering;
@@ -19,47 +20,6 @@ pub fn render(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
         .bg(color::PANEL)
         .border_t_1()
         .border_color(color::LINE)
-        .child(
-            row()
-                .child(on_click_cx(
-                    text_button("Open MIDI…", false).id("tb-open"),
-                    cx,
-                    |_, cx| shell::open_midi(cx),
-                ))
-                .child(on_click(
-                    text_button("Demo", false).id("tb-demo"),
-                    cx,
-                    |a| {
-                        a.session.load_demo();
-                        a.center_roll_on_song();
-                    },
-                )),
-        )
-        .child(separator())
-        .child(
-            row()
-                .child(on_click(
-                    text_button("Quantize", false).id("tb-quantize"),
-                    cx,
-                    |a| crate::editing::quantize(&mut a.session, &a.ui.edit),
-                ))
-                .child(on_click(
-                    text_button("Split at Playhead", false).id("tb-split"),
-                    cx,
-                    |a| crate::editing::split_at_playhead(&mut a.session, &mut a.ui.edit),
-                ))
-                .child(on_click(
-                    text_button("Join", false).id("tb-join"),
-                    cx,
-                    |a| crate::editing::join(&mut a.session, &mut a.ui.edit),
-                ))
-                .child(on_click(
-                    text_button("New Track", false).id("tb-newtrack"),
-                    cx,
-                    |a| crate::editing::new_track(&mut a.session, &mut a.ui.edit),
-                )),
-        )
-        .child(separator())
         .child(
             row()
                 .child(planned("tb-automation", "Automation", cx))

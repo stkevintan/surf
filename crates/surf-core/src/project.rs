@@ -11,13 +11,16 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 use crate::song::{self, Song, Tempo, TimedNote, Timeline};
 
 /// Stable identity of a track, region or note within a project.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Id(pub u64);
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Note {
     pub id: Id,
     pub key: u8,
@@ -33,7 +36,7 @@ impl Note {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Region {
     pub id: Id,
     pub name: String,
@@ -63,7 +66,7 @@ impl Region {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Track {
     pub id: Id,
     pub name: String,
@@ -79,6 +82,7 @@ pub struct Track {
     /// The plugin the track plays (a `.vst3` / VST2 path), or None for the
     /// built-in piano. Tracks naming the same plugin share one instance and
     /// are told apart by [`Track::channel`].
+    #[serde(default)]
     pub instrument: Option<PathBuf>,
     pub regions: Vec<Region>,
 }
@@ -89,7 +93,7 @@ impl Track {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     pub name: String,
     pub ppq: u16,
@@ -112,6 +116,55 @@ impl Project {
             tracks: Vec::new(),
             next_id: 1,
         }
+    }
+
+    /// A fresh project with one empty track on MIDI channel 1.
+    pub fn empty() -> Self {
+        let mut p = Self::new("Untitled");
+        let id = p.alloc();
+        p.tracks.push(Track {
+            id,
+            name: "Inst 1".into(),
+            color: 0,
+            channel: 0,
+            mute: false,
+            solo: false,
+            volume: 1.0,
+            instrument: None,
+            regions: Vec::new(),
+        });
+        p
+    }
+
+    /// Make a project read from a file safe to edit: ids allocate past
+    /// every id in use, fields are in range, notes and regions are sorted.
+    pub fn repair(&mut self) {
+        let mut max = 0;
+        for t in &mut self.tracks {
+            max = max.max(t.id.0);
+            t.channel = t.channel.min(15);
+            t.volume = t.volume.clamp(0.0, 1.5);
+            for r in &mut t.regions {
+                max = max.max(r.id.0);
+                r.len = r.len.max(1);
+                for n in &mut r.notes {
+                    max = max.max(n.id.0);
+                    n.key = n.key.min(127);
+                    n.velocity = n.velocity.clamp(1, 127);
+                    n.len = n.len.max(1);
+                }
+                r.sort_notes();
+            }
+            t.regions.sort_by_key(|r| r.start);
+        }
+        self.next_id = self.next_id.max(max + 1);
+        if self.tempos.is_empty() {
+            self.tempos.push(Tempo {
+                tick: 0,
+                bpm: 120.0,
+            });
+        }
+        self.ppq = self.ppq.max(1);
     }
 
     /// A fresh id, unique within this project.

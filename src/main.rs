@@ -1,11 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, point, px, size};
-use surf::ui::{Assets, SurfApp, fonts};
+use surf::ui::{Assets, SurfApp, fonts, menu};
 
 fn main() {
     Application::new().with_assets(Assets).run(|cx: &mut App| {
         fonts::register(cx);
+        menu::init(cx);
         // A fixed top-left origin behaves predictably on high-DPI Windows
         // displays. 1440x900 fits the full layout (inspector, tracks, editor).
         let bounds = Bounds {

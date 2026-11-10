@@ -5636,6 +5636,12 @@ dependencies = [
 [[package]]
 name = "surf-core"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "surf-midi"
@@ -5698,6 +5704,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "gpui",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "surf-audio",
  "surf-core",
  "surf-midi",

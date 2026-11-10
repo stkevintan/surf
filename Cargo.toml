@@ -20,6 +20,7 @@ surf-plugin = { path = "crates/surf-plugin" }
 surf-ui = { path = "crates/surf-ui" }
 
 anyhow = "1"
+base64 = "0.22.1"
 cpal = "0.18"
 crossbeam-channel = "0.5"
 gpui = { version = "0.2.2", default-features = false }

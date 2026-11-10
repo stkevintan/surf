@@ -16,7 +16,7 @@
 ┌──────────────────────────────────────────────────────────────────────────┐
 │ Control bar 48   [区域开关][transport][LCD][count-in/metro][MIDI][CPU] … │
 ├──────────────────────────────────────────────────────────────────────────┤
-│ Toolbar 32       Quantize · Split · Join · New Track │ planned… │ Export │
+│ Toolbar 32       planned… │ Export                                  │
 ├────────────┬────────────┬────────────────────────────────────────────────┤
 │ Library    │ Inspector  │ Tracks 区 / Perform 视图                        │
 │ 220        │ 236        │  pane header 30                                 │
@@ -40,7 +40,7 @@
 |---|---|---|---|
 | Library | `Y` | 关 | 插件浏览器，为**当前轨道**选乐器 |
 | Inspector | `I` | 开 | Region / Track 参数（可折叠）+ 两条 channel strip |
-| Toolbar | — | 开 | 常用编辑命令 + 导出 |
+| Toolbar | — | 开 | planned 功能 + 导出。编辑命令在系统菜单栏和 Tracks 标题栏 |
 | Editor | `E` | 开 | 底部编辑器；`P` 直达 Piano Roll，`X` 直达 Mixer；可最大化或关闭 |
 | Smart Controls | `B` | — | planned |
 
@@ -48,7 +48,11 @@
 
 pane header 右侧的分段控件切换。
 
-- **Tracks**：track header（编号、图标、名字、乐器、M/S/R）+ 时间线。显示 Edit/Functions/View 菜单、工具、Snap、Zoom。
+- **Tracks**：track header（编号、图标、名字、乐器、M/S/R）+ 时间线。标题栏有工具、Snap、Quantize / Split / Join 图标（悬停显示名称和快捷键）、Zoom。
+
+### 菜单栏
+
+所有命令都在系统菜单栏：Surf、File（New ⌘N、Open ⌘O、Close ⌘W、Save ⌘S、Save As ⇧⌘S、Bounce WAV ⌘B、Export MIDI ⇧⌘E）、Edit、Track、Navigate、View、Window。菜单项旁显示快捷键。单字母快捷键只在 Musical Typing 关闭时生效。macOS 用系统菜单栏；Windows 和 Linux 上 GPUI 0.2 不画菜单栏，Surf 自己在窗口顶部画一条（26 高，`views::menu_bar`，和系统菜单同一份定义）。`SURF_IN_WINDOW_MENU=1` 可以在 Mac 上强制看自己画的那条。View 菜单里已打开的面板、当前编辑器标签和主视图打勾；Navigate 里的 Play、Metronome、Musical Typing 也按状态打勾。两种菜单栏读同一个 `menu::checked`，所以显示一致。
 - **Perform**：落键视图，占满主区域。隐藏 Tracks 和所有只属于 Tracks 的控件，只留切换按钮。粒子和发光以后由 wgpu stage renderer 实现，这里只画平面音符块。
 
 ### 编辑器标签
@@ -134,6 +138,9 @@ pane header 右侧的分段控件切换。
 | `Cmd+Z` / `Shift+Cmd+Z` | 撤销 / 重做 | `Cmd+A` | 全选 |
 | `Cmd+T` | 在播放头处切开 | `Cmd+J` | 合并 region |
 | `Cmd+K` | Musical Typing | `Delete` | 删除选中项 |
+| `Cmd+S` / `Shift+Cmd+S` | 保存工程 / 另存为 | `Cmd+O` | 打开工程或 MIDI 文件 |
+| `Cmd+N` | 新建工程 | `Cmd+W` | 关闭窗口 |
+| `Cmd+B` / `Shift+Cmd+E` | Bounce WAV / 导出 MIDI | `Opt+Cmd+N` / `Cmd+Delete` | 新建 / 删除轨道 |
 | `Cmd+C` / `Cmd+X` | 复制 / 剪切 | `Cmd+V` | 粘贴：音符贴在原音符后一格，region 贴到播放头 |
 
 Musical Typing 开启时，`A W S E D F T G Y H U J K O L P ;` 弹 C3 到 E4（Logic 规则：C3 = MIDI 60），`Z` / `X` 换八度。这时字母键不再触发上表中的快捷键。

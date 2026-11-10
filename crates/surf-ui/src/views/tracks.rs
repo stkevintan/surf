@@ -20,7 +20,7 @@ use crate::icons;
 use crate::shell::{Drag, EditorTab, MainView, SurfApp, on_click, pane_header};
 use crate::theme::{color, font, radius, size};
 use crate::views::{self, mix, with_alpha};
-use crate::widgets::{Tone, label, msr, segment, segmented};
+use crate::widgets::{Tone, Tooltip, header_icon, label, msr, segment, segmented};
 
 /// Width of the region edge that resizes instead of moving.
 const EDGE: f32 = 6.0;
@@ -39,6 +39,7 @@ pub fn render(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
                 .child(tool_picker(app, cx))
                 .child(label("Snap"))
                 .child(snap_picker(app, cx))
+                .child(region_commands(cx))
                 .child(div().flex_1())
                 .child(view_switch(ui.main, cx))
                 .child(label("Zoom"))
@@ -65,6 +66,52 @@ fn tool_picker(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
             move |a| a.ui.edit.tracks_tool = t,
         )
     }))
+}
+
+/// Quantize, Split at Playhead and Join, as icons. They act on the area
+/// that was clicked last, like their shortcuts.
+fn region_commands(cx: &mut Context<SurfApp>) -> impl IntoElement {
+    let cmd = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl+" };
+    let button = |id: &'static str,
+                  icon: &'static str,
+                  name: &'static str,
+                  keys: String,
+                  cx: &mut Context<SurfApp>,
+                  f: fn(&mut SurfApp)| {
+        let keys: &'static str = Box::leak(keys.into_boxed_str());
+        on_click(
+            header_icon(icon)
+                .id(id)
+                .tooltip(move |_, cx| Tooltip::view(name, Some(keys), cx)),
+            cx,
+            f,
+        )
+    };
+    div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap(px(1.0))
+        .child(button("rc-quantize", "quantize", "Quantize", "Q".into(), cx, |a| {
+            editing::quantize(&mut a.session, &a.ui.edit)
+        }))
+        .child(button(
+            "rc-split",
+            "split",
+            "Split at Playhead",
+            format!("{cmd}T"),
+            cx,
+            |a| editing::split_at_playhead(&mut a.session, &mut a.ui.edit),
+        ))
+        .child(button(
+            "rc-join",
+            "join",
+            "Join Regions",
+            format!("{cmd}J"),
+            cx,
+            |a| editing::join(&mut a.session, &mut a.ui.edit),
+        ))
 }
 
 fn snap_picker(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {

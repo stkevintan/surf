@@ -85,6 +85,21 @@ const ICONS: &[(&str, &str)] = &[
         r#"<circle cx="8" cy="8" r="5.8"/><circle cx="8" cy="8" r="2"/>"#,
     ),
     ("plus", r#"<path d="M8 3v10M3 8h10"/>"#),
+    // Notes snapping to grid lines.
+    (
+        "quantize",
+        r#"<path d="M2.5 2.5v11M8 2.5v11M13.5 2.5v11" stroke-width="1"/><rect x="2.5" y="4.5" width="4" height="2.4" rx=".6" fill="black" stroke="none"/><rect x="8" y="9" width="4" height="2.4" rx=".6" fill="black" stroke="none"/>"#,
+    ),
+    // A region cut in two at a line.
+    (
+        "split",
+        r#"<rect x="1.5" y="5" width="5" height="6" rx="1"/><rect x="9.5" y="5" width="5" height="6" rx="1"/><path d="M8 2v12" stroke-dasharray="1.6 1.4"/>"#,
+    ),
+    // Two regions becoming one.
+    (
+        "join",
+        r#"<rect x="1.5" y="5" width="13" height="6" rx="1"/><path d="M6 8h4M8.5 6.5L10 8l-1.5 1.5"/>"#,
+    ),
     ("close", r#"<path d="M4 4l8 8M12 4l-8 8"/>"#),
     (
         "maximize",
