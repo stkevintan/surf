@@ -773,6 +773,17 @@ fn cursor_for(app: &SurfApp) -> CursorStyle {
     }
 }
 
+/// Play `key` so a click on the keyboard can be heard.
+/// Play a note being clicked, drawn or dragged in the grid. Not during
+/// playback: the edit itself is heard then, since the engine follows each
+/// drag move, and an audition would share the playing note's voice, so its
+/// note-off on release would cut that note.
+fn audition_edit(app: &mut SurfApp, key: u8, velocity: u8) {
+    if !app.session.engine.playing {
+        audition(app, key, velocity);
+    }
+}
+
 fn audition(app: &mut SurfApp, key: u8, velocity: u8) {
     if let Some(old) = app.ui.mouse_key.take() {
         app.session
@@ -874,7 +885,7 @@ pub(crate) fn pointer_down(app: &mut SurfApp, e: &MouseDownEvent) {
                     app.ui.drag = Some(if edge {
                         Drag::ResizeNotes { x0: x, notes }
                     } else {
-                        audition(app, lead.key, lead.velocity);
+                        audition_edit(app, lead.key, lead.velocity);
                         Drag::MoveNotes {
                             x0: x,
                             y0: y,
@@ -890,7 +901,7 @@ pub(crate) fn pointer_down(app: &mut SurfApp, e: &MouseDownEvent) {
                     if let Some(id) =
                         editing::create_note(&mut app.session, &mut app.ui.edit, start, key, grid)
                     {
-                        audition(app, key, app.ui.edit.new_velocity);
+                        audition_edit(app, key, app.ui.edit.new_velocity);
                         // Keep dragging to stretch the new note.
                         app.ui.drag = Some(Drag::ResizeNotes {
                             x0: x,
@@ -982,7 +993,7 @@ pub(crate) fn pointer_move(app: &mut SurfApp, e: &MouseMoveEvent) -> bool {
             let keys = -((y - y0) / size::ROLL_ROW_H).round() as i32;
             let new_key = (lead_key as i32 + keys).clamp(0, 127) as u8;
             if app.ui.mouse_key != Some(new_key) {
-                audition(app, new_key, app.ui.edit.new_velocity);
+                audition_edit(app, new_key, app.ui.edit.new_velocity);
             }
             if copy {
                 let (edit, ids) = copy_notes(&mut app.session.project, region, &notes, ticks, keys);

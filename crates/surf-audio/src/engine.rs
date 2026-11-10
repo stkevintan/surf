@@ -149,10 +149,12 @@ struct Core {
     /// capacity is reserved up front, so holding one never allocates; past
     /// that, the newest still waits in `timeline` until the next update.
     retired: Vec<Timeline>,
-    /// Scratch for `update`: which notes of the new timeline are sounding.
-    matched: Vec<bool>,
     shared: Arc<Shared>,
 }
+
+/// Notes the engine tracks at once. Beyond this, new ones are dropped
+/// instead of growing the list in the audio callback.
+const MAX_ACTIVE: usize = 512;
 
 /// Retired timelines `Core` can hold without allocating, beyond `trash`.
 const RETIRED_CAP: usize = 64;
@@ -172,7 +174,7 @@ impl Core {
             sustain: false,
             timeline: None,
             next_note: 0,
-            active: Vec::with_capacity(256),
+            active: Vec::with_capacity(MAX_ACTIVE),
             ended: Vec::with_capacity(256),
             pos_frames: 0,
             duration_frames: 0,
@@ -184,7 +186,6 @@ impl Core {
             slot_buf: vec![0.0; CHUNK * 2],
             trash,
             retired: Vec::with_capacity(RETIRED_CAP),
-            matched: Vec::new(),
             shared,
         }
     }
@@ -339,21 +340,19 @@ impl Core {
         let started = timeline.notes.partition_point(|n| frame(n.start) < pos);
         let now = &timeline.notes[..started];
 
-        // Pair each sounding note with one note of the new timeline that
-        // covers now on the same track (by stable id) and key. Keep it,
-        // with the new end; stop it if it has no match.
-        let matched = &mut self.matched;
-        matched.clear();
-        matched.resize(started, false);
+        // Keep a sounding note if the new timeline still has it: same track
+        // (by stable id) and key, covering now. Move its end to the new
+        // end; stop it otherwise. Nothing here allocates: this runs in the
+        // audio callback.
         let ended = &mut self.ended;
         ended.clear();
         self.active.retain_mut(|a| {
-            let found = now.iter().enumerate().rev().find(|(i, n)| {
-                !matched[*i] && n.track_id == a.track_id && n.key == a.key && covers(n)
-            });
+            let found = now
+                .iter()
+                .rev()
+                .find(|n| n.track_id == a.track_id && n.key == a.key && covers(n));
             match found {
-                Some((i, n)) => {
-                    matched[i] = true;
+                Some(n) => {
                     a.end_frame = frame(n.end).max(pos + 1);
                     true
                 }
@@ -370,11 +369,19 @@ impl Core {
         }
 
         // While playing, start edited notes that now cover the playhead but
-        // weren't sounding: one dragged back under it, or a new one drawn
-        // there. Paused, Resume picks up at `started` like any seek.
+        // aren't sounding: one dragged back under it, or a new one drawn
+        // there. A voice is one (track, key), as on an instrument, so a key
+        // that is already sounding isn't started twice. Paused, Resume picks
+        // up at `started` like any seek.
         if self.playing {
-            for (i, n) in now.iter().enumerate() {
-                if self.matched[i] || !covers(n) {
+            for n in now.iter().filter(|n| covers(n)) {
+                let sounding = self
+                    .active
+                    .iter()
+                    .any(|a| a.track_id == n.track_id && a.key == n.key);
+                // Only start what can be tracked, so every note-on gets its
+                // note-off.
+                if sounding || self.active.len() == self.active.capacity() {
                     continue;
                 }
                 let route = self.routes.get(n.track as usize).copied().unwrap_or_default();
@@ -382,15 +389,13 @@ impl Core {
                 else {
                     continue;
                 };
-                if self.active.len() < self.active.capacity() {
-                    inst.note_on(route.channel, n.key, n.velocity);
-                    self.active.push(ActiveNote {
-                        track_id: n.track_id,
-                        route,
-                        key: n.key,
-                        end_frame: frame(n.end).max(pos + 1),
-                    });
-                }
+                inst.note_on(route.channel, n.key, n.velocity);
+                self.active.push(ActiveNote {
+                    track_id: n.track_id,
+                    route,
+                    key: n.key,
+                    end_frame: frame(n.end).max(pos + 1),
+                });
             }
         }
 
@@ -529,6 +534,10 @@ impl Core {
                 .get(note.track as usize)
                 .copied()
                 .unwrap_or_default();
+            // At the cap, drop the note rather than grow `active` here.
+            if self.active.len() == self.active.capacity() {
+                continue;
+            }
             let Some(i) = self.slots.get_mut(route.slot as usize).and_then(Option::as_mut) else {
                 continue;
             };
@@ -1191,6 +1200,64 @@ mod tests {
         c.apply(Command::Update { timeline: tl() });
         assert_eq!(ui.len(), 2, "held ones go out once there's room");
         assert_eq!(c.retired.len(), 2);
+    }
+
+
+    /// Review: `update` must not allocate in the callback. The list it
+    /// tracks notes in keeps its reserved capacity, and nothing else grows.
+    #[test]
+    fn update_keeps_the_note_list_within_its_reserve() {
+        let (mut c, _log) = probe_core();
+        let cap = c.active.capacity();
+        // Far more notes under the playhead than the list can hold.
+        let crowd: Vec<TimedNote> = (0..cap + 50)
+            .map(|i| {
+                let mut n = long((i % 2) as u16, (i % 128) as u8, 0.0, 1.0);
+                n.track_id = 1000 + (i / 128) as u64;
+                n
+            })
+            .collect();
+        c.apply(Command::Play {
+            timeline: Timeline { notes: Vec::new(), duration: 1.0 },
+            from: 0.0,
+        });
+        run(&mut c, 4800);
+        c.apply(Command::Update { timeline: Timeline { notes: crowd.clone(), duration: 1.0 } });
+        c.apply(Command::Update { timeline: Timeline { notes: crowd, duration: 1.0 } });
+        assert_eq!(c.active.capacity(), cap, "never grew");
+        assert!(c.active.len() <= cap);
+    }
+
+    /// Review: every note-on gets tracked, so it gets its note-off. Past
+    /// the cap, notes are not started at all.
+    #[test]
+    fn notes_past_the_cap_are_not_started_untracked() {
+        let (mut c, log) = probe_core();
+        let cap = c.active.capacity();
+        // 2 tracks x 128 keys = 256 distinct voices; pad with a third track.
+        let mut notes = Vec::new();
+        for t in 0..((cap / 128) + 1) as u16 {
+            for k in 0..128u8 {
+                let mut n = long(t % 2, k, 0.0, 1.0);
+                n.track_id = 500 + t as u64;
+                notes.push(n);
+            }
+        }
+        assert!(notes.len() > cap);
+        c.apply(Command::Play {
+            timeline: Timeline { notes: Vec::new(), duration: 1.0 },
+            from: 0.0,
+        });
+        run(&mut c, 4800);
+        log.lock().clear();
+        c.apply(Command::Update { timeline: Timeline { notes, duration: 1.0 } });
+        let ons = log.lock().iter().filter(|e| e.2).count();
+        assert_eq!(ons, c.active.len(), "every started note is tracked");
+        assert_eq!(ons, cap);
+        // Play to the end: every one of them is released.
+        run(&mut c, 48_000);
+        let offs = log.lock().iter().filter(|e| !e.2).count();
+        assert_eq!(offs, ons, "no stuck notes");
     }
 
 }
