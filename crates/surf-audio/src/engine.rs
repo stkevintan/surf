@@ -175,7 +175,7 @@ impl Core {
             timeline: None,
             next_note: 0,
             active: Vec::with_capacity(MAX_ACTIVE),
-            ended: Vec::with_capacity(256),
+            ended: Vec::with_capacity(MAX_ACTIVE),
             pos_frames: 0,
             duration_frames: 0,
             playing: false,
