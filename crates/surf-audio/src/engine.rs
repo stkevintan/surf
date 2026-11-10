@@ -382,8 +382,8 @@ impl Core {
                 else {
                     continue;
                 };
-                inst.note_on(route.channel, n.key, n.velocity);
                 if self.active.len() < self.active.capacity() {
+                    inst.note_on(route.channel, n.key, n.velocity);
                     self.active.push(ActiveNote {
                         track_id: n.track_id,
                         route,
