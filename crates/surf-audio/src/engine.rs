@@ -15,7 +15,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use parking_lot::Mutex;
 
 use super::Instrument;
-use surf_core::song::Timeline;
+use surf_core::song::{TimedNote, Timeline};
 
 const CHUNK: usize = 64;
 const MAX_BLOCK: usize = 8192;
@@ -111,7 +111,8 @@ struct Shared {
 }
 
 struct ActiveNote {
-    track: u16,
+    /// The track's stable id, to find the note again after an edit.
+    track_id: u64,
     route: Route,
     key: u8,
     end_frame: u64,
@@ -144,8 +145,17 @@ struct Core {
     /// Replaced timelines go back to the UI thread to be freed, so the audio
     /// callback doesn't call the allocator.
     trash: crossbeam_channel::Sender<Timeline>,
+    /// Timelines that didn't fit in `trash`, kept until a slot frees. Its
+    /// capacity is reserved up front, so holding one never allocates; past
+    /// that, the newest still waits in `timeline` until the next update.
+    retired: Vec<Timeline>,
+    /// Scratch for `update`: which notes of the new timeline are sounding.
+    matched: Vec<bool>,
     shared: Arc<Shared>,
 }
+
+/// Retired timelines `Core` can hold without allocating, beyond `trash`.
+const RETIRED_CAP: usize = 64;
 
 impl Core {
     fn new(
@@ -173,6 +183,8 @@ impl Core {
             scratch: vec![0.0; MAX_BLOCK * 2],
             slot_buf: vec![0.0; CHUNK * 2],
             trash,
+            retired: Vec::with_capacity(RETIRED_CAP),
+            matched: Vec::new(),
             shared,
         }
     }
@@ -322,17 +334,26 @@ impl Core {
         let sr = self.sample_rate;
         let pos = self.pos_frames;
         let frame = |t: f64| (t * sr) as u64;
-        // Notes that started before now: the ones already triggered.
+        let covers = |n: &TimedNote| frame(n.start) < pos && frame(n.end) > pos;
+        // Notes that started before now. Those after it play as usual.
         let started = timeline.notes.partition_point(|n| frame(n.start) < pos);
+        let now = &timeline.notes[..started];
+
+        // Pair each sounding note with one note of the new timeline that
+        // covers now on the same track (by stable id) and key. Keep it,
+        // with the new end; stop it if it has no match.
+        let matched = &mut self.matched;
+        matched.clear();
+        matched.resize(started, false);
         let ended = &mut self.ended;
         ended.clear();
         self.active.retain_mut(|a| {
-            let same = timeline.notes[..started]
-                .iter()
-                .rev()
-                .find(|n| n.track == a.track && n.key == a.key && frame(n.end) > pos);
-            match same {
-                Some(n) => {
+            let found = now.iter().enumerate().rev().find(|(i, n)| {
+                !matched[*i] && n.track_id == a.track_id && n.key == a.key && covers(n)
+            });
+            match found {
+                Some((i, n)) => {
+                    matched[i] = true;
                     a.end_frame = frame(n.end).max(pos + 1);
                     true
                 }
@@ -347,14 +368,60 @@ impl Core {
                 i.note_off(route.channel, key);
             }
         }
+
+        // While playing, start edited notes that now cover the playhead but
+        // weren't sounding: one dragged back under it, or a new one drawn
+        // there. Paused, Resume picks up at `started` like any seek.
+        if self.playing {
+            for (i, n) in now.iter().enumerate() {
+                if self.matched[i] || !covers(n) {
+                    continue;
+                }
+                let route = self.routes.get(n.track as usize).copied().unwrap_or_default();
+                let Some(inst) = self.slots.get_mut(route.slot as usize).and_then(Option::as_mut)
+                else {
+                    continue;
+                };
+                inst.note_on(route.channel, n.key, n.velocity);
+                if self.active.len() < self.active.capacity() {
+                    self.active.push(ActiveNote {
+                        track_id: n.track_id,
+                        route,
+                        key: n.key,
+                        end_frame: frame(n.end).max(pos + 1),
+                    });
+                }
+            }
+        }
+
         self.next_note = started;
         self.duration_frames = (timeline.duration * sr).ceil() as u64;
         self.shared
             .duration_frames
             .store(self.duration_frames, Ordering::Relaxed);
         if let Some(old) = self.timeline.replace(timeline) {
-            // Full only if the UI stopped draining; then free it here.
-            let _ = self.trash.try_send(old);
+            self.retire(old);
+        }
+    }
+
+    /// Send a replaced timeline to the UI thread to be freed. If the channel
+    /// is full, hold it (and any earlier ones) until it has room, so the
+    /// audio thread never frees one.
+    fn retire(&mut self, old: Timeline) {
+        while let Some(t) = self.retired.pop() {
+            if let Err(e) = self.trash.try_send(t) {
+                self.retired.push(e.into_inner());
+                break;
+            }
+        }
+        if let Err(e) = self.trash.try_send(old) {
+            let old = e.into_inner();
+            if self.retired.len() < self.retired.capacity() {
+                self.retired.push(old);
+            } else {
+                // Only if the UI has stopped draining for a long time.
+                drop(old);
+            }
         }
     }
 
@@ -468,7 +535,7 @@ impl Core {
             i.note_on(route.channel, note.key, note.velocity);
             let note_end = ((note.end * self.sample_rate) as u64).max(note_start + 1);
             self.active.push(ActiveNote {
-                track: note.track,
+                track_id: note.track_id,
                 route,
                 key: note.key,
                 end_frame: note_end,
@@ -806,7 +873,6 @@ fn open_output() -> Result<(cpal::Device, u32, u16, String)> {
 mod tests {
     use super::*;
     use cpal::ErrorKind;
-    use surf_core::song::TimedNote;
 
     type Log = Arc<parking_lot::Mutex<Vec<(u8, u8, bool)>>>;
 
@@ -852,6 +918,7 @@ mod tests {
             velocity: 100,
             channel: 0,
             track,
+            track_id: 100 + track as u64,
             start,
             end: start + 0.01,
         }
@@ -940,6 +1007,7 @@ mod tests {
             velocity: 100,
             channel: 0,
             track,
+            track_id: 100 + track as u64,
             start,
             end,
         }
@@ -1039,6 +1107,90 @@ mod tests {
         run(&mut c, 48_000);
         let ons: Vec<u8> = log.lock().iter().filter(|e| e.2).map(|e| e.1).collect();
         assert_eq!(ons, vec![72]);
+    }
+
+
+    /// Review: deleting a track shifts the others' indices. Their sounding
+    /// notes must keep sounding, since they're matched by stable id.
+    #[test]
+    fn deleting_a_track_keeps_the_others_sounding() {
+        let (mut c, log) = probe_core();
+        // Track 0 (id 100) is empty; track 1 (id 101) holds a chord.
+        let a = long(1, 60, 0.0, 1.0);
+        let b = long(1, 64, 0.0, 1.0);
+        c.apply(Command::Play {
+            timeline: Timeline { notes: vec![a, b], duration: 1.0 },
+            from: 0.0,
+        });
+        run(&mut c, 4800);
+        log.lock().clear();
+        // Delete track 0: track 1 becomes index 0, same id.
+        let shift = |mut n: TimedNote| {
+            n.track = 0;
+            n
+        };
+        c.apply(Command::SetRoutes(vec![Route { slot: 1, channel: 1 }]));
+        c.apply(Command::Update {
+            timeline: Timeline { notes: vec![shift(a), shift(b)], duration: 1.0 },
+        });
+        assert!(log.lock().is_empty(), "no note-offs: {:?}", log.lock());
+    }
+
+    /// Review: a note dragged back under the playhead sounds again, and a
+    /// note drawn under it starts right away.
+    #[test]
+    fn a_note_moved_under_the_playhead_starts_sounding() {
+        let (mut c, log) = probe_core();
+        let held = long(0, 60, 0.0, 1.0);
+        c.apply(Command::Play {
+            timeline: Timeline { notes: vec![held], duration: 2.0 },
+            from: 0.0,
+        });
+        run(&mut c, 4800); // 0.1 s
+        // Drag it ahead, off the playhead: it stops.
+        c.apply(Command::Update {
+            timeline: Timeline { notes: vec![long(0, 60, 0.5, 1.5)], duration: 2.0 },
+        });
+        assert_eq!(log.lock().last(), Some(&(0, 60, false)));
+        log.lock().clear();
+        // Drag it back under the playhead: it sounds again, once.
+        c.apply(Command::Update {
+            timeline: Timeline { notes: vec![held], duration: 2.0 },
+        });
+        assert_eq!(*log.lock(), vec![(0, 60, true)]);
+        // Another update with nothing changed doesn't retrigger it.
+        c.apply(Command::Update {
+            timeline: Timeline { notes: vec![held], duration: 2.0 },
+        });
+        assert_eq!(log.lock().len(), 1, "no retrigger: {:?}", log.lock());
+    }
+
+    /// Review: with the UI not draining, replaced timelines are held, not
+    /// freed on the audio thread; they go out once the channel has room.
+    #[test]
+    fn replaced_timelines_wait_when_the_channel_is_full() {
+        let shared = Arc::new(Shared {
+            position_frames: AtomicU64::new(0),
+            duration_frames: AtomicU64::new(0),
+            playing: AtomicBool::new(false),
+            peak: AtomicU32::new(0),
+            slot_peaks: std::array::from_fn(|_| AtomicU32::new(0)),
+            sample_rate: AtomicU32::new(48_000),
+            glitches: AtomicU32::new(0),
+        });
+        let (trash, ui) = crossbeam_channel::bounded(2);
+        let mut c = Core::new(48_000, shared, trash);
+        let tl = || Timeline { notes: vec![long(0, 60, 0.0, 1.0)], duration: 1.0 };
+        c.apply(Command::Play { timeline: tl(), from: 0.0 });
+        for _ in 0..5 {
+            c.apply(Command::Update { timeline: tl() });
+        }
+        assert_eq!(ui.len(), 2, "channel full");
+        assert_eq!(c.retired.len(), 3, "the rest held, not freed");
+        while ui.try_recv().is_ok() {}
+        c.apply(Command::Update { timeline: tl() });
+        assert_eq!(ui.len(), 2, "held ones go out once there's room");
+        assert_eq!(c.retired.len(), 2);
     }
 
 }

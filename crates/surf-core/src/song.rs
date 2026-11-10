@@ -45,6 +45,10 @@ pub struct TimedNote {
     /// Index of the project track it plays on, which picks its instrument.
     /// 0 for a plain song.
     pub track: u16,
+    /// The track's stable id (`project::Id.0`), which survives tracks being
+    /// added or removed around it. The engine matches sounding notes across
+    /// an edit by this, not by `track`. 0 for a plain song.
+    pub track_id: u64,
     pub start: f64,
     pub end: f64,
 }
@@ -276,6 +280,7 @@ impl Song {
                 velocity: n.velocity,
                 channel: n.channel,
                 track: 0,
+                track_id: 0,
                 start: self.tick_to_sec(n.start_tick),
                 end: self.tick_to_sec(n.end_tick()),
             })

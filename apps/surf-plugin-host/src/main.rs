@@ -664,6 +664,7 @@ fn timeline_from_notes(notes: &[RenderNote], duration: f64) -> Timeline {
                 velocity: n.velocity,
                 channel: n.channel,
                 track: 0,
+                track_id: 0,
                 start: n.start,
                 end: n.end,
             })
