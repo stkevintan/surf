@@ -160,6 +160,9 @@ struct Core {
     /// front, so holding one never allocates; past that, the newest still waits in
     /// `timeline` until the next update.
     retired: Vec<Retired>,
+    /// A command that would retire a payload, held while `retired` is full so the
+    /// callback never frees it. Applied (before anything newer) once there is room.
+    deferred: Option<Command>,
     shared: Arc<Shared>,
 }
 
@@ -197,6 +200,7 @@ impl Core {
             slot_buf: vec![0.0; CHUNK * 2],
             trash,
             retired: Vec::with_capacity(RETIRED_CAP),
+            deferred: None,
             shared,
         }
     }
@@ -440,7 +444,8 @@ impl Core {
             if self.retired.len() < self.retired.capacity() {
                 self.retired.push(old);
             } else {
-                // Only if the UI has stopped draining for a long time.
+                // `drain` defers retiring commands until there is room, so the
+                // callback never gets here; only a direct `apply` (tests) can.
                 drop(old);
             }
         }
@@ -454,8 +459,97 @@ impl Core {
         self.shared.position_frames.store(0, Ordering::Release);
     }
 
+    /// Apply queued commands. A command that hands a timeline or route list back
+    /// for freeing waits (with everything queued after it, so order is kept) while
+    /// the retirement storage is full, rather than be applied and freed here.
+    fn drain(&mut self, rx: &crossbeam_channel::Receiver<Command>) {
+        if let Some(command) = self.deferred.take() {
+            if !self.has_retire_room() {
+                self.deferred = Some(command);
+                return;
+            }
+            self.apply(command);
+        }
+        while let Ok(command) = rx.try_recv() {
+            let retires = matches!(
+                command,
+                Command::Play { .. } | Command::Update { .. } | Command::SetRoutes(_)
+            );
+            if retires && !self.has_retire_room() {
+                self.deferred = Some(command);
+                return;
+            }
+            self.apply(command);
+        }
+    }
+
+    /// Whether one more replaced payload can be retired without freeing it here.
+    fn has_retire_room(&mut self) -> bool {
+        while let Some(t) = self.retired.pop() {
+            if let Err(e) = self.trash.try_send(t) {
+                self.retired.push(e.into_inner());
+                break;
+            }
+        }
+        self.retired.len() < self.retired.capacity()
+    }
+
+    /// Fill a device buffer of `channels` interleaved channels. `render` stops at
+    /// MAX_BLOCK, so a larger buffer is rendered in pieces; the meters then report
+    /// the loudest of all pieces, not just the last.
+    fn fill_output(&mut self, data: &mut [f32], channels: usize) {
+        let channels = channels.max(1);
+        let frames = data.len() / channels;
+        let mut peak = 0.0f32;
+        let mut slot_peaks = [0.0f32; MAX_SLOTS];
+        let mut rendered = 0usize;
+        while rendered < frames {
+            let piece = (frames - rendered).min(MAX_BLOCK);
+            let (p, slots) = self.render_piece(piece);
+            peak = peak.max(p);
+            for (max, s) in slot_peaks.iter_mut().zip(slots) {
+                *max = max.max(s);
+            }
+            for frame in 0..piece {
+                let l = self.scratch[frame * 2];
+                let r = self.scratch[frame * 2 + 1];
+                let at = rendered + frame;
+                if channels == 1 {
+                    data[at] = (l + r) * 0.5;
+                } else {
+                    data[at * channels] = l;
+                    data[at * channels + 1] = r;
+                    for ch in 2..channels {
+                        data[at * channels + ch] = (l + r) * 0.5;
+                    }
+                }
+            }
+            rendered += piece;
+        }
+        self.publish(peak, slot_peaks);
+    }
+
     /// Render interleaved stereo frames into `scratch` and return that slice.
     fn render(&mut self, frames: usize) -> &[f32] {
+        let frames = frames.min(MAX_BLOCK);
+        let (peak, slot_peaks) = self.render_piece(frames);
+        self.publish(peak, slot_peaks);
+        &self.scratch[..frames * 2]
+    }
+
+    fn publish(&self, peak: f32, slot_peaks: [f32; MAX_SLOTS]) {
+        self.shared
+            .position_frames
+            .store(self.pos_frames, Ordering::Release);
+        self.shared.peak.store(peak.to_bits(), Ordering::Relaxed);
+        for (cell, p) in self.shared.slot_peaks.iter().zip(slot_peaks) {
+            cell.store(p.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    /// Render up to MAX_BLOCK frames into `scratch`; returns the master and slot
+    /// peaks without publishing them.
+    fn render_piece(&mut self, frames: usize) -> (f32, [f32; MAX_SLOTS]) {
         let frames = frames.min(MAX_BLOCK);
         let mut done = 0usize;
         let mut peak = 0.0f32;
@@ -502,15 +596,7 @@ impl Core {
             }
             done += chunk;
         }
-
-        self.shared
-            .position_frames
-            .store(self.pos_frames, Ordering::Release);
-        self.shared.peak.store(peak.to_bits(), Ordering::Relaxed);
-        for (cell, p) in self.shared.slot_peaks.iter().zip(slot_peaks) {
-            cell.store(p.to_bits(), Ordering::Relaxed);
-        }
-        &self.scratch[..frames * 2]
+        (peak, slot_peaks)
     }
 
     fn trigger(&mut self, start: u64, end: u64) {
@@ -644,34 +730,8 @@ impl AudioEngine {
                                 data.fill(0.0);
                                 return;
                             };
-                            while let Ok(command) = rx.try_recv() {
-                                core.apply(command);
-                            }
-                            let channels = channels as usize;
-                            let frames = data.len() / channels.max(1);
-                            // `render` caps at MAX_BLOCK, so a device that hands over more
-                            // frames than that would index past the scratch buffer. Render
-                            // in pieces instead.
-                            let mut rendered = 0usize;
-                            while rendered < frames {
-                                let piece = (frames - rendered).min(MAX_BLOCK);
-                                let stereo = core.render(piece);
-                                for frame in 0..piece {
-                                    let l = stereo[frame * 2];
-                                    let r = stereo[frame * 2 + 1];
-                                    let at = rendered + frame;
-                                    if channels == 1 {
-                                        data[at] = (l + r) * 0.5;
-                                    } else {
-                                        data[at * channels] = l;
-                                        data[at * channels + 1] = r;
-                                        for ch in 2..channels {
-                                            data[at * channels + ch] = (l + r) * 0.5;
-                                        }
-                                    }
-                                }
-                                rendered += piece;
-                            }
+                            core.drain(&rx);
+                            core.fill_output(data, channels as usize);
                         },
                         err_fn,
                         None,
@@ -709,9 +769,7 @@ impl AudioEngine {
                         let start = Instant::now();
                         let mut produced_frames = 0u64;
                         while !thread_stop.load(Ordering::Acquire) {
-                            while let Ok(command) = rx.try_recv() {
-                                thread_core.lock().apply(command);
-                            }
+                            thread_core.lock().drain(&rx);
                             let elapsed = start.elapsed().as_secs_f64();
                             let target = (elapsed * sample_rate as f64) as u64;
                             while produced_frames < target {
@@ -1225,6 +1283,128 @@ mod tests {
         c.apply(Command::Update { timeline: tl() });
         assert_eq!(ui.len(), 2, "held ones go out once there's room");
         assert_eq!(c.retired.len(), 2);
+    }
+
+    /// Review: with the trash channel and the reserve both full, a command that
+    /// would retire a payload waits in the queue instead of freeing it in the
+    /// callback, and commands behind it keep their order.
+    #[test]
+    fn retiring_commands_wait_when_retirement_is_full() {
+        let shared = Arc::new(Shared {
+            position_frames: AtomicU64::new(0),
+            duration_frames: AtomicU64::new(0),
+            playing: AtomicBool::new(false),
+            peak: AtomicU32::new(0),
+            slot_peaks: std::array::from_fn(|_| AtomicU32::new(0)),
+            sample_rate: AtomicU32::new(48_000),
+            glitches: AtomicU32::new(0),
+        });
+        let (trash, ui) = crossbeam_channel::bounded::<Retired>(2);
+        let mut c = Core::new(48_000, shared, trash);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let tl = || Timeline {
+            notes: vec![long(0, 60, 0.0, 1.0)],
+            duration: 1.0,
+        };
+        let total = 2 + RETIRED_CAP + 5;
+        for _ in 0..total {
+            tx.send(Command::Update { timeline: tl() }).unwrap();
+        }
+        tx.send(Command::SetVolume(0.25)).unwrap();
+        c.drain(&rx);
+        assert_eq!(ui.len(), 2);
+        assert_eq!(
+            c.retired.len(),
+            RETIRED_CAP,
+            "the reserve fills, nothing is dropped"
+        );
+        assert!(c.deferred.is_some(), "the next retiring command waits");
+        assert_eq!(c.volume, 0.9, "commands behind it wait too");
+        // The UI drains; everything goes through in order and nothing was freed here.
+        let mut freed = 0;
+        for _ in 0..total {
+            while ui.try_recv().is_ok() {
+                freed += 1;
+            }
+            c.drain(&rx);
+        }
+        while ui.try_recv().is_ok() {
+            freed += 1;
+        }
+        freed += c.retired.len();
+        assert!(c.deferred.is_none());
+        assert_eq!(c.volume, 0.25);
+        // Every replaced timeline came back: one per update but the live one.
+        assert_eq!(freed, total - 1);
+    }
+
+    /// Review: the device callback path, without a device. A buffer larger than
+    /// MAX_BLOCK with a partial last piece fills every frame, the position moves by
+    /// the whole buffer, and the meters keep the loudest piece.
+    #[test]
+    fn large_device_buffers_fill_every_frame() {
+        for channels in [1usize, 2, 4] {
+            let (mut c, _log) = probe_core();
+            c.apply(Command::Play {
+                timeline: Timeline {
+                    notes: Vec::new(),
+                    duration: 10.0,
+                },
+                from: 0.0,
+            });
+            let frames = MAX_BLOCK * 2 + 100;
+            let mut data = vec![f32::NAN; frames * channels];
+            c.fill_output(&mut data, channels);
+            // Probe writes 0.5 to both channels; at volume 0.9 that is 0.45.
+            assert!(
+                data.iter().all(|s| (s - 0.45).abs() < 1e-6),
+                "{channels} channels: every sample written"
+            );
+            assert_eq!(c.pos_frames, frames as u64);
+            let peak = f32::from_bits(c.shared.peak.load(Ordering::Relaxed));
+            assert!((peak - 0.45).abs() < 1e-6);
+        }
+    }
+
+    /// Sound only in its first `left` frames, then silence.
+    struct Burst {
+        left: usize,
+    }
+
+    impl Instrument for Burst {
+        fn note_on(&mut self, _: u8, _: u8, _: u8) {}
+        fn note_off(&mut self, _: u8, _: u8) {}
+        fn all_notes_off(&mut self) {}
+        fn set_sustain(&mut self, _: u8, _: bool) {}
+        fn process(&mut self, out: &mut [f32], frames: usize) {
+            let loud = frames.min(self.left);
+            out[..loud * 2].fill(0.5);
+            out[loud * 2..frames * 2].fill(0.0);
+            self.left -= loud;
+        }
+        fn name(&self) -> &str {
+            "burst"
+        }
+    }
+
+    /// Review: a loud first piece followed by a silent tail must still show on the
+    /// meters; publishing per piece would leave only the silent last one.
+    #[test]
+    fn meters_keep_the_loudest_piece_of_a_large_buffer() {
+        let mut c = core();
+        c.apply(Command::SetSlot {
+            slot: 0,
+            instrument: Some(Box::new(Burst { left: MAX_BLOCK })),
+            ack: None,
+        });
+        let mut data = vec![0.0; (MAX_BLOCK * 2 + 100) * 2];
+        c.fill_output(&mut data, 2);
+        assert!(data[..MAX_BLOCK * 2].iter().all(|s| *s > 0.0));
+        assert!(data[MAX_BLOCK * 2..].iter().all(|s| *s == 0.0));
+        let peak = f32::from_bits(c.shared.peak.load(Ordering::Relaxed));
+        let slot = f32::from_bits(c.shared.slot_peaks[0].load(Ordering::Relaxed));
+        assert!((peak - 0.45).abs() < 1e-6, "master peak {peak}");
+        assert!((slot - 0.5).abs() < 1e-6, "slot peak {slot}");
     }
 
     /// Review: a replaced route list is a `Vec`, and a big one is freed with `munmap`.
