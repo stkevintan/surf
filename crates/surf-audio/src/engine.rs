@@ -463,8 +463,11 @@ impl Core {
     /// for freeing waits (with everything queued after it, so order is kept) while
     /// the retirement storage is full, rather than be applied and freed here.
     fn drain(&mut self, rx: &crossbeam_channel::Receiver<Command>) {
+        // Hand held payloads back on every call, even with nothing queued, so the
+        // reserve empties as soon as the UI makes room.
+        let room = self.has_retire_room();
         if let Some(command) = self.deferred.take() {
-            if !self.has_retire_room() {
+            if !room {
                 self.deferred = Some(command);
                 return;
             }
@@ -1336,21 +1339,19 @@ mod tests {
         assert!(c.deferred.is_some(), "the next retiring command waits");
         assert_eq!(c.volume, 0.9, "commands behind it wait too");
         // The UI drains; everything goes through in order and nothing was freed here.
-        let mut freed = 0;
-        for _ in 0..total {
+        // Count only what the UI received: the core keeps nothing once it is idle.
+        let mut received = 0;
+        for _ in 0..total + RETIRED_CAP {
             while ui.try_recv().is_ok() {
-                freed += 1;
+                received += 1;
             }
             c.drain(&rx);
         }
-        while ui.try_recv().is_ok() {
-            freed += 1;
-        }
-        freed += c.retired.len();
         assert!(c.deferred.is_none());
         assert_eq!(c.volume, 0.25);
+        assert!(c.retired.is_empty(), "idle drains flush the reserve");
         // Every replaced timeline came back: one per update but the live one.
-        assert_eq!(freed, total - 1);
+        assert_eq!(received, total - 1);
     }
 
     /// Review: a burst that fills retirement, then `Stop` and nothing else sent.
