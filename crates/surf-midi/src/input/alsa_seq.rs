@@ -32,12 +32,24 @@ impl Drop for Connection {
     }
 }
 
+/// The ALSA sequencer's own client (`SND_SEQ_CLIENT_SYSTEM`). Its `Timer` and
+/// `Announce` ports are readable and subscribable, but they carry timer ticks and
+/// port announcements, never notes.
+const SYSTEM_CLIENT: i32 = 0;
+
+/// Whether a client's ports can be a MIDI input for Surf: not Surf itself, and not
+/// the sequencer's System client. Listing `System: Timer` first made Surf
+/// auto-connect to it on start, so the keyboard stayed silent.
+fn is_input_client(client: i32, own: i32) -> bool {
+    client != own && client != SYSTEM_CLIENT
+}
+
 /// Readable, subscribable ports from other clients, in a stable order.
 fn sources(seq: &Seq) -> Vec<(Addr, String)> {
     let own = seq.client_id().unwrap_or(-1);
     let mut out = Vec::new();
     for client in ClientIter::new(seq) {
-        if client.get_client() == own {
+        if !is_input_client(client.get_client(), own) {
             continue;
         }
         let client_name = client.get_name().unwrap_or("").to_string();
@@ -141,5 +153,22 @@ fn read_loop(seq: Seq, deliver: Deliver, stop: Arc<AtomicBool>) {
             }
         }
         std::thread::sleep(Duration::from_millis(0));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SYSTEM_CLIENT, is_input_client};
+
+    #[test]
+    fn system_and_own_ports_are_not_inputs() {
+        let own = 128;
+        assert!(
+            !is_input_client(SYSTEM_CLIENT, own),
+            "System: Timer/Announce"
+        );
+        assert!(!is_input_client(own, own), "Surf's own port");
+        assert!(is_input_client(14, own), "Midi Through");
+        assert!(is_input_client(24, own), "a USB keyboard");
     }
 }
