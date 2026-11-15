@@ -147,7 +147,8 @@ impl Vst2Plugin {
             latency: self.latency,
             inputs: vec![vec![0.0; VST2_BLOCK]; self.input_channels],
             outputs: vec![vec![0.0; VST2_BLOCK]; self.output_channels],
-            pending_midi: Vec::with_capacity(64),
+            pending_midi: Vec::with_capacity(MAX_PENDING_MIDI),
+            events: EventBatch::with_capacity(MAX_PENDING_MIDI),
         }
     }
 
@@ -195,76 +196,104 @@ pub struct Vst2Instrument {
     /// the last, and anything sent in a cycle that never reached `process` vanished
     /// entirely. Queue here, flush in `process`.
     pending_midi: Vec<[u8; 3]>,
+    /// The last batch handed to `processEvents`, kept alive through the `process` that
+    /// follows it.
+    events: EventBatch,
 }
 
 impl Vst2Instrument {
     fn send_midi(&mut self, data: [u8; 3]) {
         // Bound the queue so a stalled audio thread cannot grow it without limit.
         // 512 messages is far more than a human can play into one block.
-        if self.pending_midi.len() < 512 {
+        if self.pending_midi.len() < MAX_PENDING_MIDI {
             self.pending_midi.push(data);
         }
     }
+}
 
-    /// Hand every queued message to the plugin as one `processEvents` batch.
+/// Most MIDI messages queued for one block; also the [`EventBatch`] capacity.
+const MAX_PENDING_MIDI: usize = 512;
+
+/// Words before the pointer array in a `VstEvents` block.
+///
+/// `api::Events` declares `events: [*mut Event; 2]`, but the VST2 ABI treats it as a
+/// variable-length array of `num_events` pointers, so the block is built by hand.
+/// `num_events` is an i32 followed by an isize, so repr(C) pads it out to isize
+/// alignment. Adding the two field sizes instead would place every pointer 4 bytes
+/// early on x64.
+const HEADER_WORDS: usize =
+    std::mem::offset_of!(api::Events, events) / std::mem::size_of::<usize>();
+
+/// Words in `api::Events` as declared, so a reference to the block never covers memory
+/// outside it, even with fewer than two events.
+const EVENTS_WORDS: usize = std::mem::size_of::<api::Events>() / std::mem::size_of::<usize>();
+
+/// One block's `VstEvents` and the MIDI events it points to.
+///
+/// VST2 lets a plugin keep the `VstEvents*` it got in `processEvents` and read the
+/// events in the following `processReplacing`; many do. So the block has to stay valid
+/// until that `process` returns. It lives in the instrument and is only rebuilt by the
+/// next [`fill`](Self::fill), after the previous `process` has returned.
+///
+/// Both buffers are allocated once at full capacity, so filling never reallocates on the
+/// audio thread and never moves events a plugin may still point at.
+struct EventBatch {
+    events: Vec<api::MidiEvent>,
+    /// The `VstEvents` header followed by one pointer per event, as `usize` words so
+    /// the pointer array is aligned.
+    block: Vec<usize>,
+}
+
+impl EventBatch {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            events: Vec::with_capacity(capacity),
+            block: Vec::with_capacity((HEADER_WORDS + capacity).max(EVENTS_WORDS)),
+        }
+    }
+
+    /// Replace the batch with `messages` and return the block for `processEvents`.
     ///
-    /// Takes the queue by value because the caller already holds the plugin lock, which
-    /// borrows `self`. Must be called immediately before `process`.
-    fn flush_midi(pending: &mut Vec<[u8; 3]>, plugin: &mut PluginInstance) {
-        if pending.is_empty() {
-            return;
-        }
-        // The plugin reads these during processEvents/process, so they only need to
-        // outlive this function — but `api::Events` is a fixed two-pointer struct, so a
-        // batch larger than that needs a backing allocation whose pointers stay valid
-        // for the whole call.
-        let mut events: Vec<Box<api::MidiEvent>> = pending
-            .drain(..)
-            .map(|data| {
-                Box::new(api::MidiEvent {
-                    event_type: api::EventType::Midi,
-                    byte_size: std::mem::size_of::<api::MidiEvent>() as i32,
-                    // All events land at the start of the block. Sample-accurate
-                    // placement would need the arrival offset plumbed through the IPC
-                    // ring; at 64-frame blocks this is under 1.4 ms of quantisation.
-                    delta_frames: 0,
-                    flags: 0,
-                    note_length: 0,
-                    note_offset: 0,
-                    midi_data: data,
-                    _midi_reserved: 0,
-                    detune: 0,
-                    note_off_velocity: 0,
-                    _reserved1: 0,
-                    _reserved2: 0,
-                })
-            })
-            .collect();
+    /// Messages beyond the capacity are dropped rather than reallocating.
+    fn fill(&mut self, messages: impl Iterator<Item = [u8; 3]>) -> *const api::Events {
+        let capacity = self.events.capacity();
+        self.events.clear();
+        self.events.extend(messages.take(capacity).map(midi_event));
 
-        let ptrs: Vec<*mut api::Event> = events
-            .iter_mut()
-            .map(|e| e.as_mut() as *mut api::MidiEvent as *mut api::Event)
-            .collect();
-
-        // `api::Events` declares `events: [*mut Event; 2]`, but the VST2 ABI treats it as
-        // a variable-length array of `num_events` pointers. Build the real layout by
-        // hand, taking the array offset from the struct itself: `num_events` is an i32
-        // followed by an isize, so repr(C) pads it out to isize alignment. Adding the two
-        // field sizes instead would place every pointer 4 bytes early on x64.
-        let header = std::mem::offset_of!(api::Events, events);
-        let mut raw = vec![0u8; header + ptrs.len() * std::mem::size_of::<*mut api::Event>()];
-        // SAFETY: `raw` is sized for the header plus exactly `ptrs.len()` pointers, and
-        // the writes below stay inside it. The plugin only reads it during this call.
+        self.block.clear();
+        self.block.resize(HEADER_WORDS, 0);
+        // SAFETY: the block holds at least HEADER_WORDS words, and `num_events` is the
+        // i32 at offset 0, which is the start of the first word on either endianness.
         unsafe {
-            let base = raw.as_mut_ptr();
-            std::ptr::write_unaligned(base as *mut i32, ptrs.len() as i32);
-            std::ptr::write_unaligned(base.add(std::mem::size_of::<i32>()) as *mut isize, 0);
-            let array = base.add(header) as *mut *mut api::Event;
-            for (i, ptr) in ptrs.iter().enumerate() {
-                std::ptr::write_unaligned(array.add(i), *ptr);
-            }
-            plugin.process_events(&*(base as *const api::Events));
+            std::ptr::write(self.block.as_mut_ptr() as *mut i32, self.events.len() as i32);
         }
+        for event in &mut self.events {
+            self.block.push(event as *mut api::MidiEvent as usize);
+        }
+        if self.block.len() < EVENTS_WORDS {
+            self.block.resize(EVENTS_WORDS, 0);
+        }
+        self.block.as_ptr() as *const api::Events
+    }
+}
+
+fn midi_event(data: [u8; 3]) -> api::MidiEvent {
+    api::MidiEvent {
+        event_type: api::EventType::Midi,
+        byte_size: std::mem::size_of::<api::MidiEvent>() as i32,
+        // All events land at the start of the block. Sample-accurate placement would
+        // need the arrival offset plumbed through the IPC ring; at 64-frame blocks this
+        // is under 1.4 ms of quantisation.
+        delta_frames: 0,
+        flags: 0,
+        note_length: 0,
+        note_offset: 0,
+        midi_data: data,
+        _midi_reserved: 0,
+        detune: 0,
+        note_off_velocity: 0,
+        _reserved1: 0,
+        _reserved2: 0,
     }
 }
 
@@ -309,8 +338,14 @@ impl Instrument for Vst2Instrument {
             return;
         };
         // VST2 contract: events must arrive in the same cycle as the process call that
-        // consumes them, and immediately before it.
-        Self::flush_midi(&mut self.pending_midi, &mut plugin);
+        // consumes them, and immediately before it. The plugin may read them during
+        // that process call, so the batch stays in `self.events` until the next fill.
+        if !self.pending_midi.is_empty() {
+            let block = self.events.fill(self.pending_midi.drain(..));
+            // SAFETY: `block` points into `self.events`, which is not touched again
+            // until the next `fill`, after this block's `process` below has returned.
+            plugin.process_events(unsafe { &*block });
+        }
         let input_ptrs: Vec<*const f32> = self.inputs.iter().map(|b| b.as_ptr()).collect();
         let mut output_ptrs: Vec<*mut f32> =
             self.outputs.iter_mut().map(|b| b.as_mut_ptr()).collect();
@@ -370,19 +405,19 @@ mod editor {
 
 #[cfg(test)]
 mod tests {
-    use vst::api;
+    use super::*;
 
     /// The `VstEvents` block must be laid out the way the VST2 ABI reads it.
     ///
     /// `api::Events` declares `events: [*mut Event; 2]`, but the ABI treats that as a
-    /// variable-length array of `num_events` pointers. `flush_midi` therefore builds the
+    /// variable-length array of `num_events` pointers. `EventBatch` therefore builds the
     /// block by hand, and a wrong offset there would hand Kontakt garbage pointers — so
     /// assert the layout this code depends on rather than trusting the struct definition.
     #[test]
     fn events_header_layout_matches_abi() {
         // `num_events: i32` is followed by `_reserved: isize`, so repr(C) pads the i32 out
         // to isize alignment: the pointer array starts at 2 * size_of::<isize>(), not at
-        // size_of::<i32>() + size_of::<isize>(). `flush_midi` must use `offset_of` rather
+        // size_of::<i32>() + size_of::<isize>(). `EventBatch` must use `offset_of` rather
         // than adding field sizes by hand — on x64 that mistake puts every pointer 4
         // bytes early and hands the plugin garbage.
         let offset = std::mem::offset_of!(api::Events, events);
@@ -398,64 +433,53 @@ mod tests {
         );
     }
 
-    /// Build the block exactly as `flush_midi` does and read it back as the plugin would.
-    ///
-    /// This is the regression guard for the dropped-notes bug: three messages queued in
-    /// one cycle must all survive into a single batch. The old code called
-    /// `process_events` once per message with `num_events: 1`, so a chord lost every note
-    /// but the last.
+    /// Read a block back the way a plugin walks `VstEvents`.
+    unsafe fn read_block(block: *const api::Events) -> Vec<[u8; 3]> {
+        unsafe {
+            let base = block as *const u8;
+            let num = std::ptr::read_unaligned(base as *const i32);
+            let array = base.add(std::mem::offset_of!(api::Events, events))
+                as *const *const api::MidiEvent;
+            (0..num as usize)
+                .map(|i| (*std::ptr::read_unaligned(array.add(i))).midi_data)
+                .collect()
+        }
+    }
+
+    /// Three messages queued in one cycle must all reach one batch. The old code called
+    /// `process_events` once per message, so a chord lost every note but the last.
     #[test]
     fn batched_events_all_survive() {
         let messages = [[0x90u8, 60, 100], [0x90, 64, 100], [0x90, 67, 100]];
+        let mut batch = EventBatch::with_capacity(MAX_PENDING_MIDI);
+        let block = batch.fill(messages.into_iter());
+        assert_eq!(unsafe { read_block(block) }, messages);
+    }
 
-        let mut events: Vec<Box<api::MidiEvent>> = messages
-            .iter()
-            .map(|data| {
-                Box::new(api::MidiEvent {
-                    event_type: api::EventType::Midi,
-                    byte_size: std::mem::size_of::<api::MidiEvent>() as i32,
-                    delta_frames: 0,
-                    flags: 0,
-                    note_length: 0,
-                    note_offset: 0,
-                    midi_data: *data,
-                    _midi_reserved: 0,
-                    detune: 0,
-                    note_off_velocity: 0,
-                    _reserved1: 0,
-                    _reserved2: 0,
-                })
-            })
-            .collect();
-        let ptrs: Vec<*mut api::Event> = events
-            .iter_mut()
-            .map(|e| e.as_mut() as *mut api::MidiEvent as *mut api::Event)
-            .collect();
+    /// A plugin may keep the `VstEvents*` from `processEvents` and read it in the
+    /// following `process`. The block must still hold the same events after the call
+    /// that built it has returned and other allocations have come and gone.
+    #[test]
+    fn block_outlives_process_events() {
+        let mut batch = EventBatch::with_capacity(MAX_PENDING_MIDI);
+        let block = batch.fill([[0x90u8, 60, 100], [0x80, 60, 0]].into_iter());
+        let churn: Vec<Vec<u8>> = (0..64).map(|i| vec![0xAA; 64 + i]).collect();
+        drop(churn);
+        assert_eq!(unsafe { read_block(block) }, [[0x90, 60, 100], [0x80, 60, 0]]);
+    }
 
-        let header = std::mem::offset_of!(api::Events, events);
-        let mut raw = vec![0u8; header + ptrs.len() * std::mem::size_of::<*mut api::Event>()];
-        // SAFETY: `raw` is sized for the header plus exactly `ptrs.len()` pointers.
-        unsafe {
-            let base = raw.as_mut_ptr();
-            std::ptr::write_unaligned(base as *mut i32, ptrs.len() as i32);
-            std::ptr::write_unaligned(base.add(std::mem::size_of::<i32>()) as *mut isize, 0);
-            let array = base.add(header) as *mut *mut api::Event;
-            for (i, ptr) in ptrs.iter().enumerate() {
-                std::ptr::write_unaligned(array.add(i), *ptr);
-            }
-
-            // Now read it back the way a plugin walks VstEvents.
-            let num = std::ptr::read_unaligned(base as *const i32);
-            assert_eq!(num, 3, "all three notes must be in one batch");
-            let array = base.add(header) as *const *mut api::Event;
-            for (i, expected) in messages.iter().enumerate() {
-                let event = std::ptr::read_unaligned(array.add(i)) as *const api::MidiEvent;
-                assert_eq!(
-                    (*event).midi_data,
-                    *expected,
-                    "event {i} must keep its own MIDI bytes"
-                );
-            }
-        }
+    /// Filling never reallocates, so events never move under a plugin, and a single
+    /// event still leaves the block as large as `api::Events`.
+    #[test]
+    fn fill_keeps_its_buffers() {
+        let mut batch = EventBatch::with_capacity(4);
+        let events = batch.events.as_ptr();
+        let block = batch.block.as_ptr();
+        batch.fill(std::iter::repeat([0x90, 60, 100]).take(10));
+        assert_eq!(batch.events.len(), 4, "extra messages are dropped, not reallocated");
+        batch.fill(std::iter::once([0x80, 60, 0]));
+        assert_eq!(batch.events.as_ptr(), events);
+        assert_eq!(batch.block.as_ptr(), block);
+        assert!(batch.block.len() * std::mem::size_of::<usize>() >= std::mem::size_of::<api::Events>());
     }
 }

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
@@ -25,6 +26,8 @@ pub struct VstClient {
     child: Child,
     stdin: Mutex<BufWriter<ChildStdin>>,
     events: Receiver<HelperEvent>,
+    /// This helper's private `%TEMP%`, removed once the helper has exited.
+    temp_dir: Option<PathBuf>,
 }
 
 impl VstClient {
@@ -93,8 +96,9 @@ impl VstClient {
         // it succeeds and Kontakt loads.  Note `tmpnam_s` caches the temp path on
         // first use, so this has to be set before the process starts — it cannot be
         // fixed from inside the helper.
-        if let Some(tmp) = helper_temp_dir() {
-            command.env("TMP", &tmp).env("TEMP", &tmp);
+        let temp_dir = helper_temp_dir();
+        if let Some(tmp) = &temp_dir {
+            command.env("TMP", tmp).env("TEMP", tmp);
         }
         // Start the helper in the plugin's parent directory (for Kontakt
         // Portable this is `...\Kontakt 8\x64`, next to ktp871.dll).  Doing
@@ -133,6 +137,7 @@ impl VstClient {
             child,
             stdin: Mutex::new(BufWriter::new(stdin)),
             events,
+            temp_dir,
         };
 
         // Kontakt 8.14 takes ~80s to instantiate on a cold cache on this machine
@@ -322,15 +327,22 @@ impl Drop for VstClient {
     fn drop(&mut self) {
         let _ = self.request(&HelperRequest::Shutdown);
         let deadline = Instant::now() + Duration::from_secs(2);
+        let mut exited = false;
         while Instant::now() < deadline {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
-                return;
+                exited = true;
+                break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        self.map.set_main_alive(false);
+        if !exited {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.map.set_main_alive(false);
+        }
+        if let Some(dir) = &self.temp_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
 
@@ -374,28 +386,55 @@ fn log_since(path: &Path, offset: u64) -> String {
         .join("\n")
 }
 
-/// Where the helper writes its stderr log (see [`VstClient::load`]).
+/// A private, empty `%TEMP%` for one helper process.
 ///
-/// Defaults to `surf-vst-host.log` in the writable data directory (see
-/// [`crate::paths::data_dir`]); `SURF_HELPER_LOG` overrides it.
-/// A private, empty `%TEMP%` for the helper process.
-///
-/// See the call site for why Kontakt needs this.  The directory is emptied on each
-/// spawn: libzmq's `_wtmpnam_s` names are short and derived from process state, so
-/// leftovers from an earlier run are what turn into a collision later.  Returns
-/// `None` if the directory cannot be prepared, in which case the helper simply
-/// inherits the ambient `%TEMP%` as before.
+/// See the call site for why Kontakt needs this. libzmq's `_wtmpnam_s` names are short
+/// and derived from process state, so leftovers from an earlier run are what turn into
+/// a collision later. Each helper therefore gets a fresh directory of its own under
+/// `helper-tmp`, named `<ui pid>-<n>`. Several helpers run at once (one per plugin), so
+/// a spawn must not touch the directories of helpers that are still running; it only
+/// clears what earlier Surf runs left behind. Returns `None` if the directory cannot
+/// be prepared, in which case the helper simply inherits the ambient `%TEMP%`.
 fn helper_temp_dir() -> Option<PathBuf> {
     if std::env::var_os("SURF_NO_PRIVATE_TEMP").is_some() {
         return None;
     }
-    let dir = surf_platform::data_dir().join("helper-tmp");
-    // Best-effort reset; a file we cannot delete is not worth failing the spawn over.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    new_helper_temp_dir(
+        &surf_platform::data_dir().join("helper-tmp"),
+        std::process::id(),
+        n,
+    )
+}
+
+fn new_helper_temp_dir(root: &Path, pid: u32, n: u64) -> Option<PathBuf> {
+    std::fs::create_dir_all(root).ok()?;
+    let own = format!("{pid}-");
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&own) {
+                continue; // a helper of this run, possibly still running
+            }
+            // Best effort: a file we cannot delete is not worth failing the spawn over.
+            let path = entry.path();
+            let _ = if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+        }
+    }
+    let dir = root.join(format!("{pid}-{n}"));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::create_dir(&dir).ok()?;
     Some(dir)
 }
 
+/// Where the helper writes its stderr log (see [`VstClient::load`]).
+///
+/// Defaults to `surf-vst-host.log` in the writable data directory (see
+/// [`crate::paths::data_dir`]); `SURF_HELPER_LOG` overrides it.
 pub fn helper_log_path() -> PathBuf {
     std::env::var_os("SURF_HELPER_LOG")
         .map(PathBuf::from)
@@ -457,4 +496,31 @@ fn spawn_reader(stdout: ChildStdout) -> Receiver<HelperEvent> {
         })
         .expect("failed to spawn helper reader thread");
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::new_helper_temp_dir;
+
+    /// Starting a second helper must leave the first one's `%TEMP%` alone, and only
+    /// clear what earlier runs of Surf left behind.
+    #[test]
+    fn each_helper_gets_its_own_temp_dir() {
+        let root = std::env::temp_dir().join(format!("surf-helper-tmp-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("1-0")).unwrap();
+        std::fs::write(root.join("1-0").join("stale"), b"x").unwrap();
+        std::fs::write(root.join("loose-file-from-old-builds"), b"x").unwrap();
+
+        let first = new_helper_temp_dir(&root, 42, 0).unwrap();
+        std::fs::write(first.join("zmq-ipc"), b"in use").unwrap();
+        let second = new_helper_temp_dir(&root, 42, 1).unwrap();
+
+        assert_ne!(first, second);
+        assert!(first.join("zmq-ipc").exists(), "a running helper's files survive");
+        assert!(second.read_dir().unwrap().next().is_none(), "a new helper starts empty");
+        assert!(!root.join("1-0").exists(), "an earlier run's directory is cleared");
+        assert!(!root.join("loose-file-from-old-builds").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
