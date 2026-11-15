@@ -118,6 +118,17 @@ struct ActiveNote {
     end_frame: u64,
 }
 
+/// Something the audio thread swapped out and wants the UI thread to free.
+///
+/// A large `Vec` is past glibc's mmap threshold, so dropping it is a `munmap` syscall
+/// inside the callback. Both kinds go back over the trash channel instead.
+#[allow(dead_code)] // payloads are freed on the UI side, never read
+#[derive(Debug)]
+enum Retired {
+    Timeline(Timeline),
+    Routes(Vec<Route>),
+}
+
 struct Core {
     slots: Vec<Option<Box<dyn Instrument>>>,
     gains: [f32; MAX_SLOTS],
@@ -142,13 +153,13 @@ struct Core {
     scratch: Vec<f32>,
     /// One slot's output for the current chunk, before it is mixed.
     slot_buf: Vec<f32>,
-    /// Replaced timelines go back to the UI thread to be freed, so the audio
-    /// callback doesn't call the allocator.
-    trash: crossbeam_channel::Sender<Timeline>,
-    /// Timelines that didn't fit in `trash`, kept until a slot frees. Its
-    /// capacity is reserved up front, so holding one never allocates; past
-    /// that, the newest still waits in `timeline` until the next update.
-    retired: Vec<Timeline>,
+    /// Replaced timelines and route lists go back to the UI thread to be freed, so the
+    /// audio callback doesn't call the allocator.
+    trash: crossbeam_channel::Sender<Retired>,
+    /// What didn't fit in `trash`, kept until a slot frees. Its capacity is reserved up
+    /// front, so holding one never allocates; past that, the newest still waits in
+    /// `timeline` until the next update.
+    retired: Vec<Retired>,
     shared: Arc<Shared>,
 }
 
@@ -163,7 +174,7 @@ impl Core {
     fn new(
         sample_rate: u32,
         shared: Arc<Shared>,
-        trash: crossbeam_channel::Sender<Timeline>,
+        trash: crossbeam_channel::Sender<Retired>,
     ) -> Self {
         Self {
             slots: std::iter::repeat_with(|| None).take(MAX_SLOTS).collect(),
@@ -251,7 +262,10 @@ impl Core {
                     let _ = ack.send(());
                 }
             }
-            Command::SetRoutes(routes) => self.routes = routes,
+            Command::SetRoutes(routes) => {
+                let old = std::mem::replace(&mut self.routes, routes);
+                self.retire(Retired::Routes(old));
+            }
             Command::SetSlotGain { slot, gain } => {
                 if let Some(g) = self.gains.get_mut(slot as usize) {
                     *g = gain.clamp(0.0, 2.0);
@@ -286,7 +300,9 @@ impl Core {
                 self.pos_frames = (from.max(0.0) * self.sample_rate) as u64;
                 self.next_note = timeline.notes.partition_point(|n| n.start < from.max(0.0));
                 self.active.clear();
-                self.timeline = Some(timeline);
+                if let Some(old) = self.timeline.replace(timeline) {
+                    self.retire(Retired::Timeline(old));
+                }
                 self.playing = true;
                 self.shared
                     .duration_frames
@@ -405,14 +421,14 @@ impl Core {
             .duration_frames
             .store(self.duration_frames, Ordering::Relaxed);
         if let Some(old) = self.timeline.replace(timeline) {
-            self.retire(old);
+            self.retire(Retired::Timeline(old));
         }
     }
 
-    /// Send a replaced timeline to the UI thread to be freed. If the channel
-    /// is full, hold it (and any earlier ones) until it has room, so the
-    /// audio thread never frees one.
-    fn retire(&mut self, old: Timeline) {
+    /// Send a replaced timeline or route list to the UI thread to be freed. If the
+    /// channel is full, hold it (and any earlier ones) until it has room, so the audio
+    /// thread never frees one.
+    fn retire(&mut self, old: Retired) {
         while let Some(t) = self.retired.pop() {
             if let Err(e) = self.trash.try_send(t) {
                 self.retired.push(e.into_inner());
@@ -576,7 +592,7 @@ pub struct AudioEngine {
     output: parking_lot::Mutex<String>,
     sample_accurate: bool,
     events: crossbeam_channel::Receiver<OutputEvent>,
-    trash: crossbeam_channel::Receiver<Timeline>,
+    trash: crossbeam_channel::Receiver<Retired>,
 }
 
 impl AudioEngine {
@@ -594,7 +610,7 @@ impl AudioEngine {
         });
         let (event_tx, events) = crossbeam_channel::unbounded();
         let (tx, rx) = crossbeam_channel::unbounded();
-        let (trash_tx, trash) = crossbeam_channel::bounded(8);
+        let (trash_tx, trash) = crossbeam_channel::bounded::<Retired>(8);
 
         // Try the default output device first.
         match open_output() {
@@ -633,19 +649,28 @@ impl AudioEngine {
                             }
                             let channels = channels as usize;
                             let frames = data.len() / channels.max(1);
-                            let stereo = core.render(frames);
-                            for frame in 0..frames {
-                                let l = stereo[frame * 2];
-                                let r = stereo[frame * 2 + 1];
-                                if channels == 1 {
-                                    data[frame] = (l + r) * 0.5;
-                                } else {
-                                    data[frame * channels] = l;
-                                    data[frame * channels + 1] = r;
-                                    for ch in 2..channels {
-                                        data[frame * channels + ch] = (l + r) * 0.5;
+                            // `render` caps at MAX_BLOCK, so a device that hands over more
+                            // frames than that would index past the scratch buffer. Render
+                            // in pieces instead.
+                            let mut rendered = 0usize;
+                            while rendered < frames {
+                                let piece = (frames - rendered).min(MAX_BLOCK);
+                                let stereo = core.render(piece);
+                                for frame in 0..piece {
+                                    let l = stereo[frame * 2];
+                                    let r = stereo[frame * 2 + 1];
+                                    let at = rendered + frame;
+                                    if channels == 1 {
+                                        data[at] = (l + r) * 0.5;
+                                    } else {
+                                        data[at * channels] = l;
+                                        data[at * channels + 1] = r;
+                                        for ch in 2..channels {
+                                            data[at * channels + ch] = (l + r) * 0.5;
+                                        }
                                     }
                                 }
+                                rendered += piece;
                             }
                         },
                         err_fn,
@@ -916,7 +941,7 @@ mod tests {
             glitches: AtomicU32::new(0),
         });
         // Tests keep the receiver alive so swapped timelines queue up.
-        let (trash, keep) = crossbeam_channel::bounded(8);
+        let (trash, keep) = crossbeam_channel::bounded::<Retired>(8);
         std::mem::forget(keep);
         Core::new(48_000, shared, trash)
     }
@@ -1187,7 +1212,7 @@ mod tests {
             sample_rate: AtomicU32::new(48_000),
             glitches: AtomicU32::new(0),
         });
-        let (trash, ui) = crossbeam_channel::bounded(2);
+        let (trash, ui) = crossbeam_channel::bounded::<Retired>(2);
         let mut c = Core::new(48_000, shared, trash);
         let tl = || Timeline { notes: vec![long(0, 60, 0.0, 1.0)], duration: 1.0 };
         c.apply(Command::Play { timeline: tl(), from: 0.0 });
@@ -1200,6 +1225,38 @@ mod tests {
         c.apply(Command::Update { timeline: tl() });
         assert_eq!(ui.len(), 2, "held ones go out once there's room");
         assert_eq!(c.retired.len(), 2);
+    }
+
+    /// Review: a replaced route list is a `Vec`, and a big one is freed with `munmap`.
+    /// It must go back to the UI thread, not be dropped inside the callback.
+    #[test]
+    fn replaced_routes_are_freed_off_the_audio_thread() {
+        let shared = Arc::new(Shared {
+            position_frames: AtomicU64::new(0),
+            duration_frames: AtomicU64::new(0),
+            playing: AtomicBool::new(false),
+            peak: AtomicU32::new(0),
+            slot_peaks: std::array::from_fn(|_| AtomicU32::new(0)),
+            sample_rate: AtomicU32::new(48_000),
+            glitches: AtomicU32::new(0),
+        });
+        let (trash, ui) = crossbeam_channel::bounded::<Retired>(8);
+        let mut c = Core::new(48_000, shared, trash);
+        let routes = || vec![Route { slot: 0, channel: 0 }; 256];
+        c.apply(Command::SetRoutes(routes()));
+        c.apply(Command::SetRoutes(routes()));
+        // The first apply retires the initial empty list, the second the first full one.
+        let mut retired = Vec::new();
+        while let Ok(item) = ui.try_recv() {
+            retired.push(item);
+        }
+        assert!(
+            retired
+                .iter()
+                .any(|r| matches!(r, Retired::Routes(v) if v.len() == 256)),
+            "the replaced route list should come back to the UI thread"
+        );
+        assert_eq!(c.routes.len(), 256, "the live list stays in the core");
     }
 
 
