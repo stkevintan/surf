@@ -95,9 +95,8 @@ impl Vst2Plugin {
             sample_rate: sample_rate as f32,
             directory,
         }));
-        let mut loader = PluginLoader::load(&binary, host).map_err(|e| {
-            anyhow::anyhow!("could not load VST2 plugin {}: {e}", binary.display())
-        })?;
+        let mut loader = PluginLoader::load(&binary, host)
+            .map_err(|e| anyhow::anyhow!("could not load VST2 plugin {}: {e}", binary.display()))?;
         let mut instance = loader
             .instance()
             .map_err(|e| anyhow::anyhow!("could not instantiate VST2 plugin: {e}"))?;
@@ -176,7 +175,6 @@ impl Vst2Plugin {
             .map_err(|_| anyhow::anyhow!("VST2 plugin mutex poisoned"))?;
         editor::open(&mut plugin, &self.name)
     }
-
 }
 
 pub struct Vst2Instrument {
@@ -265,7 +263,10 @@ impl EventBatch {
         // SAFETY: the block holds at least HEADER_WORDS words, and `num_events` is the
         // i32 at offset 0, which is the start of the first word on either endianness.
         unsafe {
-            std::ptr::write(self.block.as_mut_ptr() as *mut i32, self.events.len() as i32);
+            std::ptr::write(
+                self.block.as_mut_ptr() as *mut i32,
+                self.events.len() as i32,
+            );
         }
         for event in &mut self.events {
             self.block.push(event as *mut api::MidiEvent as usize);
@@ -438,8 +439,8 @@ mod tests {
         unsafe {
             let base = block as *const u8;
             let num = std::ptr::read_unaligned(base as *const i32);
-            let array = base.add(std::mem::offset_of!(api::Events, events))
-                as *const *const api::MidiEvent;
+            let array =
+                base.add(std::mem::offset_of!(api::Events, events)) as *const *const api::MidiEvent;
             (0..num as usize)
                 .map(|i| (*std::ptr::read_unaligned(array.add(i))).midi_data)
                 .collect()
@@ -465,7 +466,10 @@ mod tests {
         let block = batch.fill([[0x90u8, 60, 100], [0x80, 60, 0]].into_iter());
         let churn: Vec<Vec<u8>> = (0..64).map(|i| vec![0xAA; 64 + i]).collect();
         drop(churn);
-        assert_eq!(unsafe { read_block(block) }, [[0x90, 60, 100], [0x80, 60, 0]]);
+        assert_eq!(
+            unsafe { read_block(block) },
+            [[0x90, 60, 100], [0x80, 60, 0]]
+        );
     }
 
     /// Filling never reallocates, so events never move under a plugin, and a single
@@ -476,10 +480,16 @@ mod tests {
         let events = batch.events.as_ptr();
         let block = batch.block.as_ptr();
         batch.fill(std::iter::repeat([0x90, 60, 100]).take(10));
-        assert_eq!(batch.events.len(), 4, "extra messages are dropped, not reallocated");
+        assert_eq!(
+            batch.events.len(),
+            4,
+            "extra messages are dropped, not reallocated"
+        );
         batch.fill(std::iter::once([0x80, 60, 0]));
         assert_eq!(batch.events.as_ptr(), events);
         assert_eq!(batch.block.as_ptr(), block);
-        assert!(batch.block.len() * std::mem::size_of::<usize>() >= std::mem::size_of::<api::Events>());
+        assert!(
+            batch.block.len() * std::mem::size_of::<usize>() >= std::mem::size_of::<api::Events>()
+        );
     }
 }

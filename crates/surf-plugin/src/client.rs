@@ -392,8 +392,9 @@ fn log_since(path: &Path, offset: u64) -> String {
 /// and derived from process state, so leftovers from an earlier run are what turn into
 /// a collision later. Each helper therefore gets a fresh directory of its own under
 /// `helper-tmp`, named `<ui pid>-<n>`. Several helpers run at once (one per plugin), so
-/// a spawn must not touch the directories of helpers that are still running; it only
-/// clears what earlier Surf runs left behind. Returns `None` if the directory cannot
+/// a spawn must not touch the directories of helpers that are still running, including
+/// those of another live Surf that shares this directory. It only clears what a Surf
+/// that has already exited left behind. Returns `None` if the directory cannot
 /// be prepared, in which case the helper simply inherits the ambient `%TEMP%`.
 fn helper_temp_dir() -> Option<PathBuf> {
     if std::env::var_os("SURF_NO_PRIVATE_TEMP").is_some() {
@@ -408,13 +409,73 @@ fn helper_temp_dir() -> Option<PathBuf> {
     )
 }
 
+/// `true` when `pid` still has a process. A different pid is not proof that Surf has
+/// exited: two instances share this directory, and the other one may be live.
+fn process_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // `kill(0, 0)` signals our own process group, and a pid that does not fit in
+        // `pid_t` wraps to a negative process-group id. Neither is a live owner.
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        let rc = unsafe { kill(pid, 0) };
+        if rc == 0 {
+            return true;
+        }
+        // EPERM: the process exists, we just may not signal it.
+        std::io::Error::last_os_error().raw_os_error() == Some(1)
+    }
+    #[cfg(windows)]
+    {
+        if pid == 0 {
+            return false;
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+            fn GetLastError() -> u32;
+        }
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const ERROR_ACCESS_DENIED: u32 = 5;
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if !handle.is_null() {
+                CloseHandle(handle);
+                return true;
+            }
+            GetLastError() == ERROR_ACCESS_DENIED
+        }
+    }
+}
+
+/// Owner pid of a `<pid>-<n>` helper directory, if the name has that shape.
+fn helper_dir_owner(name: &str) -> Option<u32> {
+    let (pid, rest) = name.split_once('-')?;
+    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse().ok()
+}
+
 fn new_helper_temp_dir(root: &Path, pid: u32, n: u64) -> Option<PathBuf> {
     std::fs::create_dir_all(root).ok()?;
-    let own = format!("{pid}-");
     if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with(&own) {
-                continue; // a helper of this run, possibly still running
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(owner) = helper_dir_owner(&name) {
+                // This run's own helpers, and any helper whose Surf is still running.
+                if owner == pid || process_is_alive(owner) {
+                    continue;
+                }
             }
             // Best effort: a file we cannot delete is not worth failing the spawn over.
             let path = entry.path();
@@ -500,16 +561,28 @@ fn spawn_reader(stdout: ChildStdout) -> Receiver<HelperEvent> {
 
 #[cfg(test)]
 mod tests {
-    use super::new_helper_temp_dir;
+    use super::{helper_dir_owner, new_helper_temp_dir, process_is_alive};
+
+    /// A pid that belonged to a process which has already exited.
+    fn dead_pid() -> u32 {
+        let child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait_with_output().unwrap();
+        assert!(!process_is_alive(pid), "the waited child must be gone");
+        pid
+    }
 
     /// Starting a second helper must leave the first one's `%TEMP%` alone, and only
     /// clear what earlier runs of Surf left behind.
     #[test]
     fn each_helper_gets_its_own_temp_dir() {
-        let root = std::env::temp_dir().join(format!("surf-helper-tmp-test-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("surf-helper-tmp-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("1-0")).unwrap();
-        std::fs::write(root.join("1-0").join("stale"), b"x").unwrap();
+        // pid 1 is init and still alive, so it must not stand in for an exited Surf.
+        let dead = dead_pid();
+        std::fs::create_dir_all(root.join(format!("{dead}-0"))).unwrap();
+        std::fs::write(root.join(format!("{dead}-0")).join("stale"), b"x").unwrap();
         std::fs::write(root.join("loose-file-from-old-builds"), b"x").unwrap();
 
         let first = new_helper_temp_dir(&root, 42, 0).unwrap();
@@ -517,10 +590,52 @@ mod tests {
         let second = new_helper_temp_dir(&root, 42, 1).unwrap();
 
         assert_ne!(first, second);
-        assert!(first.join("zmq-ipc").exists(), "a running helper's files survive");
-        assert!(second.read_dir().unwrap().next().is_none(), "a new helper starts empty");
-        assert!(!root.join("1-0").exists(), "an earlier run's directory is cleared");
+        assert!(
+            first.join("zmq-ipc").exists(),
+            "a running helper's files survive"
+        );
+        assert!(
+            second.read_dir().unwrap().next().is_none(),
+            "a new helper starts empty"
+        );
+        assert!(
+            !root.join(format!("{dead}-0")).exists(),
+            "an earlier run's directory is cleared"
+        );
         assert!(!root.join("loose-file-from-old-builds").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two Surf instances share the data directory. Loading a plugin in the second must
+    /// not delete the first one's helper files while that process is still alive.
+    #[test]
+    fn a_live_other_surf_keeps_its_helper_dir() {
+        let root =
+            std::env::temp_dir().join(format!("surf-helper-tmp-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let me = std::process::id();
+        assert!(process_is_alive(me));
+        assert!(
+            !process_is_alive(u32::MAX),
+            "a pid that cannot exist is not alive"
+        );
+        assert_eq!(helper_dir_owner(&format!("{me}-3")), Some(me));
+        assert_eq!(helper_dir_owner("not-a-dir"), None);
+
+        let other = root.join(format!("{me}-7"));
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("zmq-ipc"), b"in use").unwrap();
+        // A dead owner's leftovers still go.
+        let dead = dead_pid();
+        std::fs::create_dir_all(root.join(format!("{dead}-0"))).unwrap();
+
+        let mine = new_helper_temp_dir(&root, me.wrapping_add(1), 0).unwrap();
+        assert!(
+            other.join("zmq-ipc").exists(),
+            "the other live Surf's helper files survive"
+        );
+        assert!(!root.join(format!("{dead}-0")).exists());
+        assert!(mine.read_dir().unwrap().next().is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
