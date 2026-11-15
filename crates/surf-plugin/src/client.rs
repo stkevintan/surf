@@ -448,18 +448,26 @@ fn process_is_alive(pid: u32) -> bool {
         #[link(name = "kernel32")]
         unsafe extern "system" {
             fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+            fn GetExitCodeProcess(handle: *mut std::ffi::c_void, code: *mut u32) -> i32;
             fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
             fn GetLastError() -> u32;
         }
         const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
         const ERROR_ACCESS_DENIED: u32 = 5;
+        const STILL_ACTIVE: u32 = 259;
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if !handle.is_null() {
-                CloseHandle(handle);
-                return true;
+            if handle.is_null() {
+                // The process object is gone, unless we simply may not open it.
+                return GetLastError() == ERROR_ACCESS_DENIED;
             }
-            GetLastError() == ERROR_ACCESS_DENIED
+            // A handle stays openable after the process exits (until every handle
+            // closes), so a successful open is not proof of life: check the exit
+            // code. STILL_ACTIVE means running; anything else means it has exited.
+            let mut code = 0u32;
+            let got = GetExitCodeProcess(handle, &mut code);
+            CloseHandle(handle);
+            got != 0 && code == STILL_ACTIVE
         }
     }
 }
