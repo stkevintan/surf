@@ -805,6 +805,9 @@ impl AudioEngine {
     }
 
     pub fn status(&self) -> EngineStatus {
+        // The UI reads this every frame, so retired payloads are freed even when it
+        // sends nothing, and a command the callback held back for room goes through.
+        self.reclaim();
         let sample_rate = self.shared.sample_rate.load(Ordering::Relaxed);
         EngineStatus {
             playing: self.shared.playing.load(Ordering::Acquire),
@@ -847,9 +850,13 @@ impl AudioEngine {
         self.tx.clone()
     }
 
-    pub fn send(&self, command: Command) {
-        // Free timelines the audio thread swapped out.
+    /// Free the timelines and route lists the audio thread swapped out.
+    fn reclaim(&self) {
         while self.trash.try_recv().is_ok() {}
+    }
+
+    pub fn send(&self, command: Command) {
+        self.reclaim();
         // The audio side drains at block rate; an unbounded queue keeps the UI
         // responsive even if the device stalls.
         let _ = self.tx.send(command);
@@ -910,7 +917,15 @@ impl AudioEngine {
             instrument,
             ack: Some(ack_tx),
         });
-        let _ = ack_rx.recv_timeout(Duration::from_millis(750));
+        // Keep freeing retired payloads while waiting: the callback may be holding
+        // a retiring command (and this one behind it) until there is room.
+        let deadline = Instant::now() + Duration::from_millis(750);
+        while Instant::now() < deadline {
+            self.reclaim();
+            if ack_rx.recv_timeout(Duration::from_millis(5)).is_ok() {
+                return;
+            }
+        }
     }
 }
 
@@ -1336,6 +1351,51 @@ mod tests {
         assert_eq!(c.volume, 0.25);
         // Every replaced timeline came back: one per update but the live one.
         assert_eq!(freed, total - 1);
+    }
+
+    /// Review: a burst that fills retirement, then `Stop` and nothing else sent.
+    /// With the UI only freeing what comes back (as `status` does every frame),
+    /// the held updates and the `Stop` behind them all go through.
+    #[test]
+    fn stop_after_a_burst_goes_through_without_more_sends() {
+        let shared = Arc::new(Shared {
+            position_frames: AtomicU64::new(0),
+            duration_frames: AtomicU64::new(0),
+            playing: AtomicBool::new(false),
+            peak: AtomicU32::new(0),
+            slot_peaks: std::array::from_fn(|_| AtomicU32::new(0)),
+            sample_rate: AtomicU32::new(48_000),
+            glitches: AtomicU32::new(0),
+        });
+        let (trash, ui) = crossbeam_channel::bounded::<Retired>(2);
+        let mut c = Core::new(48_000, shared, trash);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let tl = || Timeline {
+            notes: vec![long(0, 60, 0.0, 1.0)],
+            duration: 1.0,
+        };
+        tx.send(Command::Play {
+            timeline: tl(),
+            from: 0.0,
+        })
+        .unwrap();
+        for _ in 0..2 + RETIRED_CAP + 20 {
+            tx.send(Command::Update { timeline: tl() }).unwrap();
+        }
+        tx.send(Command::Stop).unwrap();
+        c.drain(&rx);
+        assert!(c.playing, "Stop is still queued behind the held update");
+        // Callback blocks and UI frames alternate; the UI sends nothing more.
+        for _ in 0..200 {
+            while ui.try_recv().is_ok() {}
+            c.drain(&rx);
+            run(&mut c, 256);
+            if !c.playing && c.deferred.is_none() && rx.is_empty() {
+                break;
+            }
+        }
+        assert!(c.deferred.is_none() && rx.is_empty(), "everything applied");
+        assert!(!c.playing, "Stop went through");
     }
 
     /// Review: the device callback path, without a device. A buffer larger than
