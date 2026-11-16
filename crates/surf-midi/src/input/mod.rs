@@ -73,6 +73,8 @@ const POLL_FALLBACK: Duration = Duration::from_secs(2);
 pub struct MidiHub {
     devices: Vec<String>,
     connection: Option<backend::Connection>,
+    /// What the open connection's device holds down, to release on disconnect.
+    held: Option<Arc<Held>>,
     selected: Option<usize>,
     /// The port the connection is on.
     on: Option<PortId>,
@@ -99,6 +101,7 @@ impl MidiHub {
         let mut hub = Self {
             devices: Vec::new(),
             connection: None,
+            held: None,
             selected: None,
             on: None,
             wanted: None,
@@ -205,19 +208,14 @@ impl MidiHub {
             anyhow::bail!("no MIDI input at index {index}");
         };
         self.disconnect();
-        let sink = self.sink.clone();
-        let tx = self.tx.clone();
-        let deliver: Deliver = Arc::new(move |event| {
-            // Timestamp before anything else so the UI sees arrival time.
-            let at = Instant::now();
-            sink(event);
-            let _ = tx.send(TimedMidi { at, event });
-        });
+        let held = Arc::new(Held::default());
+        let deliver = tracking(held.clone(), self.sink.clone(), self.tx.clone());
         // Open by name and occurrence: the backend enumerates again, and a bare
         // index could point at another port if one came or went in between.
         match backend::open(&port.name, port.nth, deliver) {
             Ok(connection) => {
                 self.connection = Some(connection);
+                self.held = Some(held);
                 self.selected = Some(index);
                 self.on = Some(port);
                 self.error = None;
@@ -231,7 +229,12 @@ impl MidiHub {
     }
 
     pub fn disconnect(&mut self) {
+        // Close first: once the device's callbacks have stopped, nothing can race
+        // the releases below.
         self.connection = None;
+        if let Some(held) = self.held.take() {
+            release_held(&held, &self.sink, &self.tx);
+        }
         self.selected = None;
         self.on = None;
     }
@@ -247,6 +250,60 @@ impl MidiHub {
             Some(index) => self.connect(index),
             None => Err(anyhow::anyhow!("MIDI input {name} is not connected")),
         }
+    }
+}
+
+/// Keys and the sustain pedal a device holds down. Updated on the driver's
+/// thread, so plain atomics: no locks there.
+struct Held {
+    keys: [AtomicBool; 128],
+    pedal: AtomicBool,
+}
+
+impl Default for Held {
+    fn default() -> Self {
+        Held {
+            keys: std::array::from_fn(|_| AtomicBool::new(false)),
+            pedal: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Deliver events to the sink and the UI, keeping track of what is held.
+fn tracking(held: Arc<Held>, sink: NoteSink, tx: Sender<TimedMidi>) -> Deliver {
+    Arc::new(move |event| {
+        // Timestamp before anything else so the UI sees arrival time.
+        let at = Instant::now();
+        match event {
+            LiveEvent::NoteOn { key, .. } => {
+                held.keys[key as usize & 127].store(true, Ordering::Relaxed)
+            }
+            LiveEvent::NoteOff { key } => {
+                held.keys[key as usize & 127].store(false, Ordering::Relaxed)
+            }
+            LiveEvent::Sustain(down) => held.pedal.store(down, Ordering::Relaxed),
+        }
+        sink(event);
+        let _ = tx.send(TimedMidi { at, event });
+    })
+}
+
+/// A device went away (unplugged, or Surf switched to another one) while keys or
+/// the pedal were down: their releases can no longer arrive, so send them now to
+/// the audio engine and the UI alike, so nothing hangs, lights up or records on.
+fn release_held(held: &Held, sink: &NoteSink, tx: &Sender<TimedMidi>) {
+    let at = Instant::now();
+    let send = |event| {
+        sink(event);
+        let _ = tx.send(TimedMidi { at, event });
+    };
+    for (key, down) in held.keys.iter().enumerate() {
+        if down.swap(false, Ordering::Relaxed) {
+            send(LiveEvent::NoteOff { key: key as u8 });
+        }
+    }
+    if held.pedal.swap(false, Ordering::Relaxed) {
+        send(LiveEvent::Sustain(false));
     }
 }
 
@@ -437,6 +494,39 @@ mod tests {
             Some(1),
             "still the second one"
         );
+    }
+
+    /// Review: switching devices (or unplugging one) while a key and the pedal
+    /// are down releases them, to the audio engine and the UI alike.
+    #[test]
+    fn a_dropped_device_releases_what_it_held() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let audio = seen.clone();
+        let sink: NoteSink = Arc::new(move |e| audio.lock().unwrap().push(e));
+        let (tx, rx) = unbounded();
+        let held = Arc::new(Held::default());
+        let deliver = tracking(held.clone(), sink.clone(), tx.clone());
+        deliver(LiveEvent::NoteOn {
+            key: 60,
+            velocity: 90,
+        });
+        deliver(LiveEvent::NoteOn {
+            key: 64,
+            velocity: 90,
+        });
+        deliver(LiveEvent::NoteOff { key: 64 });
+        deliver(LiveEvent::Sustain(true));
+        seen.lock().unwrap().clear();
+        let _: Vec<_> = rx.try_iter().collect();
+
+        release_held(&held, &sink, &tx);
+        let want = vec![LiveEvent::NoteOff { key: 60 }, LiveEvent::Sustain(false)];
+        assert_eq!(*seen.lock().unwrap(), want, "to the audio engine");
+        let ui: Vec<_> = rx.try_iter().map(|m| m.event).collect();
+        assert_eq!(ui, want, "to the UI");
+        // Released once: a second drop sends nothing.
+        release_held(&held, &sink, &tx);
+        assert_eq!(seen.lock().unwrap().len(), 2);
     }
 
     #[test]
