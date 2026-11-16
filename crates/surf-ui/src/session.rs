@@ -197,7 +197,7 @@ impl Session {
     pub fn toggle_record(&mut self) {
         if self.recorder.is_recording() {
             let notes = self.recorder.finish(Instant::now());
-            self.audio.stop();
+            self.stop_audio_keeping_pedals();
             if notes.is_empty() {
                 self.status = "Recording stopped: no notes captured".to_string();
                 return;
@@ -211,8 +211,20 @@ impl Session {
                 self.recorder.sustain(true, now);
             }
             self.live_notes.clear();
-            self.audio.stop();
+            self.stop_audio_keeping_pedals();
             self.status = "Recording… play your MIDI keyboard or use Musical Typing".to_string();
+        }
+    }
+
+    /// Stop the engine around a take without letting go of pedals that are
+    /// still held: the engine's stop lifts them, so put the held ones back.
+    fn stop_audio_keeping_pedals(&mut self) {
+        self.audio.stop();
+        if self.hw_pedal {
+            self.audio.sustain(true);
+        }
+        if self.typing_pedal {
+            self.audio.typing_sustain(true);
         }
     }
 

@@ -238,18 +238,25 @@ impl VstClient {
     /// sent on its own since the last request, so a window the user closed is
     /// seen as closed. Call between requests (the UI thread does).
     pub fn editor_open(&mut self) -> bool {
-        while let Ok((id, event)) = self.events.try_recv() {
-            match event {
-                HelperEvent::EditorClosed if id.is_none() => self.editor_open = false,
-                HelperEvent::Exited => {
-                    self.exited = true;
-                    self.editor_open = false;
-                }
-                // Late replies to requests that already timed out.
-                _ => {}
-            }
+        while let Ok((_, event)) = self.events.try_recv() {
+            self.track_editor(&event);
         }
         self.editor_open
+    }
+
+    /// Keep `editor_open` in step with what the helper says, whichever request
+    /// (if any) the event answers: a late `EditorOpened` after a timed-out open
+    /// still means a window is up.
+    fn track_editor(&mut self, event: &HelperEvent) {
+        match event {
+            HelperEvent::EditorOpened => self.editor_open = true,
+            HelperEvent::EditorClosed => self.editor_open = false,
+            HelperEvent::Exited => {
+                self.exited = true;
+                self.editor_open = false;
+            }
+            _ => {}
+        }
     }
 
     pub fn close_editor(&mut self) -> Result<()> {
@@ -367,10 +374,11 @@ impl VstClient {
             } else {
                 self.events.recv_timeout(remaining)
             };
+            if let Ok((_, event)) = &next {
+                self.track_editor(event);
+            }
             match next {
                 Ok((_, HelperEvent::Exited)) => {
-                    self.exited = true;
-                    self.editor_open = false;
                     let status = self
                         .child
                         .try_wait()
@@ -379,11 +387,6 @@ impl VstClient {
                         .map(|s| format!(" (exit {})", s.code().unwrap_or(-1)))
                         .unwrap_or_default();
                     anyhow::bail!("VST helper process exited{status}")
-                }
-                // The user closed the editor's window while we waited on another
-                // request: not this wait's answer, but the editor is gone.
-                Ok((None, HelperEvent::EditorClosed)) if id.is_some() => {
-                    self.editor_open = false;
                 }
                 // A reply to another request (one that already timed out), or an
                 // event nobody asked for: not this wait's answer.
