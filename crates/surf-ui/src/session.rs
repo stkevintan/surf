@@ -16,7 +16,7 @@ use surf_core::document::{self, Document};
 use surf_core::recorder::Recorder;
 use surf_core::edit::{Edit, History, TrackField};
 use surf_core::project::{Id, Project};
-use surf_core::song::{Song, Timeline};
+use surf_core::song::{RecordedNote, Song, Timeline};
 use surf_midi::{LiveEvent, MidiHub, NoteSink, PortChange};
 use surf_plugin::client::{RenderNote, VstClient, helper_log_path};
 use surf_plugin::scan::{self as vst_scan, PluginEntry};
@@ -29,6 +29,16 @@ pub struct LiveNote {
     pub velocity: u8,
     pub start: Instant,
     pub end: Option<Instant>,
+}
+
+/// What [`Session::save_project`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Saved {
+    Yes,
+    /// The file could not be written; `status` says why.
+    Failed,
+    /// The project has no file yet; ask where to save it.
+    NoFile,
 }
 
 pub struct Session {
@@ -180,8 +190,7 @@ impl Session {
                 self.status = "Recording stopped: no notes captured".to_string();
                 return;
             }
-            let take = Song::from_recorded("Take", &notes);
-            self.add_take(&take);
+            self.add_take(&notes);
         } else {
             self.recorder.start(Instant::now());
             self.live_notes.clear();
@@ -192,20 +201,29 @@ impl Session {
 
     /// Put a recorded take on the record track as a new region, starting at
     /// bar 1 (the transport always records from the start for now).
-    fn add_take(&mut self, take: &Song) {
+    ///
+    /// The take is in seconds; it becomes ticks through the project's own
+    /// tempo map, so it plays back as long as it was played.
+    fn add_take(&mut self, take: &[RecordedNote]) {
         let Some(track) = self.record_track() else { return };
         let bar = self.project.ticks_per_bar().max(1);
-        // The recorder works at 480 PPQ; rescale to the project's resolution.
-        let scale = self.project.ppq.max(1) as f64 / take.ppq.max(1) as f64;
+        let mut recorded: Vec<&RecordedNote> = take.iter().filter(|r| r.end > r.start).collect();
+        recorded.sort_by(|a, b| a.start.total_cmp(&b.start));
         let mut notes = Vec::new();
-        for n in &take.notes {
+        for r in recorded {
+            let start = self.project.sec_to_tick(r.start);
+            let end = self.project.sec_to_tick(r.end);
             notes.push(surf_core::project::Note {
                 id: self.project.alloc(),
-                key: n.key,
-                velocity: n.velocity,
-                start: (n.start_tick as f64 * scale).round() as u64,
-                len: ((n.duration_ticks as f64 * scale).round() as u64).max(1),
+                key: r.key,
+                velocity: r.velocity,
+                start,
+                len: end.saturating_sub(start).max(1),
             });
+        }
+        if notes.is_empty() {
+            self.status = "Recording stopped: no notes captured".to_string();
+            return;
         }
         let end = notes.iter().map(|n| n.end()).max().unwrap_or(bar);
         let index = self.project.track(track).map_or(0, |t| t.regions.len());
@@ -233,7 +251,15 @@ impl Session {
 
     /// Track that recording goes to: the armed one, else the first.
     pub fn record_track(&self) -> Option<Id> {
-        self.record_arm.or_else(|| self.project.tracks.first().map(|t| t.id))
+        self.armed_track()
+            .or_else(|| self.project.tracks.first().map(|t| t.id))
+    }
+
+    /// The armed track, if it still exists. Deleting the armed track leaves
+    /// `record_arm` pointing at it (undo brings it back armed), so every
+    /// reader goes through this.
+    fn armed_track(&self) -> Option<Id> {
+        self.record_arm.filter(|id| self.project.track(*id).is_some())
     }
 
     pub fn load_demo(&mut self) {
@@ -370,7 +396,7 @@ impl Session {
         }
         // Live input plays the record-armed track, else the selected one.
         let input = self
-            .record_arm
+            .armed_track()
             .or(self.input_track)
             .and_then(|id| self.project.tracks.iter().position(|t| t.id == id))
             .unwrap_or(0);
@@ -504,7 +530,8 @@ impl Session {
     }
 
     /// Save the project and every plugin's state to `path` (a `.surf` file).
-    pub fn save_project_to(&mut self, path: PathBuf) {
+    /// Returns whether the file was written.
+    pub fn save_project_to(&mut self, path: PathBuf) -> bool {
         let mut plugin_states = std::collections::BTreeMap::new();
         let mut failed = Vec::new();
         for host in &mut self.rack.hosts {
@@ -543,19 +570,23 @@ impl Session {
                         .push_str(&format!(" · without plugin state for {}", failed.join(", ")));
                 }
                 self.project_path = Some(path);
+                true
             }
-            Err(err) => self.status = format!("Could not save: {err:#}"),
+            Err(err) => {
+                self.status = format!("Could not save: {err:#}");
+                false
+            }
         }
     }
 
-    /// Save to the file the project came from; false if it has none yet.
-    pub fn save_project(&mut self) -> bool {
+    /// Save to the file the project came from.
+    pub fn save_project(&mut self) -> Saved {
         match self.project_path.clone() {
-            Some(path) => {
-                self.save_project_to(path);
-                true
-            }
-            None => false,
+            Some(path) => match self.save_project_to(path) {
+                true => Saved::Yes,
+                false => Saved::Failed,
+            },
+            None => Saved::NoFile,
         }
     }
 
@@ -664,6 +695,10 @@ impl Session {
     }
 
     pub fn can_export_wav(&mut self) -> bool {
+        if self.rendering {
+            self.status = "Already rendering a WAV · wait for it to finish".to_string();
+            return false;
+        }
         if self.timeline.notes.is_empty() {
             self.status = "Nothing to render yet".to_string();
             return false;
@@ -706,7 +741,10 @@ impl Session {
                 .notes
                 .push(n);
         }
-        let stem_dir = std::env::temp_dir().join(format!("surf-stems-{}", std::process::id()));
+        // A directory per bounce, so one finishing never deletes another's stems.
+        static NEXT_BOUNCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT_BOUNCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let stem_dir = std::env::temp_dir().join(format!("surf-stems-{}-{n}", std::process::id()));
         let _ = std::fs::create_dir_all(&stem_dir);
         let mut pianos = Vec::new();
         let mut stems = Vec::new();
@@ -1393,9 +1431,7 @@ mod tests {
         let mut s = Session::new();
         let track = s.project.tracks[0].id;
         let regions = s.project.tracks[0].regions.len();
-        let mut take = Song::empty();
-        take.notes.push(surf_core::song::Note { key: 64, velocity: 100, channel: 0, start_tick: 0, duration_ticks: 240 });
-        s.add_take(&take);
+        s.add_take(&[RecordedNote { key: 64, velocity: 100, start: 0.0, end: 0.25 }]);
         let t = s.project.track(track).unwrap();
         assert_eq!(t.regions.len(), regions + 1);
         let new = t.regions.last().unwrap();
@@ -1404,6 +1440,83 @@ mod tests {
         assert_eq!(s.record_region, Some(new.id));
         s.undo();
         assert_eq!(s.project.track(track).unwrap().regions.len(), regions);
+    }
+
+    /// Review: a take is in seconds and must land at the project's tempo, not at a
+    /// fixed 120 BPM. One beat at 90 BPM is 2/3 of a second.
+    #[test]
+    fn a_take_follows_the_project_tempo() {
+        let mut s = Session::new();
+        s.project.tempos[0].bpm = 90.0;
+        s.add_take(&[RecordedNote {
+            key: 60,
+            velocity: 100,
+            start: 0.0,
+            end: 2.0 / 3.0,
+        }]);
+        let note = &s.project.tracks[0].regions.last().unwrap().notes[0];
+        let beat = s.project.ticks_per_beat();
+        assert_eq!(note.start, 0);
+        assert!(
+            (note.len as i64 - beat as i64).abs() <= 1,
+            "{} vs {beat}",
+            note.len
+        );
+    }
+
+    /// Review: deleting the armed track must not leave recording aimed at it.
+    #[test]
+    fn deleting_the_armed_track_records_elsewhere() {
+        let mut s = two_tracks();
+        let armed = s.project.tracks[0].id;
+        let other = s.project.tracks[1].id;
+        s.set_record_arm(Some(armed));
+        crate::editing::delete_track(
+            &mut s,
+            &mut crate::editing::Editing {
+                track: Some(armed),
+                ..Default::default()
+            },
+        );
+        assert_eq!(s.record_track(), Some(other));
+        s.add_take(&[RecordedNote {
+            key: 62,
+            velocity: 90,
+            start: 0.0,
+            end: 0.5,
+        }]);
+        assert!(
+            s.project
+                .track(other)
+                .unwrap()
+                .regions
+                .iter()
+                .any(|r| r.name == "Take 1")
+        );
+        assert!(s.history.undo_label().is_some());
+        // Undo the take, then the deletion: the track comes back armed.
+        s.undo();
+        s.undo();
+        assert_eq!(s.record_track(), Some(armed));
+    }
+
+    /// Review: a save that does not land must not look like it did.
+    #[test]
+    fn a_failed_save_stays_dirty() {
+        let mut s = two_tracks();
+        let t = s.project.tracks[0].id;
+        s.apply(
+            "Mute",
+            Edit::SetTrack {
+                track: t,
+                field: TrackField::Mute(true),
+            },
+        );
+        s.project_path = Some(std::env::temp_dir().join("surf-no-such-dir").join("x.surf"));
+        assert_eq!(s.save_project(), Saved::Failed);
+        assert!(s.is_dirty());
+        assert!(s.status.starts_with("Could not save"));
+        assert_eq!(s.save_project_to(s.project_path.clone().unwrap()), false);
     }
 
     fn two_tracks() -> Session {
@@ -1561,7 +1674,7 @@ mod tests {
 
         // ⌘S goes back to the same file.
         s.apply("Mute", Edit::SetTrack { track: t, field: TrackField::Mute(true) });
-        assert!(s.save_project());
+        assert_eq!(s.save_project(), Saved::Yes);
         assert!(Document::load(&path).unwrap().project.tracks[1].mute);
         std::fs::remove_file(path).ok();
     }

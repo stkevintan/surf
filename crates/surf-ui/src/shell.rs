@@ -32,7 +32,7 @@ use surf_core::project::Id;
 use crate::dialogs::Unsaved;
 use crate::editing::{self, Editing, Focus};
 use crate::menu;
-use crate::session::Session;
+use crate::session::{Saved, Session};
 use crate::theme::{color, font, size};
 use crate::views;
 
@@ -277,13 +277,12 @@ impl SurfApp {
             match answer {
                 Unsaved::Cancel => {}
                 Unsaved::Discard => then(app, cx),
-                Unsaved::Save => {
-                    if app.session.save_project() {
-                        then(app, cx);
-                    } else {
-                        save_project(app, cx, true);
-                    }
-                }
+                Unsaved::Save => match app.session.save_project() {
+                    Saved::Yes => then(app, cx),
+                    // Stay put: the status says why, and the changes are still here.
+                    Saved::Failed => {}
+                    Saved::NoFile => save_project(app, cx, true),
+                },
             }
         });
     }
@@ -731,10 +730,7 @@ fn actions(d: gpui::Stateful<gpui::Div>, cx: &mut Context<SurfApp>) -> gpui::Sta
     });
     let d = on_w::<menu::NewProject>(d, cx, new_project);
     let d = on_w::<menu::OpenFile>(d, cx, open_file);
-    let d = on::<menu::LoadDemo>(d, cx, |a| {
-        a.session.load_demo();
-        a.after_project_replaced();
-    });
+    let d = on_w::<menu::LoadDemo>(d, cx, load_demo);
     let d = on_w::<menu::CloseWindow>(d, cx, |a, w, cx| a.close(w, cx));
     let d = on_w::<menu::SaveProject>(d, cx, |a, _, cx| save_project(a, cx, false));
     let d = on_w::<menu::SaveProjectAs>(d, cx, |a, _, cx| save_project(a, cx, true));
@@ -836,6 +832,15 @@ pub fn new_project(app: &mut SurfApp, window: &mut Window, cx: &mut Context<Surf
     });
 }
 
+/// File ▸ Open Demo Song, after unsaved changes. It replaces the project
+/// and its undo history like New does.
+pub fn load_demo(app: &mut SurfApp, window: &mut Window, cx: &mut Context<SurfApp>) {
+    app.leave(window, cx, |app, _| {
+        app.session.load_demo();
+        app.after_project_replaced();
+    });
+}
+
 /// Open a `.surf` project or a MIDI file through the platform picker,
 /// after unsaved changes.
 pub fn open_file(app: &mut SurfApp, window: &mut Window, cx: &mut Context<SurfApp>) {
@@ -850,7 +855,8 @@ pub fn open_file(app: &mut SurfApp, window: &mut Window, cx: &mut Context<SurfAp
 /// ⌘S: save to the project's file, or ask where the first time.
 /// ⇧⌘S (`save_as`) always asks.
 pub fn save_project(app: &mut SurfApp, cx: &mut Context<SurfApp>, save_as: bool) {
-    if !save_as && app.session.save_project() {
+    if !save_as && app.session.project_path.is_some() {
+        app.session.save_project();
         return;
     }
     let stem = app
@@ -861,7 +867,7 @@ pub fn save_project(app: &mut SurfApp, cx: &mut Context<SurfApp>, save_as: bool)
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| app.session.export_stem());
     crate::dialogs::save(cx, stem, surf_core::document::EXTENSION, |app, path| {
-        app.session.save_project_to(path)
+        app.session.save_project_to(path);
     });
 }
 
