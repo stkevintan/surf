@@ -260,6 +260,20 @@ impl Core {
         self.pedals != 0
     }
 
+    /// The live input moved from `before` to the current input route (a new
+    /// input track, or new routes): a held pedal follows it.
+    fn hand_pedal_over(&mut self, before: Route) {
+        let now = self.route(self.input);
+        if self.sustain() && before != now {
+            if let Some(i) = self.slot(before) {
+                i.set_sustain(before.channel, false);
+            }
+            if let Some(i) = self.slot(now) {
+                i.set_sustain(now.channel, true);
+            }
+        }
+    }
+
     fn stop(&mut self) {
         self.playing = false;
         self.pos_frames = 0;
@@ -391,14 +405,24 @@ impl Core {
                     });
                     // Notes on the old instrument are gone with it.
                     self.active.retain(|n| n.route.slot != slot);
+                    // A pedal still held reaches the instrument that replaced it.
+                    let input = self.route(self.input);
+                    if self.sustain()
+                        && input.slot == slot
+                        && let Some(i) = self.slot(input)
+                    {
+                        i.set_sustain(input.channel, true);
+                    }
                 }
                 if let Some(ack) = ack {
                     let _ = ack.send(());
                 }
             }
             Command::SetRoutes(routes) => {
+                let before = self.route(self.input);
                 let old = std::mem::replace(&mut self.routes, routes);
                 self.retire(Retired::Routes(old));
+                self.hand_pedal_over(before);
             }
             Command::SetSlotGain { slot, gain } => {
                 if let Some(g) = self.gains.get_mut(slot as usize) {
@@ -406,17 +430,9 @@ impl Core {
                 }
             }
             Command::SetInput(track) => {
-                let (old, new) = (self.route(self.input), self.route(track));
+                let before = self.route(self.input);
                 self.input = track;
-                // Hand the pedal over to the new instrument.
-                if self.sustain() && old != new {
-                    if let Some(i) = self.slot(old) {
-                        i.set_sustain(old.channel, false);
-                    }
-                    if let Some(i) = self.slot(new) {
-                        i.set_sustain(new.channel, true);
-                    }
-                }
+                self.hand_pedal_over(before);
             }
             Command::ControlChange {
                 slot,
@@ -1685,6 +1701,32 @@ mod tests {
         c.apply(Command::StopKeepingPedals);
         assert!(!c.sustain(), "released before the stop: stays up");
         assert!(!calls.lock().iter().skip(3).any(|e| e == "pedal true"));
+    }
+
+    /// Review: a pedal held while the input's instrument is replaced (a project
+    /// reopened, a plugin reloaded) holds the new instrument too.
+    #[test]
+    fn a_held_pedal_reaches_a_replaced_instrument() {
+        let (mut c, calls) = recorder_core();
+        c.apply(Command::Sustain(true));
+        let fresh: Calls = Default::default();
+        c.apply(Command::SetSlot {
+            slot: 1,
+            instrument: Some(Box::new(Recorder(fresh.clone()))),
+            ack: None,
+        });
+        assert_eq!(*fresh.lock(), ["pedal true"]);
+        assert!(
+            calls.lock().contains(&"all off".to_string()),
+            "old one silenced"
+        );
+        // Routes that move the input to another channel take the pedal along.
+        fresh.lock().clear();
+        c.apply(Command::SetRoutes(vec![Route {
+            slot: 1,
+            channel: 3,
+        }]));
+        assert_eq!(*fresh.lock(), ["pedal false", "pedal true"]);
     }
 
     /// Stop still resets everything, pedal included.
