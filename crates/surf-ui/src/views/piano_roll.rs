@@ -1017,6 +1017,10 @@ pub(crate) fn pointer_move(app: &mut SurfApp, e: &MouseMoveEvent) -> bool {
             );
         }
         Drag::ResizeNotes { x0, notes } => {
+            // A click on the edge, or a pixel of jitter, is not a resize.
+            if (x - x0).abs() < DRAG_SLOP {
+                return false;
+            }
             let delta = snap(((x - x0) / g.tick_w) as f64, grid);
             app.session.preview(
                 "Resize Notes",

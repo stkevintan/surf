@@ -18,7 +18,9 @@ pub enum Edit {
         ticks: i64,
         keys: i32,
     },
-    /// Change note lengths by `ticks`; a note never gets shorter than `min`.
+    /// Change note lengths by `ticks`. A note is not shortened below `min`, or
+    /// below its own length if that is already shorter: resizing never makes a
+    /// short note longer than it was by itself.
     ResizeNotes {
         region: Id,
         notes: Vec<Id>,
@@ -145,7 +147,8 @@ impl Edit {
                 let before = snapshot(p, *region, notes);
                 if let Some(r) = p.region_mut(*region) {
                     for n in r.notes.iter_mut().filter(|n| notes.contains(&n.id)) {
-                        n.len = (n.len as i64 + ticks).max(*min as i64).max(1) as u64;
+                        let floor = (*min).min(n.len).max(1) as i64;
+                        n.len = (n.len as i64 + ticks).max(floor) as u64;
                     }
                 }
                 Edit::RestoreNotes {
@@ -603,6 +606,30 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review M22: a note shorter than the resize minimum is not stretched up to
+    /// it by a resize that does not lengthen it.
+    #[test]
+    fn resizing_keeps_a_short_note_short() {
+        let mut p = crate::project::Project::from_song(&crate::song::Song::demo());
+        let region = p.tracks[0].regions[0].id;
+        let id = p.tracks[0].regions[0].notes[0].id;
+        p.region_mut(region).unwrap().notes[0].len = 60;
+        let resize = |p: &mut crate::project::Project, ticks| {
+            Edit::ResizeNotes {
+                region,
+                notes: vec![id],
+                ticks,
+                min: 120,
+            }
+            .apply(p);
+            p.find_region(region).unwrap().1.note(id).unwrap().len
+        };
+        assert_eq!(resize(&mut p, 0), 60, "no change: stays 60");
+        assert_eq!(resize(&mut p, -120), 60, "not below its own length");
+        assert_eq!(resize(&mut p, 120), 180, "grows by the drag");
+        assert_eq!(resize(&mut p, -480), 120, "a longer note stops at min");
+    }
     use crate::song::{self, Song};
 
     fn project() -> Project {

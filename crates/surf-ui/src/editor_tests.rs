@@ -155,6 +155,43 @@ fn dragging_a_note_edge_resizes_it(cx: &mut TestAppContext) {
     assert_eq!(app.session.history.undo_label(), Some("Resize Notes"));
 }
 
+/// Review M22: grabbing a short note's edge and moving a pixel or two leaves it
+/// as it was, instead of snapping it up to a whole grid step, and records no
+/// edit.
+#[gpui::test]
+fn a_tiny_resize_leaves_a_short_note_alone(cx: &mut TestAppContext) {
+    let mut app = app(cx);
+    // Zoomed in, so a half-grid note is wide enough to grab by its edge.
+    app.ui.roll_beat_w = sz::ROLL_BEAT_W_MAX;
+    let n = first_note(&app);
+    let grid = app.ui.edit.roll_snap.ticks(&app.session.project);
+    let short = (grid / 2).max(1);
+    let r = &mut app.session.project.tracks[0].regions[0];
+    r.notes.iter_mut().find(|m| m.id == n.id).unwrap().len = short;
+    let n = r.note(n.id).unwrap().clone();
+    let label = app.session.history.undo_label().map(str::to_owned);
+    let edge = roll_pos(&app, n.end(), n.key, -1.0);
+    piano_roll::pointer_down(&mut app, &down(edge, Modifiers::default(), 1));
+    assert!(
+        matches!(app.ui.drag, Some(crate::shell::Drag::ResizeNotes { .. })),
+        "grabbed by its edge"
+    );
+    for dx in [1.0, 1.5, 1.0] {
+        piano_roll::pointer_move(&mut app, &drag(point(edge.x + px(dx), edge.y)));
+    }
+    piano_roll::pointer_up(&mut app);
+    let after = app.session.project.tracks[0].regions[0]
+        .note(n.id)
+        .unwrap()
+        .len;
+    assert_eq!(after, short, "still {short} ticks");
+    assert_eq!(
+        app.session.history.undo_label().map(str::to_owned),
+        label,
+        "jitter is not an edit"
+    );
+}
+
 #[gpui::test]
 fn pencil_adds_a_note_and_double_click_removes_it(cx: &mut TestAppContext) {
     let mut app = app(cx);
