@@ -143,7 +143,7 @@ pane header 右侧的分段控件切换。
 | `Cmd+B` / `Shift+Cmd+E` | Bounce WAV / 导出 MIDI | `Opt+Cmd+N` / `Cmd+Delete` | 新建 / 删除轨道 |
 | `Cmd+C` / `Cmd+X` | 复制 / 剪切 | `Cmd+V` | 粘贴：音符贴在原音符后一格，region 贴到播放头 |
 
-Musical Typing 开启时，`A W S E D F T G Y H U J K O L P ;` 弹 C3 到 E4（Logic 规则：C3 = MIDI 60），`Z` / `X` 换八度。这时字母键不再触发上表中的快捷键。
+Musical Typing 开启时，`A W S E D F T G Y H U J K O L P ;` 弹 C3 到 E4（Logic 规则：C3 = MIDI 60），`Z` / `X` 换八度，按住 `Tab` 是延音踏板（只松开 `Tab` 自己踩下的踏板，不动硬件踏板）。这时其余字母键不再触发上表中的快捷键；走带键 `Space`、`Enter`、`R`、`,`、`.` 照常可用，这样录音中也能按 `R` 停止。`Shift` 只是修饰键，不当踏板。
 
 ## 6. 扩展位（planned）
 

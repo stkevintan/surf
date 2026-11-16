@@ -85,6 +85,10 @@ pub struct Ui {
     pub count_in: bool,
     /// Computer keys currently held for Musical Typing, and the note each plays.
     pub typing_keys: HashMap<String, u8>,
+    /// Musical Typing's sustain key (Tab) holds the pedal down. Kept apart from
+    /// the session's pedal state so letting go of Tab never lifts a hardware
+    /// pedal, and only a pedal Tab pressed is lifted.
+    pub typing_pedal: bool,
     /// Splitter drag in progress: (pointer y at start, editor height at start).
     pub splitter_drag: Option<(f32, f32)>,
     /// Which channel-strip fader is being dragged.
@@ -172,6 +176,7 @@ impl Default for Ui {
             metronome: false,
             count_in: false,
             typing_keys: HashMap::new(),
+            typing_pedal: false,
             splitter_drag: None,
             fader_drag: None,
             fader_bounds: Rc::default(),
@@ -397,6 +402,15 @@ impl SurfApp {
         let cmd = ks.modifiers.secondary();
 
         if self.ui.musical_typing && !cmd {
+            // Tab is the sustain pedal, as in Logic's Musical Typing.
+            if key == TYPING_PEDAL_KEY {
+                if !event.is_held && !self.ui.typing_pedal && !self.session.sustain {
+                    self.ui.typing_pedal = true;
+                    self.session
+                        .handle_live(LiveEvent::Sustain(true), Instant::now(), true);
+                }
+                return;
+            }
             if let Some(note) = typing_note(&key, self.ui.typing_octave) {
                 if !event.is_held && self.ui.typing_keys.insert(key, note).is_none() {
                     self.session.handle_live(
@@ -452,20 +466,14 @@ impl SurfApp {
                 }
                 self.ui.marquee = None;
             }
-            // Shift doubles as a sustain pedal when no pedal is plugged in.
-            (false, "shift") if !self.session.sustain => {
-                self.session
-                    .handle_live(LiveEvent::Sustain(true), Instant::now(), true)
-            }
             _ => {}
         }
     }
 
     fn key_up(&mut self, event: &KeyUpEvent) {
         let key = event.keystroke.key.to_lowercase();
-        if key == "shift" && self.session.sustain {
-            self.session
-                .handle_live(LiveEvent::Sustain(false), Instant::now(), true);
+        if key == TYPING_PEDAL_KEY {
+            self.release_typing_pedal();
             return;
         }
         if let Some(note) = self.ui.typing_keys.remove(&key) {
@@ -506,15 +514,24 @@ impl SurfApp {
     pub fn toggle_typing(&mut self) {
         self.ui.musical_typing = !self.ui.musical_typing;
         self.session.status = if self.ui.musical_typing {
-            "Musical Typing on · A W S E D F T G Y H U J K O L P ; play C3–E4, Z/X change octave"
+            "Musical Typing on · A W S E D F T G Y H U J K O L P ; play C3–E4, Z/X change octave, Tab is the pedal"
                 .to_string()
         } else {
             for (_, note) in self.ui.typing_keys.drain() {
                 self.session
                     .handle_live(LiveEvent::NoteOff { key: note }, Instant::now(), true);
             }
+            self.release_typing_pedal();
             "Musical Typing off · letters are shortcuts again".to_string()
         };
+    }
+
+    /// Lift the pedal if Musical Typing's Tab put it down (and only then).
+    fn release_typing_pedal(&mut self) {
+        if std::mem::take(&mut self.ui.typing_pedal) {
+            self.session
+                .handle_live(LiveEvent::Sustain(false), Instant::now(), true);
+        }
     }
 
     pub fn toggle_metronome(&mut self) {
@@ -554,6 +571,9 @@ impl SurfApp {
         self.started.elapsed().as_secs_f32()
     }
 }
+
+/// Musical Typing's sustain pedal key (Logic's).
+const TYPING_PEDAL_KEY: &str = "tab";
 
 /// Musical Typing: letters to notes, Logic layout. C3 = MIDI 60.
 fn typing_note(key: &str, octave: i8) -> Option<u8> {

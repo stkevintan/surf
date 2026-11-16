@@ -477,6 +477,103 @@ fn musical_typing_letters_are_notes_not_shortcuts(cx: &mut TestAppContext) {
     assert_eq!(view.read_with(vcx, |a, _| a.ui.show_editor), !editor);
 }
 
+fn key(key: &str, shift: bool) -> gpui::Keystroke {
+    gpui::Keystroke {
+        modifiers: Modifiers {
+            shift,
+            ..Default::default()
+        },
+        key: key.into(),
+        key_char: None,
+    }
+}
+
+fn press(vcx: &mut gpui::VisualTestContext, k: &str, shift: bool) {
+    vcx.simulate_event(gpui::KeyDownEvent {
+        keystroke: key(k, shift),
+        is_held: false,
+    });
+}
+
+fn release(vcx: &mut gpui::VisualTestContext, k: &str) {
+    vcx.simulate_event(gpui::KeyUpEvent {
+        keystroke: key(k, false),
+    });
+}
+
+/// Review M20: Shift is a modifier (Shift-click, ⇧⌘S), never the sustain pedal.
+#[gpui::test]
+fn shift_is_not_the_sustain_pedal(cx: &mut TestAppContext) {
+    let (view, vcx) = window(cx);
+    press(vcx, "shift", true);
+    assert!(!view.read_with(vcx, |a, _| a.session.sustain), "Shift down");
+    // A pedal held on a keyboard is not lifted by letting go of Shift.
+    view.update(vcx, |a, _| {
+        a.session.handle_live(
+            surf_midi::LiveEvent::Sustain(true),
+            std::time::Instant::now(),
+            true,
+        )
+    });
+    release(vcx, "shift");
+    assert!(
+        view.read_with(vcx, |a, _| a.session.sustain),
+        "hardware pedal kept"
+    );
+}
+
+/// Musical Typing's pedal is Tab: down while held, and lifting it lifts only the
+/// pedal it put down.
+#[gpui::test]
+fn tab_is_the_musical_typing_pedal(cx: &mut TestAppContext) {
+    let (view, vcx) = window(cx);
+    vcx.simulate_keystrokes("secondary-k");
+    press(vcx, "tab", false);
+    assert!(view.read_with(vcx, |a, _| a.session.sustain), "Tab down");
+    release(vcx, "tab");
+    assert!(!view.read_with(vcx, |a, _| a.session.sustain), "Tab up");
+    // A hardware pedal already down: Tab neither takes it over nor lifts it.
+    view.update(vcx, |a, _| {
+        a.session.handle_live(
+            surf_midi::LiveEvent::Sustain(true),
+            std::time::Instant::now(),
+            true,
+        )
+    });
+    press(vcx, "tab", false);
+    release(vcx, "tab");
+    assert!(
+        view.read_with(vcx, |a, _| a.session.sustain),
+        "hardware pedal kept"
+    );
+}
+
+/// Review M21: with Musical Typing on (recording turns it on), R still stops
+/// recording and the transport keys still work.
+#[gpui::test]
+fn transport_keys_work_while_typing(cx: &mut TestAppContext) {
+    let (view, vcx) = window(cx);
+    vcx.simulate_keystrokes("secondary-k");
+    assert!(view.read_with(vcx, |a, _| a.ui.musical_typing));
+    vcx.simulate_keystrokes("r");
+    assert!(
+        view.read_with(vcx, |a, _| a.session.is_recording()),
+        "R starts"
+    );
+    vcx.simulate_keystrokes("r");
+    assert!(
+        !view.read_with(vcx, |a, _| a.session.is_recording()),
+        "R stops"
+    );
+    // Other letters stay notes: M plays nothing, mutes nothing.
+    let muted = view.read_with(vcx, |a, _| a.session.project.tracks[0].mute);
+    vcx.simulate_keystrokes("m");
+    assert_eq!(
+        view.read_with(vcx, |a, _| a.session.project.tracks[0].mute),
+        muted
+    );
+}
+
 /// The in-window menu bar is built from the same menus macOS gets, and its
 /// items carry the shortcut from the keymap.
 #[gpui::test]
