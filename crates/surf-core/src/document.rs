@@ -112,12 +112,20 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let name = path
         .file_name()
         .with_context(|| format!("{} has no file name", path.display()))?;
+    // A temp name of this call's own, created exclusively: two saves of one file
+    // at once never share (and truncate) each other's temp file.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut tmp_name = name.to_os_string();
-    tmp_name.push(format!(".tmp-{}", std::process::id()));
+    tmp_name.push(format!(".tmp-{}-{n}", std::process::id()));
     let tmp = path.with_file_name(tmp_name);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .with_context(|| format!("could not write {}", tmp.display()))?;
+    // From here on the temp file is this call's, so it is the one to clean up.
     let result = (|| {
-        let mut file = std::fs::File::create(&tmp)
-            .with_context(|| format!("could not write {}", tmp.display()))?;
         file.write_all(bytes)
             .with_context(|| format!("could not write {}", tmp.display()))?;
         file.sync_all()
@@ -129,8 +137,9 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return result;
     }
-    // The rename is only durable once the directory entry is on disk. Windows
-    // cannot open a directory this way, and its rename is already journaled.
+    // The rename is only durable once the directory entry is on disk, so a
+    // failure here fails the save. Windows cannot open a directory this way, and
+    // its rename is already journaled.
     #[cfg(unix)]
     if let Some(dir) = path.parent() {
         let dir = if dir.as_os_str().is_empty() {
@@ -138,9 +147,9 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         } else {
             dir
         };
-        if let Ok(d) = std::fs::File::open(dir) {
-            let _ = d.sync_all();
-        }
+        std::fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .with_context(|| format!("could not flush directory {}", dir.display()))?;
     }
     Ok(())
 }
@@ -169,7 +178,22 @@ mod tests {
             [std::ffi::OsString::from("kontakt.state")],
             "no temp file left"
         );
+        // Saves of one file from several threads at once each publish a whole file.
+        let threads: Vec<_> = (0..8u8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || write_atomic(&path, &vec![i; 64 * 1024]).unwrap())
+            })
+            .collect();
+        threads.into_iter().for_each(|t| t.join().unwrap());
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 64 * 1024);
+        assert!(
+            bytes.iter().all(|b| *b == bytes[0]),
+            "one writer's whole file"
+        );
         // A write that cannot complete leaves the old file as it was.
+        write_atomic(&path, b"new state, longer").unwrap();
         let missing = dir.join("no-such-dir").join("x.state");
         assert!(write_atomic(&missing, b"x").is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"new state, longer");
