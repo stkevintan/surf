@@ -75,6 +75,10 @@ pub struct Session {
     input_track: Option<Id>,
     /// The `.surf` file the project was opened from or last saved to.
     pub project_path: Option<PathBuf>,
+    /// A plugin's editor was opened since the last save or open. What happens
+    /// inside it (a new Kontakt instrument) is not an undoable edit, and Surf
+    /// cannot see it, so it counts as an unsaved change.
+    plugins_touched: bool,
     /// Plugin states from the opened project, used when each plugin's host
     /// first starts.
     project_states: std::collections::BTreeMap<PathBuf, Vec<u8>>,
@@ -125,6 +129,7 @@ impl Session {
             rack: Rack::new(),
             render_rx: None,
             rendering: false,
+            plugins_touched: false,
             pending_vst: std::env::var_os("SURF_VST").map(PathBuf::from),
             plugin_scan,
             sustain: false,
@@ -304,6 +309,7 @@ impl Session {
         }
         self.project = project;
         self.history.clear();
+        self.plugins_touched = false;
         self.record_arm = None;
         self.record_region = None;
         self.project_path = None;
@@ -588,6 +594,7 @@ impl Session {
         match doc.save(&path) {
             Ok(()) => {
                 self.history.mark_saved();
+                self.plugins_touched = false;
                 self.status = format!("Saved {}", path.display());
                 if !failed.is_empty() {
                     self.status.push_str(&format!(
@@ -642,6 +649,7 @@ impl Session {
         }
         self.project = doc.project;
         self.history.clear();
+        self.plugins_touched = false;
         self.record_arm = None;
         self.record_region = None;
         self.project_path = Some(path.to_path_buf());
@@ -695,7 +703,7 @@ impl Session {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.history.is_dirty()
+        self.history.is_dirty() || self.plugins_touched
     }
 
     /// Suggested file name for an export, without extension.
@@ -1023,14 +1031,16 @@ impl Session {
             self.status = "This track plays the built-in piano".to_string();
             return;
         };
-        let status = match host.client.open_editor() {
-            Ok(()) => format!(
-                "{} editor opened — tracks sharing it play on their own MIDI channels",
-                host.client.name
-            ),
+        let name = host.client.name.clone();
+        let opened = host.client.open_editor();
+        self.status = match opened {
+            Ok(()) => {
+                // Whatever the user changes in there is not an undo step.
+                self.plugins_touched = true;
+                format!("{name} editor opened — tracks sharing it play on their own MIDI channels")
+            }
             Err(err) => format!("Could not open plugin editor: {err:#}"),
         };
-        self.status = status;
     }
 
     pub fn save_vst_state(&mut self) {
@@ -1752,6 +1762,24 @@ mod tests {
 
     /// Save, edit, reopen: the file brings back the tracks and mix as saved,
     /// with a clean undo stack.
+    /// Review M23: changes made inside a plugin's editor are not undo steps, so
+    /// opening the editor counts as unsaved; saving clears it.
+    #[test]
+    fn using_a_plugin_editor_counts_as_unsaved() {
+        let path = temp_project("plugin-touched");
+        let mut s = two_tracks();
+        s.save_project_to(path.clone());
+        assert!(!s.is_dirty());
+        s.plugins_touched = true; // what a successful open_vst_editor sets
+        assert!(s.is_dirty(), "the plugin may have changed");
+        s.save_project_to(path.clone());
+        assert!(!s.is_dirty(), "saved with the plugin's state");
+        s.plugins_touched = true;
+        s.open_path(&path);
+        assert!(!s.is_dirty(), "a freshly opened project is clean");
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn a_saved_project_opens_as_it_was() {
         let path = temp_project("roundtrip");
