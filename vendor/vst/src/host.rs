@@ -779,6 +779,11 @@ impl PluginParameters for PluginParametersInstance {
             &mut ptr as *mut *mut u8 as *mut c_void,
             0.0,
         );
+        // Surf patch: a plugin without chunk support leaves the pointer null and
+        // returns 0 (or garbage). Building a slice from that is undefined behaviour.
+        if ptr.is_null() || len <= 0 {
+            return Vec::new();
+        }
         let slice = unsafe { slice::from_raw_parts(ptr, len as usize) };
         slice.to_vec()
     }
@@ -793,6 +798,11 @@ impl PluginParameters for PluginParametersInstance {
             &mut ptr as *mut *mut u8 as *mut c_void,
             0.0,
         );
+        // Surf patch: a plugin without chunk support leaves the pointer null and
+        // returns 0 (or garbage). Building a slice from that is undefined behaviour.
+        if ptr.is_null() || len <= 0 {
+            return Vec::new();
+        }
         let slice = unsafe { slice::from_raw_parts(ptr, len as usize) };
         slice.to_vec()
     }

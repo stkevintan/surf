@@ -430,7 +430,7 @@ impl Session {
         // The opened project's state wins over the last one saved for the
         // plugin; it goes through the parked file, which the host reads.
         if let Some(blob) = self.project_states.remove(path) {
-            let _ = std::fs::write(&parked, blob);
+            let _ = surf_core::document::write_atomic(&parked, &blob);
         }
         let state = if parked.exists() {
             Some(parked)

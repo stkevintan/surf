@@ -21,7 +21,7 @@ use surf_core::song::{TimedNote, Timeline};
 use surf_plugin::backends::vst2::{Vst2EditorWindow, Vst2Plugin};
 use surf_plugin::backends::vst3::{VstPlugin, render_vst_to_wav};
 use surf_plugin::format::{self, Format};
-use surf_plugin::protocol::{HelperEvent, HelperRequest, RenderNote};
+use surf_plugin::protocol::{HelperEvent, HelperRequest, RenderNote, Reply, Request};
 use surf_plugin::shm::{MidiKind, SharedMap};
 use vst3_host::window::PluginWindow;
 #[cfg(windows)]
@@ -265,9 +265,9 @@ fn main() -> Result<()> {
                 if line.is_empty() {
                     continue;
                 }
-                match serde_json::from_str::<HelperRequest>(line) {
+                match serde_json::from_str::<Request>(line) {
                     Ok(req) => {
-                        if tx.send(req).is_err() {
+                        if tx.send((req.id, req.request)).is_err() {
                             break;
                         }
                     }
@@ -275,7 +275,7 @@ fn main() -> Result<()> {
                 }
             }
             // Parent exited / closed the pipe.
-            let _ = tx.send(HelperRequest::Shutdown);
+            let _ = tx.send((0, HelperRequest::Shutdown));
         })
         .context("could not spawn helper control thread")?;
 
@@ -322,7 +322,7 @@ fn main() -> Result<()> {
             eprintln!("helper: editor closed by the user");
             send_event(&mut out, &HelperEvent::EditorClosed)?;
         }
-        while let Ok(request) = rx.try_recv() {
+        while let Ok((id, request)) = rx.try_recv() {
             match request {
                 HelperRequest::OpenEditor => {
                     // A plugin may allow only one live view (Kontakt), so the old editor has
@@ -337,34 +337,40 @@ fn main() -> Result<()> {
                             {
                                 editor_opened_at = Some(std::time::Instant::now());
                             }
-                            send_event(&mut out, &HelperEvent::EditorOpened)?;
+                            reply(&mut out, id, &HelperEvent::EditorOpened)?;
                         }
-                        Err(err) => send_error(&mut out, format!("{err:#}"))?,
+                        Err(err) => reply_error(&mut out, id, format!("{err:#}"))?,
                     }
                 }
                 HelperRequest::CloseEditor => {
                     editor = None;
-                    send_event(&mut out, &HelperEvent::EditorClosed)?;
+                    reply(&mut out, id, &HelperEvent::EditorClosed)?;
                 }
                 HelperRequest::SaveState { path } => match backend.state() {
-                    Ok(bytes) => match std::fs::write(&path, &bytes) {
-                        Ok(()) => send_event(
-                            &mut out,
-                            &HelperEvent::StateSaved {
-                                bytes: bytes.len(),
-                                path,
-                            },
-                        )?,
-                        Err(err) => send_error(&mut out, format!("{err}"))?,
-                    },
-                    Err(err) => send_error(&mut out, format!("{err:#}"))?,
+                    // Atomic: a host killed mid-write must not leave a truncated
+                    // state that every later load feeds to the plugin.
+                    Ok(bytes) => {
+                        match surf_core::document::write_atomic(std::path::Path::new(&path), &bytes)
+                        {
+                            Ok(()) => reply(
+                                &mut out,
+                                id,
+                                &HelperEvent::StateSaved {
+                                    bytes: bytes.len(),
+                                    path,
+                                },
+                            )?,
+                            Err(err) => reply_error(&mut out, id, format!("{err:#}"))?,
+                        }
+                    }
+                    Err(err) => reply_error(&mut out, id, format!("{err:#}"))?,
                 },
                 HelperRequest::LoadState { path } => match std::fs::read(&path) {
                     Ok(bytes) => match backend.load_state(&bytes) {
-                        Ok(()) => send_event(&mut out, &HelperEvent::StateLoaded)?,
-                        Err(err) => send_error(&mut out, format!("{err:#}"))?,
+                        Ok(()) => reply(&mut out, id, &HelperEvent::StateLoaded)?,
+                        Err(err) => reply_error(&mut out, id, format!("{err:#}"))?,
                     },
-                    Err(err) => send_error(&mut out, format!("{err}"))?,
+                    Err(err) => reply_error(&mut out, id, format!("{err}"))?,
                 },
                 HelperRequest::Render {
                     output,
@@ -398,18 +404,19 @@ fn main() -> Result<()> {
                         ),
                     };
                     match result {
-                        Ok((path, duration, peak)) => send_event(
+                        Ok((path, duration, peak)) => reply(
                             &mut out,
+                            id,
                             &HelperEvent::RenderDone {
                                 path,
                                 duration,
                                 peak,
                             },
                         )?,
-                        Err(err) => send_error(&mut out, format!("{err:#}"))?,
+                        Err(err) => reply_error(&mut out, id, format!("{err:#}"))?,
                     }
                 }
-                HelperRequest::Ping => send_event(&mut out, &HelperEvent::Pong)?,
+                HelperRequest::Ping => reply(&mut out, id, &HelperEvent::Pong)?,
                 HelperRequest::Shutdown => running = false,
             }
         }
@@ -464,14 +471,29 @@ fn parse_args() -> Result<Args> {
     })
 }
 
-fn send_event(out: &mut protocol_out::Out, event: &HelperEvent) -> Result<()> {
-    protocol_out::send(out, &serde_json::to_vec(event)?)?;
+fn write_reply(out: &mut protocol_out::Out, id: Option<u64>, event: &HelperEvent) -> Result<()> {
+    let reply = Reply {
+        id,
+        event: event.clone(),
+    };
+    protocol_out::send(out, &serde_json::to_vec(&reply)?)?;
     Ok(())
 }
 
-fn send_error(out: &mut protocol_out::Out, message: String) -> Result<()> {
+/// An event the host sends on its own, answering no request.
+fn send_event(out: &mut protocol_out::Out, event: &HelperEvent) -> Result<()> {
+    write_reply(out, None, event)
+}
+
+/// The reply to request `id`.
+fn reply(out: &mut protocol_out::Out, id: u64, event: &HelperEvent) -> Result<()> {
+    write_reply(out, Some(id), event)
+}
+
+/// An error in answer to request `id`.
+fn reply_error(out: &mut protocol_out::Out, id: u64, message: String) -> Result<()> {
     eprintln!("helper error: {message}");
-    send_event(out, &HelperEvent::Error { message })
+    reply(out, id, &HelperEvent::Error { message })
 }
 
 /// Let the OS deliver window events, which plugin editors depend on.
@@ -601,6 +623,8 @@ fn audio_loop(mut instrument: Box<dyn Instrument>, map: Arc<SharedMap>, stop: Ar
 
     let mut buffer = [0.0f32; 128];
     while !stop.load(Ordering::Acquire) {
+        // Proof of life for the UI: stops if the plugin hangs below.
+        map.beat();
         while let Some(msg) = map.pop_midi() {
             let ch = (msg.channel & 15) as u8;
             match msg.kind {
@@ -723,4 +747,4 @@ fn render_vst2_to_wav(
 
 // Keep the receiver type explicit for readability of the control loop.
 #[allow(dead_code)]
-fn _assert_receiver(_: Receiver<HelperRequest>) {}
+fn _assert_receiver(_: Receiver<(u64, HelperRequest)>) {}

@@ -68,6 +68,22 @@ impl SharedRegion {
         if fd < 0 {
             return Err(std::io::Error::last_os_error()).context("shm_open (open) failed");
         }
+        // Mapping past the object's end succeeds, but touching those pages raises
+        // SIGBUS. Refuse a region smaller than asked for (another build's layout).
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `fd` is a valid descriptor and `st` is writable.
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(err).context("fstat on shared memory failed");
+        }
+        if (st.st_size as u64) < size as u64 {
+            unsafe { libc::close(fd) };
+            anyhow::bail!(
+                "shared memory {name} is {} bytes, expected at least {size}",
+                st.st_size
+            );
+        }
         let ptr = map(fd, size);
         unsafe { libc::close(fd) };
         Ok(Self {

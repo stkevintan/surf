@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 pub use crate::protocol::{HelperEvent, HelperRequest, RenderNote};
+use crate::protocol::{Reply, Request, answers};
 use crate::remote::RemoteInstrument;
 use crate::shm::SharedMap;
 
@@ -25,7 +26,11 @@ pub struct VstClient {
     map: Arc<SharedMap>,
     child: Child,
     stdin: Mutex<BufWriter<ChildStdin>>,
-    events: Receiver<HelperEvent>,
+    /// Events with the id of the request they answer (none if unprompted).
+    events: Receiver<(Option<u64>, HelperEvent)>,
+    /// The id the next request gets.
+    next_id: u64,
+    heartbeat: Heartbeat,
     /// This helper's private `%TEMP%`, removed once the helper has exited.
     temp_dir: Option<PathBuf>,
 }
@@ -145,6 +150,8 @@ impl VstClient {
             child,
             stdin: Mutex::new(BufWriter::new(stdin)),
             events,
+            next_id: 1,
+            heartbeat: Heartbeat::default(),
             temp_dir,
         };
 
@@ -152,7 +159,7 @@ impl VstClient {
         // (it scans libraries and talks to NTKDaemon before the factory returns),
         // so 30s was timing out on a load that would have succeeded. Allow a wide
         // margin: a plugin that is merely slow should load, not be killed.
-        match client.wait_event(Duration::from_secs(240), |ev| {
+        match client.wait_event(Duration::from_secs(240), None, |ev| {
             matches!(ev, HelperEvent::Ready { .. })
         }) {
             Ok(HelperEvent::Ready { name, .. }) => {
@@ -210,26 +217,26 @@ impl VstClient {
     }
 
     pub fn open_editor(&mut self) -> Result<()> {
-        self.request(&HelperRequest::OpenEditor)?;
-        self.wait_event(Duration::from_secs(15), |ev| {
+        let id = self.request(&HelperRequest::OpenEditor)?;
+        self.wait_event(Duration::from_secs(15), Some(id), |ev| {
             matches!(ev, HelperEvent::EditorOpened)
         })?;
         Ok(())
     }
 
     pub fn close_editor(&mut self) -> Result<()> {
-        self.request(&HelperRequest::CloseEditor)?;
-        self.wait_event(Duration::from_secs(15), |ev| {
+        let id = self.request(&HelperRequest::CloseEditor)?;
+        self.wait_event(Duration::from_secs(15), Some(id), |ev| {
             matches!(ev, HelperEvent::EditorClosed)
         })?;
         Ok(())
     }
 
     pub fn save_state(&mut self, path: &Path) -> Result<usize> {
-        self.request(&HelperRequest::SaveState {
+        let id = self.request(&HelperRequest::SaveState {
             path: path.display().to_string(),
         })?;
-        match self.wait_event(Duration::from_secs(120), |ev| {
+        match self.wait_event(Duration::from_secs(120), Some(id), |ev| {
             matches!(ev, HelperEvent::StateSaved { .. })
         })? {
             HelperEvent::StateSaved { bytes, .. } => Ok(bytes),
@@ -238,10 +245,10 @@ impl VstClient {
     }
 
     pub fn load_state(&mut self, path: &Path) -> Result<()> {
-        self.request(&HelperRequest::LoadState {
+        let id = self.request(&HelperRequest::LoadState {
             path: path.display().to_string(),
         })?;
-        self.wait_event(Duration::from_secs(120), |ev| {
+        self.wait_event(Duration::from_secs(120), Some(id), |ev| {
             matches!(ev, HelperEvent::StateLoaded)
         })?;
         Ok(())
@@ -257,7 +264,7 @@ impl VstClient {
         controls: Vec<(u8, u8, u8)>,
     ) -> Result<(String, f64, f32)> {
         let output = std::path::absolute(output).unwrap_or_else(|_| output.to_path_buf());
-        self.request(&HelperRequest::Render {
+        let id = self.request(&HelperRequest::Render {
             output: output.display().to_string(),
             sample_rate,
             notes,
@@ -265,7 +272,7 @@ impl VstClient {
             tail_secs,
             controls,
         })?;
-        match self.wait_event(Duration::from_secs(600), |ev| {
+        match self.wait_event(Duration::from_secs(600), Some(id), |ev| {
             matches!(ev, HelperEvent::RenderDone { .. })
         })? {
             HelperEvent::RenderDone {
@@ -277,12 +284,27 @@ impl VstClient {
         }
     }
 
+    /// Whether the helper is still playing: its process is running and its
+    /// audio thread is not stuck (a plugin deadlocked in `process`). A stuck one
+    /// is reported dead, so its tracks fall back to the built-in piano and
+    /// dropping the client kills it.
     pub fn is_alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
+            && self.heartbeat.alive(self.map.beats(), Instant::now())
     }
 
-    fn request(&mut self, request: &HelperRequest) -> Result<()> {
-        let mut line = serde_json::to_vec(request)?;
+    /// Send `request` and return the id its reply will carry.
+    fn request(&mut self, request: &HelperRequest) -> Result<u64> {
+        // A request can hold the plugin for a while (saving Kontakt's state), and
+        // the audio thread waits on it meanwhile. Start the stall clock afresh
+        // after it rather than count that wait as a hang.
+        self.heartbeat.reset();
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut line = serde_json::to_vec(&Request {
+            id,
+            request: request.clone(),
+        })?;
         line.push(b'\n');
         let mut stdin = self
             .stdin
@@ -290,10 +312,18 @@ impl VstClient {
             .map_err(|_| anyhow::anyhow!("helper stdin poisoned"))?;
         stdin.write_all(&line)?;
         stdin.flush()?;
-        Ok(())
+        Ok(id)
     }
 
-    fn wait_event<F>(&mut self, timeout: Duration, wanted: F) -> Result<HelperEvent>
+    /// Wait for the event `wanted` picks among the replies to request `id` (any
+    /// event when `id` is none). Replies to other requests, such as a late one to
+    /// a request that already timed out, are skipped.
+    fn wait_event<F>(
+        &mut self,
+        timeout: Duration,
+        id: Option<u64>,
+        wanted: F,
+    ) -> Result<HelperEvent>
     where
         F: Fn(&HelperEvent) -> bool,
     {
@@ -304,8 +334,7 @@ impl VstClient {
                 anyhow::bail!("VST helper did not respond in time");
             }
             match self.events.recv_timeout(remaining) {
-                Ok(HelperEvent::Error { message }) => anyhow::bail!("VST helper: {message}"),
-                Ok(HelperEvent::Exited) => {
+                Ok((_, HelperEvent::Exited)) => {
                     let status = self
                         .child
                         .try_wait()
@@ -315,7 +344,11 @@ impl VstClient {
                         .unwrap_or_default();
                     anyhow::bail!("VST helper process exited{status}")
                 }
-                Ok(event) => {
+                // A reply to another request (one that already timed out), or an
+                // event nobody asked for: not this wait's answer.
+                Ok((got, _)) if !answers(id, got) => {}
+                Ok((_, HelperEvent::Error { message })) => anyhow::bail!("VST helper: {message}"),
+                Ok((_, event)) => {
                     if wanted(&event) {
                         return Ok(event);
                     }
@@ -351,6 +384,36 @@ impl Drop for VstClient {
         if let Some(dir) = &self.temp_dir {
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+}
+
+/// How long the helper's audio thread may make no progress before the helper
+/// counts as hung. Generous: a plugin may block it briefly while loading.
+const STALL: Duration = Duration::from_secs(10);
+
+/// Watches the helper's heartbeat across `is_alive` calls.
+#[derive(Default)]
+struct Heartbeat {
+    /// The last count seen, and when it last changed.
+    seen: Option<(u64, Instant)>,
+}
+
+impl Heartbeat {
+    fn alive(&mut self, beats: u64, now: Instant) -> bool {
+        match self.seen {
+            Some((last, since)) if last == beats => {
+                // Not started yet (still loading) is not a hang.
+                beats == 0 || now.duration_since(since) < STALL
+            }
+            _ => {
+                self.seen = Some((beats, now));
+                true
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        self.seen = None;
     }
 }
 
@@ -565,7 +628,7 @@ fn helper_path() -> Result<PathBuf> {
     )
 }
 
-fn spawn_reader(stdout: ChildStdout) -> Receiver<HelperEvent> {
+fn spawn_reader(stdout: ChildStdout) -> Receiver<(Option<u64>, HelperEvent)> {
     let (tx, rx) = channel();
     std::thread::Builder::new()
         .name("surf-vst-helper-events".into())
@@ -579,9 +642,9 @@ fn spawn_reader(stdout: ChildStdout) -> Receiver<HelperEvent> {
                 if line.is_empty() {
                     continue;
                 }
-                match serde_json::from_str::<HelperEvent>(line) {
-                    Ok(event) => {
-                        let _ = tx.send(event);
+                match serde_json::from_str::<Reply>(line) {
+                    Ok(Reply { id, event }) => {
+                        let _ = tx.send((id, event));
                     }
                     Err(_) => {
                         // Never let plugin chatter poison the protocol.
@@ -589,7 +652,7 @@ fn spawn_reader(stdout: ChildStdout) -> Receiver<HelperEvent> {
                     }
                 }
             }
-            let _ = tx.send(HelperEvent::Exited);
+            let _ = tx.send((None, HelperEvent::Exited));
         })
         .expect("failed to spawn helper reader thread");
     rx
@@ -598,6 +661,26 @@ fn spawn_reader(stdout: ChildStdout) -> Receiver<HelperEvent> {
 #[cfg(test)]
 mod tests {
     use super::{HELPER_PID_FILE, helper_dir_owner, new_helper_temp_dir, process_is_alive};
+
+    /// Review M13: a helper whose audio thread stops making progress for STALL
+    /// counts as dead; one still loading (no beat yet) or beating does not, and a
+    /// request restarts the clock.
+    #[test]
+    fn a_frozen_heartbeat_means_a_hung_helper() {
+        use super::{Heartbeat, STALL};
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut h = Heartbeat::default();
+        assert!(h.alive(0, t0));
+        assert!(h.alive(0, t0 + STALL * 3), "still loading");
+        assert!(h.alive(5, t0 + STALL * 3));
+        assert!(h.alive(9, t0 + STALL * 4), "beating");
+        assert!(h.alive(9, t0 + STALL * 4 + Duration::from_secs(1)));
+        assert!(!h.alive(9, t0 + STALL * 5), "frozen for STALL");
+        h.reset();
+        assert!(h.alive(9, t0 + STALL * 9), "a request restarts the clock");
+        assert!(!h.alive(9, t0 + STALL * 10));
+    }
 
     /// A pid that belonged to a process which has already exited.
     fn dead_pid() -> u32 {

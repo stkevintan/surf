@@ -88,15 +88,10 @@ impl Document {
         })
     }
 
-    /// Write atomically: to a temp file next to `path`, then rename, so a
-    /// crash mid-save never leaves a half-written project.
+    /// Write atomically (see [`write_atomic`]), so a crash mid-save never leaves
+    /// a half-written project.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let text = self.to_json()?;
-        let tmp = path.with_extension(format!("{EXTENSION}.tmp"));
-        std::fs::write(&tmp, text).with_context(|| format!("could not write {}", tmp.display()))?;
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("could not replace {}", path.display()))?;
-        Ok(())
+        write_atomic(path, self.to_json()?.as_bytes())
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -106,10 +101,142 @@ impl Document {
     }
 }
 
+/// A new file of this call's own in `path`'s directory, created exclusively.
+///
+/// The name is short (not `path`'s name plus a suffix, which could pass the
+/// filesystem's name limit for a long project name) and random enough that a
+/// stale one left by a killed writer, or a concurrent save, only costs a retry:
+/// an existing file is never opened, truncated or removed.
+fn create_temp_beside(path: &Path) -> Result<(std::path::PathBuf, std::fs::File)> {
+    use std::hash::{BuildHasher, Hasher};
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut last = None;
+    for _ in 0..16 {
+        // RandomState is seeded per process from the OS; mix in a counter, the
+        // pid and the clock so every attempt differs.
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        h.write_u32(std::process::id());
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
+        let tmp = path.with_file_name(format!(".surf-{:016x}.tmp", h.finish()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => return Ok((tmp, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => last = Some(err),
+            Err(err) => {
+                return Err(err).with_context(|| format!("could not write {}", tmp.display()));
+            }
+        }
+    }
+    Err(last.expect("16 attempts")).context("could not pick a temporary file name")
+}
+
+/// Replace `path` with `bytes` so that, whenever the process is killed or the
+/// machine loses power, `path` holds either the old contents or the new ones,
+/// never a truncated mix: write a temp file next to it, flush it to disk, rename
+/// it over `path`, then flush the directory so the rename itself is durable.
+/// Project files and plugin state files both go through here.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    if path.file_name().is_none() {
+        anyhow::bail!("{} has no file name", path.display());
+    }
+    let (tmp, mut file) = create_temp_beside(path)?;
+    // From here on the temp file is this call's, so it is the one to clean up.
+    let result = (|| {
+        file.write_all(bytes)
+            .with_context(|| format!("could not write {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("could not flush {}", tmp.display()))?;
+        drop(file);
+        std::fs::rename(&tmp, path).with_context(|| format!("could not replace {}", path.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return result;
+    }
+    // The rename is only durable once the directory entry is on disk, so a
+    // failure here fails the save. Windows cannot open a directory this way, and
+    // its rename is already journaled.
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        std::fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .with_context(|| format!("could not flush directory {}", dir.display()))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::song::Song;
+
+    /// Review M10: the old file stays whole until the new one is complete, and no
+    /// temp file is left behind.
+    #[test]
+    fn write_atomic_replaces_whole_files() {
+        let dir = std::env::temp_dir().join(format!("surf-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kontakt.state");
+        write_atomic(&path, b"old state").unwrap();
+        write_atomic(&path, b"new state, longer").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new state, longer");
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            left,
+            [std::ffi::OsString::from("kontakt.state")],
+            "no temp file left"
+        );
+        // Saves of one file from several threads at once each publish a whole file.
+        let threads: Vec<_> = (0..8u8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || write_atomic(&path, &vec![i; 64 * 1024]).unwrap())
+            })
+            .collect();
+        threads.into_iter().for_each(|t| t.join().unwrap());
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 64 * 1024);
+        assert!(
+            bytes.iter().all(|b| *b == bytes[0]),
+            "one writer's whole file"
+        );
+        // A name near the filesystem's limit still saves: the temp name is short.
+        let long = dir.join(format!("{}.surf", "x".repeat(245)));
+        write_atomic(&long, b"long name").unwrap();
+        assert_eq!(std::fs::read(&long).unwrap(), b"long name");
+        std::fs::remove_file(&long).unwrap();
+        // A stale temp file is left alone, not reused or removed.
+        let stale = dir.join(".surf-0000000000000000.tmp");
+        std::fs::write(&stale, b"stale").unwrap();
+        write_atomic(&path, b"after stale").unwrap();
+        assert_eq!(std::fs::read(&stale).unwrap(), b"stale");
+        std::fs::remove_file(&stale).unwrap();
+        // A write that cannot complete leaves the old file as it was.
+        write_atomic(&path, b"new state, longer").unwrap();
+        let missing = dir.join("no-such-dir").join("x.state");
+        assert!(write_atomic(&missing, b"x").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"new state, longer");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn doc() -> Document {
         let mut project = Project::from_song(&Song::demo());
