@@ -87,11 +87,14 @@ pub(crate) fn list_ports() -> Result<Vec<String>> {
     Ok((0..count).filter_map(device_name).collect())
 }
 
-pub(crate) fn open(index: usize, deliver: Deliver) -> Result<Connection> {
-    let index = index as u32;
-    if device_name(index).is_none() {
-        anyhow::bail!("midiInGetDevCapsW failed for device {index}");
-    }
+pub(crate) fn open(name: &str, nth: usize, deliver: Deliver) -> Result<Connection> {
+    let count = unsafe { midiInGetNumDevs() };
+    let Some(index) = (0..count)
+        .filter(|i| device_name(*i).as_deref() == Some(name))
+        .nth(nth)
+    else {
+        anyhow::bail!("no MIDI input named {name}");
+    };
     let ctx = Box::into_raw(Box::new(CallbackCtx { deliver }));
     let mut handle = HMIDIIN(std::ptr::null_mut());
     let rc = unsafe {
