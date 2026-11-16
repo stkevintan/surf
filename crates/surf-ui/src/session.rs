@@ -424,7 +424,18 @@ impl Session {
     /// Routes, slot gains and channel volumes for the current project.
     fn send_plan(&mut self) {
         let plan = rack::plan(&self.project, &self.rack.slots, &self.rack.failed);
-        self.audio.send(Command::SetRoutes(plan.routes));
+        // Live input plays the record-armed track, else the selected one.
+        let input = self
+            .armed_track()
+            .or(self.input_track)
+            .and_then(|id| self.project.tracks.iter().position(|t| t.id == id))
+            .unwrap_or(0);
+        // Routes and input in one command, so a held pedal never passes through
+        // the new routes paired with the old input index.
+        self.audio.send(Command::SetRoutesAndInput {
+            routes: plan.routes,
+            input: input as u16,
+        });
         for (slot, gain) in plan.gains {
             self.audio.send(Command::SetSlotGain { slot, gain });
         }
@@ -438,13 +449,6 @@ impl Session {
                 });
             }
         }
-        // Live input plays the record-armed track, else the selected one.
-        let input = self
-            .armed_track()
-            .or(self.input_track)
-            .and_then(|id| self.project.tracks.iter().position(|t| t.id == id))
-            .unwrap_or(0);
-        self.audio.send(Command::SetInput(input as u16));
     }
 
     /// Start a plugin host, restoring the state saved for the plugin (or

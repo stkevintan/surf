@@ -58,6 +58,13 @@ pub enum Command {
     },
     /// The route of every track, by track index (`TimedNote::track`).
     SetRoutes(Vec<Route>),
+    /// New routes and live-input track together, as one change: a held pedal
+    /// moves only from the old input route to the final one, never through an
+    /// in-between pairing of new routes with the old input index.
+    SetRoutesAndInput {
+        routes: Vec<Route>,
+        input: u16,
+    },
     /// Linear output gain of a slot: the track's fader, or for a shared
     /// plugin the loudest of its tracks.
     SetSlotGain {
@@ -429,6 +436,13 @@ impl Core {
                     *g = gain.clamp(0.0, 2.0);
                 }
             }
+            Command::SetRoutesAndInput { routes, input } => {
+                let before = self.route(self.input);
+                let old = std::mem::replace(&mut self.routes, routes);
+                self.input = input;
+                self.retire(Retired::Routes(old));
+                self.hand_pedal_over(before);
+            }
             Command::SetInput(track) => {
                 let before = self.route(self.input);
                 self.input = track;
@@ -621,7 +635,10 @@ impl Core {
         while let Some(command) = rx.try_recv() {
             let retires = matches!(
                 command,
-                Command::Play { .. } | Command::Update { .. } | Command::SetRoutes(_)
+                Command::Play { .. }
+                    | Command::Update { .. }
+                    | Command::SetRoutes(_)
+                    | Command::SetRoutesAndInput { .. }
             );
             if retires && !self.has_retire_room() {
                 self.deferred = Some(command);
@@ -1727,6 +1744,36 @@ mod tests {
             channel: 3,
         }]));
         assert_eq!(*fresh.lock(), ["pedal false", "pedal true"]);
+    }
+
+    /// Review: deleting an earlier track shifts both the routes and the input
+    /// index. Applied together, the instrument the input stays on keeps its
+    /// pedal: no up-down blip that would release a sustained note.
+    #[test]
+    fn routes_and_input_move_together() {
+        let (mut c, calls) = recorder_core();
+        c.apply(Command::SetRoutes(vec![
+            Route {
+                slot: 0,
+                channel: 0,
+            },
+            Route {
+                slot: 1,
+                channel: 0,
+            },
+        ]));
+        c.apply(Command::SetInput(1));
+        c.apply(Command::Sustain(true));
+        calls.lock().clear();
+        // Track 0 deleted: track 1 (slot 1) is now index 0.
+        c.apply(Command::SetRoutesAndInput {
+            routes: vec![Route {
+                slot: 1,
+                channel: 0,
+            }],
+            input: 0,
+        });
+        assert!(calls.lock().is_empty(), "{:?}", calls.lock());
     }
 
     /// Stop still resets everything, pedal included.
