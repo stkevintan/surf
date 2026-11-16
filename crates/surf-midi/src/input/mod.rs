@@ -74,6 +74,10 @@ pub struct MidiHub {
     devices: Vec<String>,
     connection: Option<backend::Connection>,
     selected: Option<usize>,
+    /// The port to be on: the last one connected. Kept while it is unplugged, so
+    /// it is picked up again when it returns instead of Surf staying on whatever
+    /// else happens to be listed.
+    wanted: Option<String>,
     rx: Receiver<TimedMidi>,
     tx: Sender<TimedMidi>,
     sink: NoteSink,
@@ -94,6 +98,7 @@ impl MidiHub {
             devices: Vec::new(),
             connection: None,
             selected: None,
+            wanted: None,
             rx,
             tx,
             sink,
@@ -113,7 +118,7 @@ impl MidiHub {
         if !notified && self.last_scan.elapsed() < POLL_FALLBACK {
             return None;
         }
-        let before_name = self.selected.and_then(|i| self.devices.get(i).cloned());
+        let connected = self.selected.and_then(|i| self.devices.get(i).cloned());
         let before_ports = self.devices.clone();
         let ports = match backend::list_ports() {
             Ok(ports) => ports,
@@ -129,34 +134,31 @@ impl MidiHub {
         }
         self.devices = ports;
 
-        match before_name {
-            // Still there: keep the connection if the index is unchanged,
-            // otherwise reconnect by name (indices shift as ports come and go).
-            Some(name) if self.devices.contains(&name) => {
-                if self.devices.get(self.selected.unwrap_or(usize::MAX)) != Some(&name) {
-                    let _ = self.connect_by_name(&name);
-                }
+        let target = pick(self.wanted.as_deref(), &before_ports, &self.devices);
+        match (connected, target) {
+            // Already on the right port. Indices may have shifted; the connection
+            // was opened by name and stays as it is.
+            (Some(now), target)
+                if self.devices.contains(&now) && target.as_ref().is_none_or(|t| *t == now) =>
+            {
+                self.selected = self.devices.iter().position(|p| *p == now);
                 None
             }
-            Some(name) => {
+            (connected, Some(target)) => match self.connect_by_name(&target) {
+                Ok(()) => Some(PortChange::Connected(target)),
+                Err(_) => connected.map(|name| {
+                    self.disconnect();
+                    PortChange::Disconnected(name)
+                }),
+            },
+            (Some(name), None) => {
+                // Gone, and nothing to switch to. Stay disconnected rather than
+                // grabbing an unrelated port; `wanted` brings it back on replug.
                 self.disconnect();
-                // Fall through to auto-connect another port, if any.
-                self.connect_first_new(&before_ports)
-                    .or(Some(PortChange::Disconnected(name)))
+                Some(PortChange::Disconnected(name))
             }
-            None => self.connect_first_new(&before_ports),
+            (None, None) => None,
         }
-    }
-
-    /// Connect to the first port that was not in `before`, else the first port.
-    fn connect_first_new(&mut self, before: &[String]) -> Option<PortChange> {
-        let index = self
-            .devices
-            .iter()
-            .position(|p| !before.contains(p))
-            .or((!self.devices.is_empty()).then_some(0))?;
-        self.connect(index).ok()?;
-        Some(PortChange::Connected(self.devices[index].clone()))
     }
 
     /// Re-enumerate ports. Connects to the first port when nothing is connected.
@@ -202,10 +204,14 @@ impl MidiHub {
             sink(event);
             let _ = tx.send(TimedMidi { at, event });
         });
-        match backend::open(index, deliver) {
+        // Open by name: the backend re-enumerates, and an index could point at a
+        // different port if one came or went in between.
+        let name = self.devices[index].clone();
+        match backend::open(&name, deliver) {
             Ok(connection) => {
                 self.connection = Some(connection);
                 self.selected = Some(index);
+                self.wanted = Some(name);
                 self.error = None;
                 Ok(())
             }
@@ -233,6 +239,18 @@ impl MidiHub {
             None => Err(anyhow::anyhow!("MIDI input {name} is not connected")),
         }
     }
+}
+
+/// Which port to be on after the list changed from `before` to `now`: the wanted
+/// one if it is listed, else one that just appeared (a keyboard plugged in), else
+/// none. Never an arbitrary port that was already there.
+fn pick(wanted: Option<&str>, before: &[String], now: &[String]) -> Option<String> {
+    if let Some(wanted) = wanted
+        && now.iter().any(|p| p == wanted)
+    {
+        return Some(wanted.to_string());
+    }
+    now.iter().find(|p| !before.contains(p)).cloned()
 }
 
 /// Parse a channel voice message. Surf only acts on notes and the sustain pedal.
@@ -276,6 +294,39 @@ mod tests {
                 velocity: 100
             })
         );
+    }
+
+    fn ports(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// Review M16: unplugging the keyboard must not grab an unrelated port, and
+    /// plugging it back in returns to it.
+    #[test]
+    fn hot_plug_returns_to_the_wanted_port() {
+        let all = ports(&["Midi Through", "Keyboard"]);
+        let unplugged = ports(&["Midi Through"]);
+        // Unplugged: nothing new appeared, so no port is picked.
+        assert_eq!(pick(Some("Keyboard"), &all, &unplugged), None);
+        // Plugged back in: it is the wanted port again.
+        assert_eq!(
+            pick(Some("Keyboard"), &unplugged, &all),
+            Some("Keyboard".to_string())
+        );
+        // A new device while on the wanted one does not steal the input.
+        let more = ports(&["Midi Through", "Keyboard", "Pad"]);
+        assert_eq!(
+            pick(Some("Keyboard"), &all, &more),
+            Some("Keyboard".to_string())
+        );
+        // With the wanted one gone, a newly plugged device is taken.
+        let swap = ports(&["Midi Through", "Pad"]);
+        assert_eq!(
+            pick(Some("Keyboard"), &unplugged, &swap),
+            Some("Pad".to_string())
+        );
+        // Nothing wanted yet: only a new port, never an old one.
+        assert_eq!(pick(None, &unplugged, &unplugged), None);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use midly::num::{u4, u7, u24, u28};
 use midly::{Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind};
-use surf_core::song::{DEFAULT_PPQ, DRUM_CHANNEL, Note, Song, Tempo};
+use surf_core::song::{DRUM_CHANNEL, Note, Song, Tempo};
 
 pub fn load(path: impl AsRef<Path>) -> Result<Song> {
     let path = path.as_ref();
@@ -29,15 +29,17 @@ pub fn load(path: impl AsRef<Path>) -> Result<Song> {
 
 pub fn from_bytes(bytes: &[u8], name: &str) -> Result<Song> {
     let smf = Smf::parse(bytes).context("invalid Standard MIDI File")?;
-    let ppq = match smf.header.timing {
-        Timing::Metrical(ppq) => ppq.as_int(),
-        Timing::Timecode(_, _) => {
-            // SMPTE timing is vanishingly rare in piano MIDI; fall back to
-            // a musical grid rather than refusing the file.
-            DEFAULT_PPQ
+    // SMPTE files count ticks in real time (frames x subframes per second) and
+    // ignore tempo events. Model that as one quarter per second at a fixed tempo,
+    // so a tick lasts what the file says instead of 1/960 s.
+    let (ppq, smpte_bpm) = match smf.header.timing {
+        Timing::Metrical(ppq) => (ppq.as_int().max(1), None),
+        Timing::Timecode(fps, subframes) => {
+            let per_sec = fps.as_f32() as f64 * subframes.max(1) as f64;
+            let ppq = per_sec.round().clamp(1.0, u16::MAX as f64) as u16;
+            (ppq, Some(60.0 * per_sec / ppq as f64))
         }
-    }
-    .max(1);
+    };
 
     let mut tempos = Vec::new();
     let mut time_signature = (4u8, 4u8);
@@ -52,6 +54,7 @@ pub fn from_bytes(bytes: &[u8], name: &str) -> Result<Song> {
         for event in track {
             tick += event.delta.as_int() as u64;
             match event.kind {
+                TrackEventKind::Meta(MetaMessage::Tempo(_)) if smpte_bpm.is_some() => {}
                 TrackEventKind::Meta(MetaMessage::Tempo(us_per_quarter)) => {
                     let us = us_per_quarter.as_int();
                     if us > 0 {
@@ -112,6 +115,9 @@ pub fn from_bytes(bytes: &[u8], name: &str) -> Result<Song> {
         }
     }
 
+    if let Some(bpm) = smpte_bpm {
+        tempos = vec![Tempo { tick: 0, bpm }];
+    }
     // A file that only carries tempo should still start at 120 BPM.
     if tempos.is_empty() {
         tempos.push(Tempo {
@@ -302,8 +308,26 @@ fn close_note(
     });
 }
 
-/// Extend note-offs that happen while the sustain pedal is held.
+/// Extend note-offs that happen while the sustain pedal is held, but never past
+/// the next note-on of the same key on the same channel: re-striking a held key
+/// ends the old note, so extending past it would overlap the two.
 fn apply_sustain(notes: &mut [Note], pedals: &HashMap<u8, Vec<(u64, bool)>>) {
+    let mut starts: HashMap<(u8, u8), Vec<u64>> = HashMap::new();
+    for n in notes.iter() {
+        starts
+            .entry((n.channel, n.key))
+            .or_default()
+            .push(n.start_tick);
+    }
+    for list in starts.values_mut() {
+        list.sort_unstable();
+    }
+    let next_strike = |note: &Note| {
+        starts.get(&(note.channel, note.key)).and_then(|list| {
+            let i = list.partition_point(|t| *t <= note.start_tick);
+            list.get(i).copied()
+        })
+    };
     for note in notes {
         let Some(events) = pedals.get(&note.channel) else {
             continue;
@@ -317,12 +341,15 @@ fn apply_sustain(notes: &mut [Note], pedals: &HashMap<u8, Vec<(u64, bool)>>) {
         if !events[idx].1 {
             continue;
         }
-        // Sustain is down: hold until the next pedal-up.
-        if let Some((up_tick, _)) = events[idx + 1..].iter().find(|(_, down)| !*down) {
-            note.duration_ticks = up_tick.saturating_sub(note.start_tick).max(1);
-        } else {
-            note.duration_ticks = note.duration_ticks.saturating_add(1);
+        // Sustain is down: hold until the next pedal-up, or the key is struck again.
+        let mut held_to = match events[idx + 1..].iter().find(|(_, down)| !*down) {
+            Some((up_tick, _)) => *up_tick,
+            None => end.saturating_add(1),
+        };
+        if let Some(strike) = next_strike(note) {
+            held_to = held_to.min(strike.max(end));
         }
+        note.duration_ticks = held_to.saturating_sub(note.start_tick).max(1);
     }
 }
 
@@ -349,6 +376,106 @@ mod tests {
             },
         ];
         song
+    }
+
+    fn on(delta: u32, key: u8) -> TrackEvent<'static> {
+        TrackEvent {
+            delta: u28::new(delta),
+            kind: TrackEventKind::Midi {
+                channel: u4::new(0),
+                message: MidiMessage::NoteOn {
+                    key: u7::new(key),
+                    vel: u7::new(100),
+                },
+            },
+        }
+    }
+
+    fn off(delta: u32, key: u8) -> TrackEvent<'static> {
+        TrackEvent {
+            delta: u28::new(delta),
+            kind: TrackEventKind::Midi {
+                channel: u4::new(0),
+                message: MidiMessage::NoteOff {
+                    key: u7::new(key),
+                    vel: u7::new(0),
+                },
+            },
+        }
+    }
+
+    fn pedal(delta: u32, down: bool) -> TrackEvent<'static> {
+        TrackEvent {
+            delta: u28::new(delta),
+            kind: TrackEventKind::Midi {
+                channel: u4::new(0),
+                message: MidiMessage::Controller {
+                    controller: u7::new(64),
+                    value: u7::new(if down { 127 } else { 0 }),
+                },
+            },
+        }
+    }
+
+    fn encode(timing: Timing, events: Vec<TrackEvent<'static>>) -> Vec<u8> {
+        let mut smf = Smf::new(Header::new(Format::SingleTrack, timing));
+        let mut track = events;
+        track.push(TrackEvent {
+            delta: u28::new(0),
+            kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+        });
+        smf.tracks.push(track);
+        let mut bytes = Vec::new();
+        smf.write(&mut bytes).unwrap();
+        bytes
+    }
+
+    /// Review M17: SMPTE timing counts real time. At 25 fps x 40 subframes a
+    /// tick is 1 ms, so a note 1000 ticks in starts at 1 s and lasts 0.5 s.
+    #[test]
+    fn smpte_files_keep_their_real_time() {
+        let bytes = encode(
+            Timing::Timecode(midly::Fps::Fps25, 40),
+            vec![on(1000, 60), off(500, 60)],
+        );
+        let song = from_bytes(&bytes, "smpte").unwrap();
+        let tl = song.timeline();
+        assert!(
+            (tl.notes[0].start - 1.0).abs() < 1e-9,
+            "{}",
+            tl.notes[0].start
+        );
+        assert!((tl.notes[0].end - 1.5).abs() < 1e-9, "{}", tl.notes[0].end);
+    }
+
+    /// Review M17: a key re-struck under the pedal ends the earlier note there
+    /// instead of both sounding until the pedal comes up.
+    #[test]
+    fn sustain_stops_at_the_next_strike_of_the_key() {
+        let bytes = encode(
+            Timing::Metrical(480.into()),
+            vec![
+                pedal(0, true),
+                on(0, 60),
+                off(100, 60),
+                on(380, 60),
+                off(100, 60),
+                pedal(1440, false),
+            ],
+        );
+        let song = from_bytes(&bytes, "sustain").unwrap();
+        assert_eq!(song.notes.len(), 2);
+        let (a, b) = (&song.notes[0], &song.notes[1]);
+        assert_eq!(
+            (a.start_tick, a.end_tick()),
+            (0, 480),
+            "first held to the re-strike"
+        );
+        assert_eq!(
+            (b.start_tick, b.end_tick()),
+            (480, 2020),
+            "second held to pedal-up"
+        );
     }
 
     #[test]

@@ -59,9 +59,11 @@ pub(crate) fn list_ports() -> Result<Vec<String>> {
     Ok(Sources.into_iter().map(|s| source_name(&s)).collect())
 }
 
-pub(crate) fn open(index: usize, deliver: Deliver) -> Result<Connection> {
-    let source =
-        Source::from_index(index).with_context(|| format!("no MIDI input at index {index}"))?;
+pub(crate) fn open(name: &str, deliver: Deliver) -> Result<Connection> {
+    let source = Sources
+        .into_iter()
+        .find(|s| source_name(s) == name)
+        .with_context(|| format!("no MIDI input named {name}"))?;
     let client = Client::new("Surf")
         .map_err(|status| anyhow::anyhow!("MIDIClientCreate failed ({status})"))?;
     let port = client
