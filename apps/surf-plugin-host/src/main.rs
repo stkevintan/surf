@@ -347,16 +347,21 @@ fn main() -> Result<()> {
                     send_event(&mut out, &HelperEvent::EditorClosed)?;
                 }
                 HelperRequest::SaveState { path } => match backend.state() {
-                    Ok(bytes) => match std::fs::write(&path, &bytes) {
-                        Ok(()) => send_event(
-                            &mut out,
-                            &HelperEvent::StateSaved {
-                                bytes: bytes.len(),
-                                path,
-                            },
-                        )?,
-                        Err(err) => send_error(&mut out, format!("{err}"))?,
-                    },
+                    // Atomic: a host killed mid-write must not leave a truncated
+                    // state that every later load feeds to the plugin.
+                    Ok(bytes) => {
+                        match surf_core::document::write_atomic(std::path::Path::new(&path), &bytes)
+                        {
+                            Ok(()) => send_event(
+                                &mut out,
+                                &HelperEvent::StateSaved {
+                                    bytes: bytes.len(),
+                                    path,
+                                },
+                            )?,
+                            Err(err) => send_error(&mut out, format!("{err:#}"))?,
+                        }
+                    }
                     Err(err) => send_error(&mut out, format!("{err:#}"))?,
                 },
                 HelperRequest::LoadState { path } => match std::fs::read(&path) {

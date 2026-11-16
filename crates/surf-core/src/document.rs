@@ -88,15 +88,10 @@ impl Document {
         })
     }
 
-    /// Write atomically: to a temp file next to `path`, then rename, so a
-    /// crash mid-save never leaves a half-written project.
+    /// Write atomically (see [`write_atomic`]), so a crash mid-save never leaves
+    /// a half-written project.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let text = self.to_json()?;
-        let tmp = path.with_extension(format!("{EXTENSION}.tmp"));
-        std::fs::write(&tmp, text).with_context(|| format!("could not write {}", tmp.display()))?;
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("could not replace {}", path.display()))?;
-        Ok(())
+        write_atomic(path, self.to_json()?.as_bytes())
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -106,10 +101,80 @@ impl Document {
     }
 }
 
+/// Replace `path` with `bytes` so that, whenever the process is killed or the
+/// machine loses power, `path` holds either the old contents or the new ones,
+/// never a truncated mix: write a temp file next to it, flush it to disk, rename
+/// it over `path`, then flush the directory so the rename itself is durable.
+/// Project files and plugin state files both go through here.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let name = path
+        .file_name()
+        .with_context(|| format!("{} has no file name", path.display()))?;
+    let mut tmp_name = name.to_os_string();
+    tmp_name.push(format!(".tmp-{}", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+    let result = (|| {
+        let mut file = std::fs::File::create(&tmp)
+            .with_context(|| format!("could not write {}", tmp.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("could not write {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("could not flush {}", tmp.display()))?;
+        drop(file);
+        std::fs::rename(&tmp, path).with_context(|| format!("could not replace {}", path.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return result;
+    }
+    // The rename is only durable once the directory entry is on disk. Windows
+    // cannot open a directory this way, and its rename is already journaled.
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::song::Song;
+
+    /// Review M10: the old file stays whole until the new one is complete, and no
+    /// temp file is left behind.
+    #[test]
+    fn write_atomic_replaces_whole_files() {
+        let dir = std::env::temp_dir().join(format!("surf-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kontakt.state");
+        write_atomic(&path, b"old state").unwrap();
+        write_atomic(&path, b"new state, longer").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new state, longer");
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            left,
+            [std::ffi::OsString::from("kontakt.state")],
+            "no temp file left"
+        );
+        // A write that cannot complete leaves the old file as it was.
+        let missing = dir.join("no-such-dir").join("x.state");
+        assert!(write_atomic(&missing, b"x").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"new state, longer");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn doc() -> Document {
         let mut project = Project::from_song(&Song::demo());
