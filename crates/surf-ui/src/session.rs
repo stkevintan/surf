@@ -64,8 +64,12 @@ pub struct Session {
     pub status: String,
     /// Engine state sampled once per frame by [`Session::tick`].
     pub engine: EngineStatus,
-    /// Sustain pedal state, for the UI indicator and the held-note highlight.
+    /// Sustain pedal state, for the UI indicator and the held-note highlight:
+    /// down while the hardware pedal or Musical Typing's pedal key is.
     pub sustain: bool,
+    /// The two pedals behind `sustain`. Each lifts only itself.
+    hw_pedal: bool,
+    typing_pedal: bool,
     /// Keys whose note-off arrived while the pedal was down. They sound until the
     /// pedal lifts, so the keyboard should keep showing them as ringing.
     pub sustained_keys: HashSet<u8>,
@@ -133,6 +137,8 @@ impl Session {
             pending_vst: std::env::var_os("SURF_VST").map(PathBuf::from),
             plugin_scan,
             sustain: false,
+            hw_pedal: false,
+            typing_pedal: false,
             sustained_keys: HashSet::new(),
             record_arm: None,
             input_track: None,
@@ -594,16 +600,23 @@ impl Session {
         match doc.save(&path) {
             Ok(()) => {
                 self.history.mark_saved();
-                self.plugins_touched = false;
-                self.status = format!("Saved {}", path.display());
-                if !failed.is_empty() {
-                    self.status.push_str(&format!(
-                        " · without plugin state for {}",
+                self.project_path = Some(path.clone());
+                if failed.is_empty() {
+                    self.plugins_touched = false;
+                    self.status = format!("Saved {}", path.display());
+                    true
+                } else {
+                    // The file holds an older state for these plugins: their
+                    // changes are not saved, so the project stays unsaved and
+                    // closing it asks again.
+                    self.plugins_touched = true;
+                    self.status = format!(
+                        "Saved {} without the current plugin state for {}",
+                        path.display(),
                         failed.join(", ")
-                    ));
+                    );
+                    false
                 }
-                self.project_path = Some(path);
-                true
             }
             Err(err) => {
                 self.status = format!("Could not save: {err:#}");
@@ -1171,18 +1184,41 @@ impl Session {
                 }
             }
             LiveEvent::Sustain(down) => {
-                self.sustain = down;
-                if !down {
-                    // Pedal up: everything it was holding stops ringing.
-                    self.sustained_keys.clear();
-                }
-                if self.recorder.is_recording() {
-                    self.recorder.sustain(down, at);
-                }
+                self.hw_pedal = down;
                 if send_audio {
                     self.audio.sustain(down);
                 }
+                self.pedal_changed(at);
             }
+        }
+    }
+
+    /// Musical Typing's pedal key went down or up. It is a pedal of its own:
+    /// lifting it does not lift a hardware pedal that is still down.
+    pub fn typing_sustain(&mut self, down: bool) {
+        self.typing_pedal = down;
+        self.audio.typing_sustain(down);
+        self.pedal_changed(Instant::now());
+    }
+
+    /// Whether Musical Typing's pedal key is down.
+    pub fn typing_pedal(&self) -> bool {
+        self.typing_pedal
+    }
+
+    /// Update the combined pedal after one of the two moved.
+    fn pedal_changed(&mut self, at: Instant) {
+        let down = self.hw_pedal || self.typing_pedal;
+        if down == self.sustain {
+            return;
+        }
+        self.sustain = down;
+        if !down {
+            // Pedal up: everything it was holding stops ringing.
+            self.sustained_keys.clear();
+        }
+        if self.recorder.is_recording() {
+            self.recorder.sustain(down, at);
         }
     }
 
@@ -1201,6 +1237,11 @@ impl Session {
     /// Advance per-frame state: drain MIDI, react to devices and plugin
     /// crashes, finish background renders, sample the engine.
     pub fn tick(&mut self) {
+        // Changes inside a plugin's editor are not undo steps: while one is open,
+        // even after a save, the project may have changed.
+        if self.rack.hosts.iter_mut().any(|h| h.client.editor_open()) {
+            self.plugins_touched = true;
+        }
         if let Some(path) = self.pending_vst.take()
             && path.exists()
         {
@@ -1763,7 +1804,8 @@ mod tests {
     /// Save, edit, reopen: the file brings back the tracks and mix as saved,
     /// with a clean undo stack.
     /// Review M23: changes made inside a plugin's editor are not undo steps, so
-    /// opening the editor counts as unsaved; saving clears it.
+    /// opening the editor counts as unsaved; saving clears it. (While an editor
+    /// stays open, `tick` sets it again; that needs a running plugin host.)
     #[test]
     fn using_a_plugin_editor_counts_as_unsaved() {
         let path = temp_project("plugin-touched");

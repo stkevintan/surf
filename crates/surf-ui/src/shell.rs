@@ -89,10 +89,6 @@ pub struct Ui {
     pub count_in: bool,
     /// Computer keys currently held for Musical Typing, and the note each plays.
     pub typing_keys: HashMap<String, u8>,
-    /// Musical Typing's sustain key (Tab) holds the pedal down. Kept apart from
-    /// the session's pedal state so letting go of Tab never lifts a hardware
-    /// pedal, and only a pedal Tab pressed is lifted.
-    pub typing_pedal: bool,
     /// Splitter drag in progress: (pointer y at start, editor height at start).
     pub splitter_drag: Option<(f32, f32)>,
     /// Which channel-strip fader is being dragged.
@@ -182,7 +178,6 @@ impl Default for Ui {
             metronome: false,
             count_in: false,
             typing_keys: HashMap::new(),
-            typing_pedal: false,
             splitter_drag: None,
             fader_drag: None,
             fader_bounds: Rc::default(),
@@ -312,6 +307,9 @@ impl SurfApp {
     /// Reset the editors after the whole project was replaced.
     pub fn after_project_replaced(&mut self) {
         self.ui.edit = Editing::default();
+        // A new project starts at bar 1 and its first track.
+        self.ui.tracks_scroll_x = 0.0;
+        self.ui.tracks_scroll_y = 0.0;
         self.ui.edit.reconcile(&self.session.project);
         self.center_roll_on_song();
     }
@@ -410,10 +408,10 @@ impl SurfApp {
         if self.ui.musical_typing && !cmd {
             // Tab is the sustain pedal, as in Logic's Musical Typing.
             if key == TYPING_PEDAL_KEY {
-                if !event.is_held && !self.ui.typing_pedal && !self.session.sustain {
-                    self.ui.typing_pedal = true;
-                    self.session
-                        .handle_live(LiveEvent::Sustain(true), Instant::now(), true);
+                // A pedal of its own: held with the hardware pedal, the pedal
+                // stays down until both are up.
+                if !event.is_held && !self.session.typing_pedal() {
+                    self.session.typing_sustain(true);
                 }
                 return;
             }
@@ -532,11 +530,10 @@ impl SurfApp {
         };
     }
 
-    /// Lift the pedal if Musical Typing's Tab put it down (and only then).
+    /// Lift Musical Typing's pedal, if it is down. A hardware pedal stays down.
     fn release_typing_pedal(&mut self) {
-        if std::mem::take(&mut self.ui.typing_pedal) {
-            self.session
-                .handle_live(LiveEvent::Sustain(false), Instant::now(), true);
+        if self.session.typing_pedal() {
+            self.session.typing_sustain(false);
         }
     }
 

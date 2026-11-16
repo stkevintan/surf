@@ -176,7 +176,8 @@ fn a_tiny_resize_leaves_a_short_note_alone(cx: &mut TestAppContext) {
         matches!(app.ui.drag, Some(crate::shell::Drag::ResizeNotes { .. })),
         "grabbed by its edge"
     );
-    for dx in [1.0, 1.5, 1.0] {
+    // Out past the threshold (a preview is applied), then back within it.
+    for dx in [1.0, 1.5, 40.0, 1.0] {
         piano_roll::pointer_move(&mut app, &drag(point(edge.x + px(dx), edge.y)));
     }
     piano_roll::pointer_up(&mut app);
@@ -307,6 +308,17 @@ fn clicks_follow_the_tracks_scroll(cx: &mut TestAppContext) {
     let made = app.session.project.track(fourth).unwrap().regions.clone();
     assert_eq!(made.len(), 1, "drawn on the fourth track");
     assert_eq!(made[0].start, bar, "in bar 2");
+}
+
+/// A replaced project starts at bar 1 and its first track, wherever the last
+/// one was scrolled to.
+#[gpui::test]
+fn a_new_project_resets_the_tracks_scroll(cx: &mut TestAppContext) {
+    let mut app = app(cx);
+    app.ui.tracks_scroll_x = 5_000.0;
+    app.ui.tracks_scroll_y = 200.0;
+    app.after_project_replaced();
+    assert_eq!((app.ui.tracks_scroll_x, app.ui.tracks_scroll_y), (0.0, 0.0));
 }
 
 #[gpui::test]
@@ -628,6 +640,26 @@ fn tab_is_the_musical_typing_pedal(cx: &mut TestAppContext) {
         view.read_with(vcx, |a, _| a.session.sustain),
         "hardware pedal kept"
     );
+    // Tab first, then the hardware pedal: letting go of Tab keeps the pedal.
+    let hw = |vcx: &mut gpui::VisualTestContext, down: bool| {
+        view.update(vcx, |a, _| {
+            a.session.handle_live(
+                surf_midi::LiveEvent::Sustain(down),
+                std::time::Instant::now(),
+                true,
+            )
+        })
+    };
+    hw(vcx, false);
+    press(vcx, "tab", false);
+    hw(vcx, true);
+    release(vcx, "tab");
+    assert!(
+        view.read_with(vcx, |a, _| a.session.sustain),
+        "pedal still held"
+    );
+    hw(vcx, false);
+    assert!(!view.read_with(vcx, |a, _| a.session.sustain), "both up");
 }
 
 /// Review M21: with Musical Typing on (recording turns it on), R still stops

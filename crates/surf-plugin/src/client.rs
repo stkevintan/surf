@@ -31,6 +31,13 @@ pub struct VstClient {
     /// The id the next request gets.
     next_id: u64,
     heartbeat: Heartbeat,
+    /// Whether the plugin's editor is open: set by `open_editor`, cleared by
+    /// `close_editor` or by the user closing its window (an unprompted
+    /// `EditorClosed`).
+    editor_open: bool,
+    /// The helper's stdout closed. Kept, since `editor_open` may take the
+    /// `Exited` event off the channel before a request waits for it.
+    exited: bool,
     /// This helper's private `%TEMP%`, removed once the helper has exited.
     temp_dir: Option<PathBuf>,
 }
@@ -152,6 +159,8 @@ impl VstClient {
             events,
             next_id: 1,
             heartbeat: Heartbeat::default(),
+            editor_open: false,
+            exited: false,
             temp_dir,
         };
 
@@ -221,7 +230,26 @@ impl VstClient {
         self.wait_event(Duration::from_secs(15), Some(id), |ev| {
             matches!(ev, HelperEvent::EditorOpened)
         })?;
+        self.editor_open = true;
         Ok(())
+    }
+
+    /// Whether the plugin's editor window is still open. Reads what the helper
+    /// sent on its own since the last request, so a window the user closed is
+    /// seen as closed. Call between requests (the UI thread does).
+    pub fn editor_open(&mut self) -> bool {
+        while let Ok((id, event)) = self.events.try_recv() {
+            match event {
+                HelperEvent::EditorClosed if id.is_none() => self.editor_open = false,
+                HelperEvent::Exited => {
+                    self.exited = true;
+                    self.editor_open = false;
+                }
+                // Late replies to requests that already timed out.
+                _ => {}
+            }
+        }
+        self.editor_open
     }
 
     pub fn close_editor(&mut self) -> Result<()> {
@@ -229,6 +257,7 @@ impl VstClient {
         self.wait_event(Duration::from_secs(15), Some(id), |ev| {
             matches!(ev, HelperEvent::EditorClosed)
         })?;
+        self.editor_open = false;
         Ok(())
     }
 
@@ -333,8 +362,15 @@ impl VstClient {
             if remaining.is_zero() {
                 anyhow::bail!("VST helper did not respond in time");
             }
-            match self.events.recv_timeout(remaining) {
+            let next = if self.exited {
+                Ok((None, HelperEvent::Exited))
+            } else {
+                self.events.recv_timeout(remaining)
+            };
+            match next {
                 Ok((_, HelperEvent::Exited)) => {
+                    self.exited = true;
+                    self.editor_open = false;
                     let status = self
                         .child
                         .try_wait()
@@ -343,6 +379,11 @@ impl VstClient {
                         .map(|s| format!(" (exit {})", s.code().unwrap_or(-1)))
                         .unwrap_or_default();
                     anyhow::bail!("VST helper process exited{status}")
+                }
+                // The user closed the editor's window while we waited on another
+                // request: not this wait's answer, but the editor is gone.
+                Ok((None, HelperEvent::EditorClosed)) if id.is_some() => {
+                    self.editor_open = false;
                 }
                 // A reply to another request (one that already timed out), or an
                 // event nobody asked for: not this wait's answer.

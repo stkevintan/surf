@@ -1017,9 +1017,12 @@ pub(crate) fn pointer_move(app: &mut SurfApp, e: &MouseMoveEvent) -> bool {
             );
         }
         Drag::ResizeNotes { x0, notes } => {
-            // A click on the edge, or a pixel of jitter, is not a resize.
+            // A click on the edge, or a pixel of jitter, is not a resize; coming
+            // back within it undoes the preview, so letting go keeps the length.
             if (x - x0).abs() < DRAG_SLOP {
-                return false;
+                app.session.history.cancel(&mut app.session.project);
+                app.session.project_changed();
+                return true;
             }
             let delta = snap(((x - x0) / g.tick_w) as f64, grid);
             app.session.preview(
