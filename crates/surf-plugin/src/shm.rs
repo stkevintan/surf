@@ -23,7 +23,11 @@ use surf_platform::shm::SharedRegion;
 pub const AUDIO_CAPACITY: usize = 16_384; // stereo frames (~341 ms @ 48 kHz)
 pub const MIDI_CAPACITY: usize = 1_024;
 
-const MAGIC: u64 = 0x5355_5246_5653_5431; // "SURFVST1"
+// "SURFVST2": bumped with the layout fields below, so a host built before them
+// (which checks only the magic) refuses a newer UI's mapping instead of misreading it.
+const MAGIC: u64 = 0x5355_5246_5653_5432;
+/// Bump when the header or ring layout changes.
+const LAYOUT_VERSION: u32 = 1;
 const HEADER_SIZE: usize = 64;
 const AUDIO_OFFSET: usize = HEADER_SIZE;
 const MIDI_OFFSET: usize = AUDIO_OFFSET + AUDIO_CAPACITY * 2 * size_of::<f32>();
@@ -38,6 +42,11 @@ const OFF_MIDI_WRITE: usize = 32;
 const OFF_MIDI_READ: usize = 40;
 const OFF_HELPER_ALIVE: usize = 48;
 const OFF_MAIN_ALIVE: usize = 52;
+const OFF_LAYOUT_VERSION: usize = 56;
+const OFF_TOTAL_SIZE: usize = 60;
+// Every header field must end inside the header, before the audio ring.
+const _: () = assert!(OFF_TOTAL_SIZE + size_of::<u32>() <= HEADER_SIZE);
+const _: () = assert!(TOTAL_SIZE <= u32::MAX as usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -114,9 +123,14 @@ impl SharedMap {
             ptr: region.as_ptr(),
             region,
         };
-        map.atomic_u64(OFF_MAGIC).store(MAGIC, Ordering::Release);
         map.set_helper_alive(false);
         map.atomic_u32(OFF_MAIN_ALIVE).store(1, Ordering::Release);
+        map.atomic_u32(OFF_LAYOUT_VERSION)
+            .store(LAYOUT_VERSION, Ordering::Release);
+        map.atomic_u32(OFF_TOTAL_SIZE)
+            .store(TOTAL_SIZE as u32, Ordering::Release);
+        // Last: an opener that sees the magic sees the rest of the header too.
+        map.atomic_u64(OFF_MAGIC).store(MAGIC, Ordering::Release);
         Ok(map)
     }
 
@@ -126,10 +140,29 @@ impl SharedMap {
             ptr: region.as_ptr(),
             region,
         };
-        if map.atomic_u64(OFF_MAGIC).load(Ordering::Acquire) != MAGIC {
-            anyhow::bail!("shared memory magic mismatch");
-        }
+        map.check_layout()?;
         Ok(map)
+    }
+
+    /// Refuse a mapping laid out by another build of Surf: reading its rings at
+    /// this build's offsets would go out of bounds.
+    fn check_layout(&self) -> Result<()> {
+        let magic = self.atomic_u64(OFF_MAGIC).load(Ordering::Acquire);
+        if magic != MAGIC {
+            anyhow::bail!(
+                "shared memory was made by another Surf version (magic {magic:#x}); \
+                 the UI and surf-vst-host must come from the same build"
+            );
+        }
+        let version = self.atomic_u32(OFF_LAYOUT_VERSION).load(Ordering::Acquire);
+        let size = self.atomic_u32(OFF_TOTAL_SIZE).load(Ordering::Acquire) as usize;
+        if version != LAYOUT_VERSION || size != TOTAL_SIZE {
+            anyhow::bail!(
+                "shared memory layout {version} ({size} bytes) does not match this \
+                 build's {LAYOUT_VERSION} ({TOTAL_SIZE} bytes)"
+            );
+        }
+        Ok(())
     }
 
     /// Size of the mapping, for diagnostics.
@@ -296,6 +329,24 @@ mod tests {
         let creator = SharedMap::create(&name).unwrap();
         let opener = SharedMap::open(&name).unwrap();
         (creator, opener)
+    }
+
+    /// Review M12: a mapping from another build is refused, not misread.
+    #[test]
+    fn another_layout_is_refused() {
+        let (ui, host) = pair();
+        assert!(host.check_layout().is_ok());
+        ui.atomic_u32(OFF_LAYOUT_VERSION)
+            .store(LAYOUT_VERSION + 1, Ordering::Release);
+        assert!(host.check_layout().is_err(), "newer layout");
+        ui.atomic_u32(OFF_LAYOUT_VERSION)
+            .store(LAYOUT_VERSION, Ordering::Release);
+        ui.atomic_u32(OFF_TOTAL_SIZE)
+            .store(TOTAL_SIZE as u32 / 2, Ordering::Release);
+        assert!(host.check_layout().is_err(), "other size");
+        ui.atomic_u64(OFF_MAGIC)
+            .store(0x5355_5246_5653_5431, Ordering::Release);
+        assert!(host.check_layout().is_err(), "old magic");
     }
 
     #[test]

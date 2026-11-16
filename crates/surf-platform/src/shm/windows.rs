@@ -37,6 +37,16 @@ impl SharedRegion {
             )
         }
         .context("CreateFileMappingW failed")?;
+        // On an existing name CreateFileMappingW succeeds and opens that mapping,
+        // whatever its size; only the last error says so. Refuse it, as the Unix
+        // create does with O_EXCL.
+        const ERROR_ALREADY_EXISTS: i32 = 183;
+        if std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ALREADY_EXISTS) {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            anyhow::bail!("shared memory {name} already exists");
+        }
         let region = Self::map(handle, size)?;
         unsafe { ptr::write_bytes(region.ptr, 0, size) };
         Ok(region)

@@ -51,6 +51,17 @@ mod tests {
         }
     }
 
+    /// Review M12: a name that exists is not created again, and a region is not
+    /// mapped larger than it is (on Unix that would SIGBUS on first touch).
+    #[test]
+    fn create_is_exclusive_and_open_checks_the_size() {
+        let name = make_name();
+        let _a = SharedRegion::create(&name, 4096).unwrap();
+        assert!(SharedRegion::create(&name, 8192).is_err(), "name taken");
+        assert!(SharedRegion::open(&name, 1 << 20).is_err(), "too small");
+        assert!(SharedRegion::open(&name, 4096).is_ok());
+    }
+
     /// The 31-byte limit is macOS's POSIX shm rule; Windows section names
     /// (`Local\...`) allow up to MAX_PATH and are deliberately longer.
     #[cfg(unix)]
