@@ -623,6 +623,8 @@ fn audio_loop(mut instrument: Box<dyn Instrument>, map: Arc<SharedMap>, stop: Ar
 
     let mut buffer = [0.0f32; 128];
     while !stop.load(Ordering::Acquire) {
+        // Proof of life for the UI: stops if the plugin hangs below.
+        map.beat();
         while let Some(msg) = map.pop_midi() {
             let ch = (msg.channel & 15) as u8;
             match msg.kind {

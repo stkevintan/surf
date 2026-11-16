@@ -28,7 +28,7 @@ pub const MIDI_CAPACITY: usize = 1_024;
 const MAGIC: u64 = 0x5355_5246_5653_5432;
 /// Bump when the header or ring layout changes.
 const LAYOUT_VERSION: u32 = 1;
-const HEADER_SIZE: usize = 64;
+const HEADER_SIZE: usize = 128;
 const AUDIO_OFFSET: usize = HEADER_SIZE;
 const MIDI_OFFSET: usize = AUDIO_OFFSET + AUDIO_CAPACITY * 2 * size_of::<f32>();
 const TOTAL_SIZE: usize = MIDI_OFFSET + MIDI_CAPACITY * size_of::<MidiMsg>();
@@ -44,8 +44,9 @@ const OFF_HELPER_ALIVE: usize = 48;
 const OFF_MAIN_ALIVE: usize = 52;
 const OFF_LAYOUT_VERSION: usize = 56;
 const OFF_TOTAL_SIZE: usize = 60;
+const OFF_HELPER_BEAT: usize = 64;
 // Every header field must end inside the header, before the audio ring.
-const _: () = assert!(OFF_TOTAL_SIZE + size_of::<u32>() <= HEADER_SIZE);
+const _: () = assert!(OFF_HELPER_BEAT + size_of::<u64>() <= HEADER_SIZE);
 const _: () = assert!(TOTAL_SIZE <= u32::MAX as usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,6 +188,19 @@ impl SharedMap {
 
     pub fn helper_alive(&self) -> bool {
         self.atomic_u32(OFF_HELPER_ALIVE).load(Ordering::Acquire) != 0
+    }
+
+    /// Called by the host's audio thread on every pass of its loop. It stops
+    /// advancing when the plugin hangs in `process`, even though the process
+    /// itself is still running.
+    pub fn beat(&self) {
+        self.atomic_u64(OFF_HELPER_BEAT)
+            .fetch_add(1, Ordering::Release);
+    }
+
+    /// How many passes the host's audio thread has made (0: not started yet).
+    pub fn beats(&self) -> u64 {
+        self.atomic_u64(OFF_HELPER_BEAT).load(Ordering::Acquire)
     }
 
     pub fn set_main_alive(&self, alive: bool) {
@@ -347,6 +361,15 @@ mod tests {
         ui.atomic_u64(OFF_MAGIC)
             .store(0x5355_5246_5653_5431, Ordering::Release);
         assert!(host.check_layout().is_err(), "old magic");
+    }
+
+    #[test]
+    fn the_heartbeat_crosses_the_mapping() {
+        let (ui, host) = pair();
+        assert_eq!(ui.beats(), 0);
+        host.beat();
+        host.beat();
+        assert_eq!(ui.beats(), 2);
     }
 
     #[test]

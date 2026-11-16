@@ -30,6 +30,7 @@ pub struct VstClient {
     events: Receiver<(Option<u64>, HelperEvent)>,
     /// The id the next request gets.
     next_id: u64,
+    heartbeat: Heartbeat,
     /// This helper's private `%TEMP%`, removed once the helper has exited.
     temp_dir: Option<PathBuf>,
 }
@@ -150,6 +151,7 @@ impl VstClient {
             stdin: Mutex::new(BufWriter::new(stdin)),
             events,
             next_id: 1,
+            heartbeat: Heartbeat::default(),
             temp_dir,
         };
 
@@ -282,12 +284,21 @@ impl VstClient {
         }
     }
 
+    /// Whether the helper is still playing: its process is running and its
+    /// audio thread is not stuck (a plugin deadlocked in `process`). A stuck one
+    /// is reported dead, so its tracks fall back to the built-in piano and
+    /// dropping the client kills it.
     pub fn is_alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
+            && self.heartbeat.alive(self.map.beats(), Instant::now())
     }
 
     /// Send `request` and return the id its reply will carry.
     fn request(&mut self, request: &HelperRequest) -> Result<u64> {
+        // A request can hold the plugin for a while (saving Kontakt's state), and
+        // the audio thread waits on it meanwhile. Start the stall clock afresh
+        // after it rather than count that wait as a hang.
+        self.heartbeat.reset();
         let id = self.next_id;
         self.next_id += 1;
         let mut line = serde_json::to_vec(&Request {
@@ -373,6 +384,36 @@ impl Drop for VstClient {
         if let Some(dir) = &self.temp_dir {
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+}
+
+/// How long the helper's audio thread may make no progress before the helper
+/// counts as hung. Generous: a plugin may block it briefly while loading.
+const STALL: Duration = Duration::from_secs(10);
+
+/// Watches the helper's heartbeat across `is_alive` calls.
+#[derive(Default)]
+struct Heartbeat {
+    /// The last count seen, and when it last changed.
+    seen: Option<(u64, Instant)>,
+}
+
+impl Heartbeat {
+    fn alive(&mut self, beats: u64, now: Instant) -> bool {
+        match self.seen {
+            Some((last, since)) if last == beats => {
+                // Not started yet (still loading) is not a hang.
+                beats == 0 || now.duration_since(since) < STALL
+            }
+            _ => {
+                self.seen = Some((beats, now));
+                true
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        self.seen = None;
     }
 }
 
@@ -620,6 +661,26 @@ fn spawn_reader(stdout: ChildStdout) -> Receiver<(Option<u64>, HelperEvent)> {
 #[cfg(test)]
 mod tests {
     use super::{HELPER_PID_FILE, helper_dir_owner, new_helper_temp_dir, process_is_alive};
+
+    /// Review M13: a helper whose audio thread stops making progress for STALL
+    /// counts as dead; one still loading (no beat yet) or beating does not, and a
+    /// request restarts the clock.
+    #[test]
+    fn a_frozen_heartbeat_means_a_hung_helper() {
+        use super::{Heartbeat, STALL};
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut h = Heartbeat::default();
+        assert!(h.alive(0, t0));
+        assert!(h.alive(0, t0 + STALL * 3), "still loading");
+        assert!(h.alive(5, t0 + STALL * 3));
+        assert!(h.alive(9, t0 + STALL * 4), "beating");
+        assert!(h.alive(9, t0 + STALL * 4 + Duration::from_secs(1)));
+        assert!(!h.alive(9, t0 + STALL * 5), "frozen for STALL");
+        h.reset();
+        assert!(h.alive(9, t0 + STALL * 9), "a request restarts the clock");
+        assert!(!h.alive(9, t0 + STALL * 10));
+    }
 
     /// A pid that belonged to a process which has already exited.
     fn dead_pid() -> u32 {
