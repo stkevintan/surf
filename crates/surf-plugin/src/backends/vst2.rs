@@ -107,6 +107,7 @@ impl Vst2Plugin {
         let mut state_restored = false;
         if let Some(bytes) = state
             && !bytes.is_empty()
+            && instance.get_info().preset_chunks
         {
             instance.get_parameter_object().load_bank_data(bytes);
             state_restored = true;
@@ -151,12 +152,18 @@ impl Vst2Plugin {
         }
     }
 
+    /// The plugin's state as a chunk. Errors, rather than returning an empty blob
+    /// that would be saved as if it were the state, when the plugin does not
+    /// support chunks or hands back nothing.
     pub fn state(&self) -> Result<Vec<u8>> {
         let mut plugin = self
             .instance
             .lock()
             .map_err(|_| anyhow::anyhow!("VST2 plugin mutex poisoned"))?;
-        Ok(plugin.get_parameter_object().get_bank_data())
+        chunk_state(
+            plugin.get_info().preset_chunks,
+            plugin.get_parameter_object().get_bank_data(),
+        )
     }
 
     pub fn load_state(&self, bytes: &[u8]) -> Result<()> {
@@ -164,6 +171,12 @@ impl Vst2Plugin {
             .instance
             .lock()
             .map_err(|_| anyhow::anyhow!("VST2 plugin mutex poisoned"))?;
+        if !plugin.get_info().preset_chunks {
+            anyhow::bail!(
+                "{} cannot restore state: it does not support chunks",
+                self.name
+            );
+        }
         plugin.get_parameter_object().load_bank_data(bytes);
         Ok(())
     }
@@ -175,6 +188,18 @@ impl Vst2Plugin {
             .map_err(|_| anyhow::anyhow!("VST2 plugin mutex poisoned"))?;
         editor::open(&mut plugin, &self.name)
     }
+}
+
+/// What `state` returns for a plugin: only a non-empty chunk from a plugin that
+/// declares chunk support counts as its state.
+fn chunk_state(supports_chunks: bool, bytes: Vec<u8>) -> Result<Vec<u8>> {
+    if !supports_chunks {
+        anyhow::bail!("this VST2 plugin does not support state chunks");
+    }
+    if bytes.is_empty() {
+        anyhow::bail!("the VST2 plugin returned an empty state");
+    }
+    Ok(bytes)
 }
 
 pub struct Vst2Instrument {
@@ -407,6 +432,15 @@ mod editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review M11: no chunk support, or an empty chunk, is an error, not a state
+    /// to save.
+    #[test]
+    fn only_real_chunks_count_as_state() {
+        assert!(chunk_state(false, vec![1, 2, 3]).is_err());
+        assert!(chunk_state(true, Vec::new()).is_err());
+        assert_eq!(chunk_state(true, vec![1, 2, 3]).unwrap(), [1, 2, 3]);
+    }
 
     /// The `VstEvents` block must be laid out the way the VST2 ABI reads it.
     ///
