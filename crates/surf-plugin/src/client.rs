@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
@@ -25,6 +26,8 @@ pub struct VstClient {
     child: Child,
     stdin: Mutex<BufWriter<ChildStdin>>,
     events: Receiver<HelperEvent>,
+    /// This helper's private `%TEMP%`, removed once the helper has exited.
+    temp_dir: Option<PathBuf>,
 }
 
 impl VstClient {
@@ -93,8 +96,9 @@ impl VstClient {
         // it succeeds and Kontakt loads.  Note `tmpnam_s` caches the temp path on
         // first use, so this has to be set before the process starts — it cannot be
         // fixed from inside the helper.
-        if let Some(tmp) = helper_temp_dir() {
-            command.env("TMP", &tmp).env("TEMP", &tmp);
+        let temp_dir = helper_temp_dir();
+        if let Some(tmp) = &temp_dir {
+            command.env("TMP", tmp).env("TEMP", tmp);
         }
         // Start the helper in the plugin's parent directory (for Kontakt
         // Portable this is `...\Kontakt 8\x64`, next to ktp871.dll).  Doing
@@ -126,6 +130,14 @@ impl VstClient {
         }
         let events = spawn_reader(stdout);
 
+        // Record the helper's own pid in its temp dir, so another spawn can tell a
+        // still-running helper from one left behind by a crashed Surf. Written right
+        // after spawn, before the long Kontakt load, so the window where only the UI
+        // pid vouches for the directory is a few instructions wide.
+        if let Some(dir) = &temp_dir {
+            let _ = std::fs::write(dir.join(HELPER_PID_FILE), child.id().to_string());
+        }
+
         let mut client = Self {
             path: plugin,
             name: "VST helper".to_string(),
@@ -133,6 +145,7 @@ impl VstClient {
             child,
             stdin: Mutex::new(BufWriter::new(stdin)),
             events,
+            temp_dir,
         };
 
         // Kontakt 8.14 takes ~80s to instantiate on a cold cache on this machine
@@ -322,15 +335,22 @@ impl Drop for VstClient {
     fn drop(&mut self) {
         let _ = self.request(&HelperRequest::Shutdown);
         let deadline = Instant::now() + Duration::from_secs(2);
+        let mut exited = false;
         while Instant::now() < deadline {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
-                return;
+                exited = true;
+                break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        self.map.set_main_alive(false);
+        if !exited {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.map.set_main_alive(false);
+        }
+        if let Some(dir) = &self.temp_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
 
@@ -374,28 +394,144 @@ fn log_since(path: &Path, offset: u64) -> String {
         .join("\n")
 }
 
-/// Where the helper writes its stderr log (see [`VstClient::load`]).
+/// A private, empty `%TEMP%` for one helper process.
 ///
-/// Defaults to `surf-vst-host.log` in the writable data directory (see
-/// [`crate::paths::data_dir`]); `SURF_HELPER_LOG` overrides it.
-/// A private, empty `%TEMP%` for the helper process.
-///
-/// See the call site for why Kontakt needs this.  The directory is emptied on each
-/// spawn: libzmq's `_wtmpnam_s` names are short and derived from process state, so
-/// leftovers from an earlier run are what turn into a collision later.  Returns
-/// `None` if the directory cannot be prepared, in which case the helper simply
-/// inherits the ambient `%TEMP%` as before.
+/// See the call site for why Kontakt needs this. libzmq's `_wtmpnam_s` names are short
+/// and derived from process state, so leftovers from an earlier run are what turn into
+/// a collision later. Each helper therefore gets a fresh directory of its own under
+/// `helper-tmp`, named `<ui pid>-<n>`. Several helpers run at once (one per plugin), so
+/// a spawn must not touch the directories of helpers that are still running, including
+/// those of another live Surf that shares this directory. It only clears what a Surf
+/// that has already exited left behind. Returns `None` if the directory cannot
+/// be prepared, in which case the helper simply inherits the ambient `%TEMP%`.
 fn helper_temp_dir() -> Option<PathBuf> {
     if std::env::var_os("SURF_NO_PRIVATE_TEMP").is_some() {
         return None;
     }
-    let dir = surf_platform::data_dir().join("helper-tmp");
-    // Best-effort reset; a file we cannot delete is not worth failing the spawn over.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    new_helper_temp_dir(
+        &surf_platform::data_dir().join("helper-tmp"),
+        std::process::id(),
+        n,
+    )
+}
+
+/// `true` when `pid` still has a process. A different pid is not proof that Surf has
+/// exited: two instances share this directory, and the other one may be live.
+fn process_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // `kill(0, 0)` signals our own process group, and a pid that does not fit in
+        // `pid_t` wraps to a negative process-group id. Neither is a live owner.
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        let rc = unsafe { kill(pid, 0) };
+        if rc == 0 {
+            return true;
+        }
+        // EPERM: the process exists, we just may not signal it.
+        std::io::Error::last_os_error().raw_os_error() == Some(1)
+    }
+    #[cfg(windows)]
+    {
+        if pid == 0 {
+            return false;
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+            fn GetExitCodeProcess(handle: *mut std::ffi::c_void, code: *mut u32) -> i32;
+            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+            fn GetLastError() -> u32;
+        }
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const ERROR_ACCESS_DENIED: u32 = 5;
+        const STILL_ACTIVE: u32 = 259;
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                // The process object is gone, unless we simply may not open it.
+                return GetLastError() == ERROR_ACCESS_DENIED;
+            }
+            // A handle stays openable after the process exits (until every handle
+            // closes), so a successful open is not proof of life: check the exit
+            // code. STILL_ACTIVE means running; anything else means it has exited.
+            let mut code = 0u32;
+            let got = GetExitCodeProcess(handle, &mut code);
+            CloseHandle(handle);
+            got != 0 && code == STILL_ACTIVE
+        }
+    }
+}
+
+/// Owner pid of a `<pid>-<n>` helper directory, if the name has that shape.
+fn helper_dir_owner(name: &str) -> Option<u32> {
+    let (pid, rest) = name.split_once('-')?;
+    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse().ok()
+}
+
+/// The helper's own pid, written into its temp dir right after spawn.
+const HELPER_PID_FILE: &str = ".surf-helper-pid";
+
+/// Whether a helper temp directory's owner is still running, so it must be kept.
+///
+/// The directory is named `<ui pid>-<n>`. A matching UI pid means this run owns it.
+/// Otherwise the directory may belong to another live Surf, or to a helper that is
+/// still running after its Surf crashed mid-load — so also honour the helper pid the
+/// spawn wrote into it. A directory with neither a recognisable name nor a live owner
+/// is leftover from an exited run and can go.
+fn helper_dir_in_use(dir: &Path, name: &str, own_pid: u32) -> bool {
+    if let Some(owner) = helper_dir_owner(name) {
+        if owner == own_pid || process_is_alive(owner) {
+            return true;
+        }
+    }
+    if let Ok(text) = std::fs::read_to_string(dir.join(HELPER_PID_FILE)) {
+        if let Ok(helper) = text.trim().parse::<u32>() {
+            return process_is_alive(helper);
+        }
+    }
+    false
+}
+
+fn new_helper_temp_dir(root: &Path, pid: u32, n: u64) -> Option<PathBuf> {
+    std::fs::create_dir_all(root).ok()?;
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            if helper_dir_in_use(&path, &name.to_string_lossy(), pid) {
+                continue;
+            }
+            // Best effort: a file we cannot delete is not worth failing the spawn over.
+            let _ = if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+        }
+    }
+    let dir = root.join(format!("{pid}-{n}"));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::create_dir(&dir).ok()?;
     Some(dir)
 }
 
+/// Where the helper writes its stderr log (see [`VstClient::load`]).
+///
+/// Defaults to `surf-vst-host.log` in the writable data directory (see
+/// [`crate::paths::data_dir`]); `SURF_HELPER_LOG` overrides it.
 pub fn helper_log_path() -> PathBuf {
     std::env::var_os("SURF_HELPER_LOG")
         .map(PathBuf::from)
@@ -457,4 +593,121 @@ fn spawn_reader(stdout: ChildStdout) -> Receiver<HelperEvent> {
         })
         .expect("failed to spawn helper reader thread");
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HELPER_PID_FILE, helper_dir_owner, new_helper_temp_dir, process_is_alive};
+
+    /// A pid that belonged to a process which has already exited.
+    fn dead_pid() -> u32 {
+        let mut cmd = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "exit"]);
+            c
+        } else {
+            std::process::Command::new("true")
+        };
+        let child = cmd.spawn().unwrap();
+        let pid = child.id();
+        child.wait_with_output().unwrap();
+        assert!(!process_is_alive(pid), "the waited child must be gone");
+        pid
+    }
+
+    /// Starting a second helper must leave the first one's `%TEMP%` alone, and only
+    /// clear what earlier runs of Surf left behind.
+    #[test]
+    fn each_helper_gets_its_own_temp_dir() {
+        let root =
+            std::env::temp_dir().join(format!("surf-helper-tmp-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // pid 1 is init and still alive, so it must not stand in for an exited Surf.
+        let dead = dead_pid();
+        std::fs::create_dir_all(root.join(format!("{dead}-0"))).unwrap();
+        std::fs::write(root.join(format!("{dead}-0")).join("stale"), b"x").unwrap();
+        std::fs::write(root.join("loose-file-from-old-builds"), b"x").unwrap();
+
+        let first = new_helper_temp_dir(&root, 42, 0).unwrap();
+        std::fs::write(first.join("zmq-ipc"), b"in use").unwrap();
+        let second = new_helper_temp_dir(&root, 42, 1).unwrap();
+
+        assert_ne!(first, second);
+        assert!(
+            first.join("zmq-ipc").exists(),
+            "a running helper's files survive"
+        );
+        assert!(
+            second.read_dir().unwrap().next().is_none(),
+            "a new helper starts empty"
+        );
+        assert!(
+            !root.join(format!("{dead}-0")).exists(),
+            "an earlier run's directory is cleared"
+        );
+        assert!(!root.join("loose-file-from-old-builds").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two Surf instances share the data directory. Loading a plugin in the second must
+    /// not delete the first one's helper files while that process is still alive.
+    #[test]
+    fn a_live_other_surf_keeps_its_helper_dir() {
+        let root =
+            std::env::temp_dir().join(format!("surf-helper-tmp-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let me = std::process::id();
+        assert!(process_is_alive(me));
+        assert!(
+            !process_is_alive(u32::MAX),
+            "a pid that cannot exist is not alive"
+        );
+        assert_eq!(helper_dir_owner(&format!("{me}-3")), Some(me));
+        assert_eq!(helper_dir_owner("not-a-dir"), None);
+
+        let other = root.join(format!("{me}-7"));
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("zmq-ipc"), b"in use").unwrap();
+        // A dead owner's leftovers still go.
+        let dead = dead_pid();
+        std::fs::create_dir_all(root.join(format!("{dead}-0"))).unwrap();
+
+        let mine = new_helper_temp_dir(&root, me.wrapping_add(1), 0).unwrap();
+        assert!(
+            other.join("zmq-ipc").exists(),
+            "the other live Surf's helper files survive"
+        );
+        assert!(!root.join(format!("{dead}-0")).exists());
+        assert!(mine.read_dir().unwrap().next().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Surf crashed while its helper was still loading a plugin: the UI pid is dead
+    /// but the helper is alive. Its directory must survive until the helper exits.
+    #[test]
+    fn a_running_helper_of_a_crashed_surf_keeps_its_dir() {
+        let root =
+            std::env::temp_dir().join(format!("surf-helper-tmp-orphan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dead_ui = dead_pid();
+        let me = std::process::id();
+
+        // Helper still running (this test process stands in for it).
+        let orphan = root.join(format!("{dead_ui}-0"));
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join(HELPER_PID_FILE), me.to_string()).unwrap();
+        std::fs::write(orphan.join("zmq-ipc"), b"in use").unwrap();
+        // Helper gone too: this one may be cleared.
+        let gone = root.join(format!("{dead_ui}-1"));
+        std::fs::create_dir_all(&gone).unwrap();
+        std::fs::write(gone.join(HELPER_PID_FILE), dead_pid().to_string()).unwrap();
+
+        new_helper_temp_dir(&root, me.wrapping_add(1), 0).unwrap();
+        assert!(
+            orphan.join("zmq-ipc").exists(),
+            "a live helper's files survive"
+        );
+        assert!(!gone.exists(), "a dead helper's directory is cleared");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
