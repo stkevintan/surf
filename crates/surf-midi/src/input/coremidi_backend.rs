@@ -228,9 +228,9 @@ mod tests {
     }
 
     /// A source that appears after the hub started shows up in the port list.
-    /// If nothing was connected it is connected automatically; a port that is
-    /// already connected (a real keyboard on this machine) is not replaced.
-    /// Removing the source takes it out of the list again.
+    /// If nothing was connected it is connected automatically; a port the user
+    /// chose (here: a real keyboard on this machine, chosen explicitly) is not
+    /// replaced. Removing the source takes it out of the list again.
     #[test]
     fn hot_plugged_source_is_listed_and_removed() {
         let _serial = coremidi_lock();
@@ -251,6 +251,11 @@ mod tests {
         };
 
         let mut hub = MidiHub::new(Arc::new(|_| {}));
+        // The port `new` opened on its own is not a choice; make it one, so a
+        // newly plugged source must not take over.
+        if let Some(i) = hub.selected() {
+            hub.connect(i).unwrap();
+        }
         let had_connection = hub.selected().map(|i| hub.ports()[i].clone());
         let name = format!("Surf Hotplug {}", std::process::id());
         let client = Client::new("Surf Hotplug Sender").unwrap();
