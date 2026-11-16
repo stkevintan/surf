@@ -241,6 +241,30 @@ impl Core {
         self.sustain = false;
     }
 
+    /// Note-off for a playback note, unless that voice still has to sound:
+    /// another playback note of the same key on the same route, or the player
+    /// holding the key there. Whichever ends last sends the note-off.
+    fn release(&mut self, route: Route, key: u8) {
+        let still = self.active.iter().any(|a| a.route == route && a.key == key)
+            || self.held[key as usize & 127] == Some(route);
+        if !still && let Some(i) = self.slot(route) {
+            i.note_off(route.channel, key);
+        }
+    }
+
+    /// End every playback note, leaving what the player holds alone: keys still
+    /// down and the sustain pedal. Transport moves (loop, seek, play, pause) use
+    /// this; only Stop and AllNotesOff reset everything.
+    fn release_playback(&mut self) {
+        self.ended.clear();
+        self.ended
+            .extend(self.active.drain(..).map(|a| (a.route, a.key)));
+        for i in 0..self.ended.len() {
+            let (route, key) = self.ended[i];
+            self.release(route, key);
+        }
+    }
+
     fn apply(&mut self, command: Command) {
         match command {
             Command::NoteOn { key, velocity } => {
@@ -254,7 +278,9 @@ impl Core {
                 let route = self.held[key as usize & 127]
                     .take()
                     .unwrap_or_else(|| self.route(self.input));
-                if let Some(i) = self.slot(route) {
+                // Playback is sounding the same key there: it ends it.
+                let playing = self.active.iter().any(|a| a.route == route && a.key == key);
+                if !playing && let Some(i) = self.slot(route) {
                     i.note_off(route.channel, key);
                 }
             }
@@ -319,11 +345,10 @@ impl Core {
                 }
             }
             Command::Play { timeline, from } => {
-                self.all_notes_off();
+                self.release_playback();
                 self.duration_frames = (timeline.duration * self.sample_rate).ceil() as u64;
                 self.pos_frames = (from.max(0.0) * self.sample_rate) as u64;
                 self.next_note = timeline.notes.partition_point(|n| n.start < from.max(0.0));
-                self.active.clear();
                 if let Some(old) = self.timeline.replace(timeline) {
                     self.retire(Retired::Timeline(old));
                 }
@@ -336,7 +361,7 @@ impl Core {
             Command::Update { timeline } => self.update(timeline),
             Command::Pause => {
                 self.playing = false;
-                self.all_notes_off();
+                self.release_playback();
                 self.shared.playing.store(false, Ordering::Release);
             }
             Command::Resume => {
@@ -357,8 +382,7 @@ impl Core {
             Command::Seek(sec) => {
                 let sec = sec.max(0.0);
                 self.pos_frames = (sec * self.sample_rate) as u64;
-                self.active.clear();
-                self.all_notes_off();
+                self.release_playback();
                 if let Some(timeline) = &self.timeline {
                     self.next_note = timeline.notes.partition_point(|n| n.start < sec);
                     self.shared
@@ -402,14 +426,9 @@ impl Core {
                 }
             }
         });
-        for &(route, key) in &self.ended {
-            if let Some(i) = self
-                .slots
-                .get_mut(route.slot as usize)
-                .and_then(Option::as_mut)
-            {
-                i.note_off(route.channel, key);
-            }
+        for i in 0..self.ended.len() {
+            let (route, key) = self.ended[i];
+            self.release(route, key);
         }
 
         // While playing, start edited notes that now cover the playhead but
@@ -485,8 +504,7 @@ impl Core {
     fn reset_to_start(&mut self) {
         self.pos_frames = 0;
         self.next_note = 0;
-        self.active.clear();
-        self.all_notes_off();
+        self.release_playback();
         self.shared.position_frames.store(0, Ordering::Release);
     }
 
@@ -601,7 +619,7 @@ impl Core {
                     } else {
                         self.pos_frames = self.duration_frames;
                         self.playing = false;
-                        self.all_notes_off();
+                        self.release_playback();
                         self.shared.playing.store(false, Ordering::Release);
                     }
                 } else {
@@ -634,9 +652,9 @@ impl Core {
     }
 
     fn trigger(&mut self, start: u64, end: u64) {
-        let Some(timeline) = &self.timeline else {
+        if self.timeline.is_none() {
             return;
-        };
+        }
 
         // Note-offs first so back-to-back notes on the same key retrigger cleanly.
         let ended = &mut self.ended;
@@ -649,16 +667,14 @@ impl Core {
                 true
             }
         });
-        for &(route, key) in &self.ended {
-            if let Some(i) = self
-                .slots
-                .get_mut(route.slot as usize)
-                .and_then(Option::as_mut)
-            {
-                i.note_off(route.channel, key);
-            }
+        for i in 0..self.ended.len() {
+            let (route, key) = self.ended[i];
+            self.release(route, key);
         }
 
+        let Some(timeline) = &self.timeline else {
+            return;
+        };
         while self.next_note < timeline.notes.len() {
             let note = &timeline.notes[self.next_note];
             let note_start = (note.start * self.sample_rate) as u64;
@@ -737,7 +753,9 @@ impl AudioEngine {
             glitches: AtomicU32::new(0),
         });
         let (event_tx, events) = crossbeam_channel::unbounded();
-        let (tx, rx) = crossbeam_channel::unbounded();
+        // Bounded: an unbounded channel allocates on send and frees on receive,
+        // so the audio callback would call the allocator every ~31 commands.
+        let (tx, rx) = crossbeam_channel::bounded(COMMAND_CAP);
         let (trash_tx, trash) = crossbeam_channel::bounded::<Retired>(8);
 
         // Try the default output device first.
@@ -887,7 +905,8 @@ impl AudioEngine {
     }
 
     /// A cloneable command sender, used by the MIDI callback to reach the audio
-    /// thread without going through the UI at 60 fps.
+    /// thread without going through the UI at 60 fps. The queue is bounded: a
+    /// driver thread should `try_send`, never block on it.
     pub fn sender(&self) -> crossbeam_channel::Sender<Command> {
         self.tx.clone()
     }
@@ -899,9 +918,7 @@ impl AudioEngine {
 
     pub fn send(&self, command: Command) {
         self.reclaim();
-        // The audio side drains at block rate; an unbounded queue keeps the UI
-        // responsive even if the device stalls.
-        let _ = self.tx.send(command);
+        push(&self.tx, command, SEND_WAIT, || self.reclaim());
     }
 
     pub fn note_on(&self, key: u8, velocity: u8) {
@@ -954,11 +971,16 @@ impl AudioEngine {
     /// last reference to its plugin host on the UI thread.
     pub fn set_slot(&self, slot: u8, instrument: Option<Box<dyn Instrument>>) {
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
-        let _ = self.tx.send(Command::SetSlot {
-            slot,
-            instrument,
-            ack: Some(ack_tx),
-        });
+        push(
+            &self.tx,
+            Command::SetSlot {
+                slot,
+                instrument,
+                ack: Some(ack_tx),
+            },
+            SEND_WAIT,
+            || self.reclaim(),
+        );
         // Keep freeing retired payloads while waiting: the callback may be holding
         // a retiring command (and this one behind it) until there is room.
         let deadline = Instant::now() + Duration::from_millis(750);
@@ -966,6 +988,39 @@ impl AudioEngine {
             self.reclaim();
             if ack_rx.recv_timeout(Duration::from_millis(5)).is_ok() {
                 return;
+            }
+        }
+    }
+}
+
+/// Commands the audio thread can have queued. The callback drains them every
+/// block, so this only fills if the device stops calling back.
+const COMMAND_CAP: usize = 1024;
+
+/// How long a UI send waits for room before the command is dropped.
+const SEND_WAIT: Duration = Duration::from_millis(250);
+
+/// Queue `command`, freeing retired payloads while the queue is full (the callback
+/// may be holding commands back for room). Gives up after `wait` rather than hang
+/// the UI on a stalled device. Returns whether it was queued.
+fn push(
+    tx: &crossbeam_channel::Sender<Command>,
+    mut command: Command,
+    wait: Duration,
+    mut reclaim: impl FnMut(),
+) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        match tx.try_send(command) {
+            Ok(()) => return true,
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => return false,
+            Err(crossbeam_channel::TrySendError::Full(c)) => {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                command = c;
+                reclaim();
+                thread::sleep(Duration::from_millis(1));
             }
         }
     }
@@ -1216,6 +1271,176 @@ mod tests {
             },
         ]));
         (c, log)
+    }
+
+    /// Every call an instrument gets, in order.
+    type Calls = Arc<parking_lot::Mutex<Vec<String>>>;
+
+    struct Recorder(Calls);
+
+    impl Instrument for Recorder {
+        fn note_on(&mut self, _: u8, key: u8, _: u8) {
+            self.0.lock().push(format!("on {key}"));
+        }
+        fn note_off(&mut self, _: u8, key: u8) {
+            self.0.lock().push(format!("off {key}"));
+        }
+        fn all_notes_off(&mut self) {
+            self.0.lock().push("all off".into());
+        }
+        fn set_sustain(&mut self, _: u8, down: bool) {
+            self.0.lock().push(format!("pedal {down}"));
+        }
+        fn process(&mut self, out: &mut [f32], frames: usize) {
+            out[..frames * 2].fill(0.0);
+        }
+        fn name(&self) -> &str {
+            "recorder"
+        }
+    }
+
+    fn recorder_core() -> (Core, Calls) {
+        let mut c = core();
+        let calls: Calls = Default::default();
+        c.apply(Command::SetSlot {
+            slot: 1,
+            instrument: Some(Box::new(Recorder(calls.clone()))),
+            ack: None,
+        });
+        c.apply(Command::SetRoutes(vec![Route {
+            slot: 1,
+            channel: 0,
+        }]));
+        calls.lock().clear();
+        (c, calls)
+    }
+
+    fn secs(c: &mut Core, s: f64) {
+        run(c, (s * 48_000.0) as usize);
+    }
+
+    /// Review M6: two overlapping playback notes on one key. The first ending
+    /// must not cut the second; the key goes off once, when the last one ends.
+    #[test]
+    fn overlapping_notes_on_a_key_end_with_the_last() {
+        let (mut c, calls) = recorder_core();
+        c.apply(Command::Play {
+            timeline: Timeline {
+                notes: vec![long(0, 60, 0.0, 1.0), long(0, 60, 0.5, 2.0)],
+                duration: 3.0,
+            },
+            from: 0.0,
+        });
+        secs(&mut c, 1.5);
+        assert_eq!(*calls.lock(), ["on 60", "on 60"], "still sounding at 1.5 s");
+        secs(&mut c, 1.0);
+        assert_eq!(*calls.lock(), ["on 60", "on 60", "off 60"]);
+    }
+
+    /// Review M6: playback ending a note must not cut the same key the player is
+    /// holding, and the player letting go must not cut playback's note.
+    #[test]
+    fn playback_and_the_player_do_not_cut_each_other() {
+        let (mut c, calls) = recorder_core();
+        c.apply(Command::NoteOn {
+            key: 60,
+            velocity: 90,
+        });
+        c.apply(Command::Play {
+            timeline: Timeline {
+                notes: vec![long(0, 60, 0.0, 0.5), long(0, 62, 0.0, 2.0)],
+                duration: 3.0,
+            },
+            from: 0.0,
+        });
+        secs(&mut c, 1.0);
+        assert!(
+            !calls.lock().contains(&"off 60".to_string()),
+            "held key kept"
+        );
+        c.apply(Command::NoteOff { key: 60 });
+        assert_eq!(calls.lock().last().map(String::as_str), Some("off 60"));
+
+        // The other way round: the player lets go while playback still sounds it.
+        calls.lock().clear();
+        c.apply(Command::NoteOn {
+            key: 62,
+            velocity: 90,
+        });
+        c.apply(Command::NoteOff { key: 62 });
+        assert!(
+            !calls.lock().contains(&"off 62".to_string()),
+            "playback's note kept"
+        );
+        secs(&mut c, 1.5);
+        assert_eq!(calls.lock().last().map(String::as_str), Some("off 62"));
+    }
+
+    /// Review M4: looping back to the start, seeking or pausing must not drop the
+    /// sustain pedal or a key the player holds.
+    #[test]
+    fn transport_moves_keep_the_players_pedal_and_keys() {
+        let (mut c, calls) = recorder_core();
+        c.apply(Command::SetLoop(true));
+        c.apply(Command::Sustain(true));
+        c.apply(Command::NoteOn {
+            key: 50,
+            velocity: 90,
+        });
+        c.apply(Command::Play {
+            timeline: Timeline {
+                notes: vec![long(0, 72, 0.0, 0.2)],
+                duration: 0.5,
+            },
+            from: 0.0,
+        });
+        secs(&mut c, 1.2); // wraps twice
+        c.apply(Command::Seek(0.1));
+        c.apply(Command::Pause);
+        let calls = calls.lock().clone();
+        assert!(
+            !calls
+                .iter()
+                .any(|e| e == "all off" || e == "pedal false" || e == "off 50"),
+            "{calls:?}"
+        );
+        assert!(c.sustain, "pedal still down");
+        assert!(c.held[50].is_some(), "key still held");
+        assert!(
+            calls.iter().filter(|e| *e == "on 72").count() >= 2,
+            "playback looped: {calls:?}"
+        );
+    }
+
+    /// Stop still resets everything, pedal included.
+    #[test]
+    fn stop_resets_the_pedal() {
+        let (mut c, calls) = recorder_core();
+        c.apply(Command::Sustain(true));
+        c.apply(Command::Stop);
+        assert!(!c.sustain);
+        assert!(calls.lock().contains(&"all off".to_string()));
+    }
+
+    /// Review M3: the command queue is bounded. A send to a full queue frees
+    /// retired payloads while it waits, then gives up instead of hanging.
+    #[test]
+    fn a_full_command_queue_gives_up_after_waiting() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        assert!(push(&tx, Command::Pause, SEND_WAIT, || {}));
+        let mut reclaimed = 0;
+        let started = Instant::now();
+        assert!(!push(
+            &tx,
+            Command::Resume,
+            Duration::from_millis(30),
+            || reclaimed += 1
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(reclaimed > 0, "reclaims while waiting");
+        // Room again: it goes through.
+        rx.try_recv().unwrap();
+        assert!(push(&tx, Command::Resume, SEND_WAIT, || {}));
     }
 
     /// An edit while playing keeps the position and leaves sounding notes

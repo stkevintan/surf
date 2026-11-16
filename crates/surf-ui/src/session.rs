@@ -96,7 +96,9 @@ impl Session {
                 LiveEvent::NoteOff { key } => Command::NoteOff { key },
                 LiveEvent::Sustain(down) => Command::Sustain(down),
             };
-            let _ = audio_tx.send(command);
+            // Never block the driver's thread. The queue only fills if the
+            // audio device stopped calling back.
+            let _ = audio_tx.try_send(command);
         });
         let midi = MidiHub::new(sink);
         // Start with a short demo loaded (paused) so the piano roll has
