@@ -101,6 +101,44 @@ impl Document {
     }
 }
 
+/// A new file of this call's own in `path`'s directory, created exclusively.
+///
+/// The name is short (not `path`'s name plus a suffix, which could pass the
+/// filesystem's name limit for a long project name) and random enough that a
+/// stale one left by a killed writer, or a concurrent save, only costs a retry:
+/// an existing file is never opened, truncated or removed.
+fn create_temp_beside(path: &Path) -> Result<(std::path::PathBuf, std::fs::File)> {
+    use std::hash::{BuildHasher, Hasher};
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut last = None;
+    for _ in 0..16 {
+        // RandomState is seeded per process from the OS; mix in a counter, the
+        // pid and the clock so every attempt differs.
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        h.write_u32(std::process::id());
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
+        let tmp = path.with_file_name(format!(".surf-{:016x}.tmp", h.finish()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => return Ok((tmp, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => last = Some(err),
+            Err(err) => {
+                return Err(err).with_context(|| format!("could not write {}", tmp.display()));
+            }
+        }
+    }
+    Err(last.expect("16 attempts")).context("could not pick a temporary file name")
+}
+
 /// Replace `path` with `bytes` so that, whenever the process is killed or the
 /// machine loses power, `path` holds either the old contents or the new ones,
 /// never a truncated mix: write a temp file next to it, flush it to disk, rename
@@ -109,21 +147,10 @@ impl Document {
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
 
-    let name = path
-        .file_name()
-        .with_context(|| format!("{} has no file name", path.display()))?;
-    // A temp name of this call's own, created exclusively: two saves of one file
-    // at once never share (and truncate) each other's temp file.
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut tmp_name = name.to_os_string();
-    tmp_name.push(format!(".tmp-{}-{n}", std::process::id()));
-    let tmp = path.with_file_name(tmp_name);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .with_context(|| format!("could not write {}", tmp.display()))?;
+    if path.file_name().is_none() {
+        anyhow::bail!("{} has no file name", path.display());
+    }
+    let (tmp, mut file) = create_temp_beside(path)?;
     // From here on the temp file is this call's, so it is the one to clean up.
     let result = (|| {
         file.write_all(bytes)
@@ -192,6 +219,17 @@ mod tests {
             bytes.iter().all(|b| *b == bytes[0]),
             "one writer's whole file"
         );
+        // A name near the filesystem's limit still saves: the temp name is short.
+        let long = dir.join(format!("{}.surf", "x".repeat(245)));
+        write_atomic(&long, b"long name").unwrap();
+        assert_eq!(std::fs::read(&long).unwrap(), b"long name");
+        std::fs::remove_file(&long).unwrap();
+        // A stale temp file is left alone, not reused or removed.
+        let stale = dir.join(".surf-0000000000000000.tmp");
+        std::fs::write(&stale, b"stale").unwrap();
+        write_atomic(&path, b"after stale").unwrap();
+        assert_eq!(std::fs::read(&stale).unwrap(), b"stale");
+        std::fs::remove_file(&stale).unwrap();
         // A write that cannot complete leaves the old file as it was.
         write_atomic(&path, b"new state, longer").unwrap();
         let missing = dir.join("no-such-dir").join("x.state");
