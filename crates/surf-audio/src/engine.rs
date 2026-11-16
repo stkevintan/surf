@@ -134,6 +134,8 @@ struct ActiveNote {
     route: Route,
     key: u8,
     end_frame: u64,
+    /// The block in which its voice was struck (its start frame).
+    struck_at: u64,
 }
 
 /// Something the audio thread swapped out and wants the UI thread to free.
@@ -254,6 +256,22 @@ impl Core {
     /// playback note, or the player), end that voice first: one voice per key and
     /// route, as on an instrument, so every note-on is matched by one note-off.
     fn strike(&mut self, route: Route, key: u8, velocity: u8) {
+        self.strike_at(route, key, velocity, None);
+    }
+
+    /// `strike` for playback. Notes struck in the same block (frames from
+    /// `block`) on a voice already struck in that block share it instead of
+    /// retriggering: hundreds of identical starts would otherwise send an
+    /// off/on pair each and overflow a plugin's per-block event batch.
+    fn strike_at(&mut self, route: Route, key: u8, velocity: u8, block: Option<u64>) {
+        if let Some(block) = block
+            && self
+                .active
+                .iter()
+                .any(|a| a.route == route && a.key == key && a.struck_at >= block)
+        {
+            return;
+        }
         let again = self.sounding(route, key);
         if let Some(i) = self.slot(route) {
             if again {
@@ -482,12 +500,13 @@ impl Core {
                 if self.slot(route).is_none() {
                     continue;
                 }
-                self.strike(route, n.key, n.velocity);
+                self.strike_at(route, n.key, n.velocity, Some(pos));
                 self.active.push(ActiveNote {
                     track_id: n.track_id,
                     route,
                     key: n.key,
                     end_frame: frame(n.end).max(pos + 1),
+                    struck_at: pos,
                 });
             }
         }
@@ -720,13 +739,14 @@ impl Core {
             if self.slot(route).is_none() {
                 continue;
             }
-            self.strike(route, note.key, note.velocity);
+            self.strike_at(route, note.key, note.velocity, Some(start));
             let note_end = ((note.end * self.sample_rate) as u64).max(note_start + 1);
             self.active.push(ActiveNote {
                 track_id: note.track_id,
                 route,
                 key: note.key,
                 end_frame: note_end,
+                struck_at: note_start,
             });
         }
     }
@@ -1493,6 +1513,29 @@ mod tests {
         assert_eq!(*calls.lock(), ["off 62", "on 62", "off 62"]);
     }
 
+    /// Review: many identical starts on one key in one block share one voice, so
+    /// they send one note-on (not an off/on pair each, which would overflow a
+    /// VST2 plugin's 512-event batch) and one note-off when the last one ends.
+    #[test]
+    fn identical_starts_in_a_block_share_one_voice() {
+        let (mut c, calls) = recorder_core();
+        let notes: Vec<TimedNote> = (0..300)
+            .map(|i| long(0, 60, 0.0, 0.5 + i as f64 * 0.001))
+            .collect();
+        c.apply(Command::Play {
+            timeline: Timeline {
+                notes,
+                duration: 2.0,
+            },
+            from: 0.0,
+        });
+        secs(&mut c, 0.1);
+        assert_eq!(*calls.lock(), ["on 60"]);
+        assert_eq!(c.active.len(), 300, "every note is tracked");
+        secs(&mut c, 1.5);
+        assert_eq!(*calls.lock(), ["on 60", "off 60"]);
+    }
+
     /// Review: after AllNotesOff, a silenced playback note no longer owns its key,
     /// so the player pressing and releasing that key does end it.
     #[test]
@@ -2075,8 +2118,12 @@ mod tests {
             },
         });
         let ons = log.lock().iter().filter(|e| e.2).count();
-        assert_eq!(ons, c.active.len(), "every started note is tracked");
-        assert_eq!(ons, cap);
+        assert_eq!(c.active.len(), cap, "tracked up to the cap, no further");
+        // Notes on one key and route share a voice: one note-on per voice.
+        let mut voices: Vec<(u8, u8)> = c.active.iter().map(|a| (a.route.channel, a.key)).collect();
+        voices.sort_unstable();
+        voices.dedup();
+        assert_eq!(ons, voices.len(), "one note-on per tracked voice");
         // Play to the end: every one of them is released.
         run(&mut c, 48_000);
         let offs = log.lock().iter().filter(|e| !e.2).count();
