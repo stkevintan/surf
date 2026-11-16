@@ -243,7 +243,12 @@ impl Song {
             if tempo.tick > tick {
                 break;
             }
-            secs += ticks_to_secs(tick.min(tempo.tick) - prev_tick, self.ppq, bpm);
+            // Saturating: an out-of-order map must not underflow (`repair` sorts it).
+            secs += ticks_to_secs(
+                tick.min(tempo.tick).saturating_sub(prev_tick),
+                self.ppq,
+                bpm,
+            );
             prev_tick = tempo.tick;
             bpm = tempo.bpm.max(1.0);
         }

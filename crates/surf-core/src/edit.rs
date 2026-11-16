@@ -235,6 +235,9 @@ impl Edit {
                 // Undo with the opposite offset is exact only if no region
                 // was clamped at bar 0 or the first/last track, so record
                 // where each region really was instead.
+                // One (remove moved, reinsert original) pair per region. Each
+                // `index` was taken after the earlier regions were removed, so the
+                // pairs must be undone last-first, like `Batch`.
                 let mut undo = Vec::new();
                 let n_tracks = p.tracks.len() as i32;
                 for id in regions {
@@ -247,14 +250,17 @@ impl Edit {
                     moved.start = (region.start as i64 + ticks).max(0) as u64;
                     p.tracks[target].regions.push(moved);
                     sort_regions(&mut p.tracks[target]);
-                    undo.push(Edit::RemoveRegion { region: *id });
-                    undo.push(Edit::InsertRegion {
-                        track: p.tracks[ti].id,
-                        index: ri,
-                        region,
-                    });
+                    undo.push([
+                        Edit::RemoveRegion { region: *id },
+                        Edit::InsertRegion {
+                            track: p.tracks[ti].id,
+                            index: ri,
+                            region,
+                        },
+                    ]);
                 }
-                Edit::Batch(undo)
+                undo.reverse();
+                Edit::Batch(undo.into_iter().flatten().collect())
             }
             Edit::ResizeRegion { region, len } => {
                 let Some(r) = p.region_mut(*region) else {
@@ -691,6 +697,31 @@ mod tests {
                 len: 50,
             }],
         });
+    }
+
+    /// Review M14: two regions on one track, moved together far enough that the
+    /// first passes the second, then undone, come back in their original order.
+    #[test]
+    fn moving_regions_on_one_track_undoes_in_order() {
+        let mut p = project();
+        let mut second = p.tracks[0].regions[0].clone();
+        second.id = Id(30_000);
+        second.start = 3840;
+        p.tracks[0].regions.push(second);
+        let before = p.clone();
+        let ids: Vec<Id> = p.tracks[0].regions.iter().map(|r| r.id).collect();
+        let undo = Edit::MoveRegions {
+            regions: ids.clone(),
+            // Past the second region's start, so the first lands after it.
+            ticks: 4000,
+            tracks: 0,
+        }
+        .apply(&mut p);
+        assert_ne!(p, before);
+        undo.apply(&mut p);
+        let after: Vec<Id> = p.tracks[0].regions.iter().map(|r| r.id).collect();
+        assert_eq!(after, ids);
+        assert_eq!(p, before);
     }
 
     #[test]

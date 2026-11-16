@@ -158,6 +158,8 @@ impl Project {
             t.regions.sort_by_key(|r| r.start);
         }
         self.next_id = self.next_id.max(max + 1);
+        // Tempo conversion walks the map in order; a hand-edited file may not be.
+        self.tempos.sort_by_key(|t| t.tick);
         if self.tempos.is_empty() {
             self.tempos.push(Tempo {
                 tick: 0,
@@ -403,6 +405,35 @@ fn track_name(channel: u8, several: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review M15: a hand-edited file with tempos out of order must not underflow
+    /// in tick/second conversion, and `repair` puts the map back in order.
+    #[test]
+    fn repair_sorts_an_out_of_order_tempo_map() {
+        let mut p = Project::empty();
+        p.tempos = vec![
+            Tempo {
+                tick: 1920,
+                bpm: 60.0,
+            },
+            Tempo {
+                tick: 0,
+                bpm: 120.0,
+            },
+        ];
+        // Before repair: must not panic. Past both entries, the second (tick 0)
+        // came after 1920 and the subtraction underflowed in debug builds.
+        let _ = p.tick_to_sec(3000);
+        p.repair();
+        assert_eq!(
+            p.tempos.iter().map(|t| t.tick).collect::<Vec<_>>(),
+            vec![0, 1920]
+        );
+        // One bar at 120 BPM is 2 s, then a beat at 60 BPM is 1 s.
+        let beat = p.ticks_per_beat();
+        assert!((p.tick_to_sec(1920) - 2.0).abs() < 1e-9);
+        assert!((p.tick_to_sec(1920 + beat) - 3.0).abs() < 1e-9);
+    }
 
     fn two_channel_song() -> Song {
         let mut s = Song::empty();
