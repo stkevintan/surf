@@ -264,6 +264,51 @@ fn marquee_selects_notes_under_it(cx: &mut TestAppContext) {
     }
 }
 
+/// Review M19: with the lanes scrolled, a click lands on the lane and the time
+/// drawn under the pointer, not on the unscrolled one.
+#[gpui::test]
+fn clicks_follow_the_tracks_scroll(cx: &mut TestAppContext) {
+    let mut app = app(cx);
+    // Enough tracks to scroll past the 300 px view.
+    for _ in 0..8 {
+        editing::new_track(&mut app.session, &mut app.ui.edit);
+    }
+    let n = app.session.project.tracks.len();
+    assert!(n as f32 * sz::LANE_H > 300.0 - sz::RULER_TRACKS_H);
+    // Scroll down one lane with the wheel; it stops at the last lane.
+    tracks::scroll_by(&mut app, 0.0, -sz::LANE_H, false, false);
+    assert_eq!(app.ui.tracks_scroll_y, sz::LANE_H);
+    tracks::scroll_by(&mut app, 0.0, -100_000.0, false, false);
+    let max = n as f32 * sz::LANE_H - (300.0 - sz::RULER_TRACKS_H);
+    assert_eq!(app.ui.tracks_scroll_y, max, "stops at the last lane");
+    tracks::scroll_by(&mut app, 0.0, 100_000.0, false, false);
+    assert_eq!(app.ui.tracks_scroll_y, 0.0);
+
+    // Three lanes down: the top visible lane is track 4, a new empty one.
+    tracks::scroll_by(&mut app, 0.0, -3.0 * sz::LANE_H, false, false);
+    let at = point(
+        px(TRACKS_ORIGIN.0 + 20.0),
+        px(TRACKS_ORIGIN.1 + sz::RULER_TRACKS_H + 10.0),
+    );
+    tracks::pointer_down(&mut app, &down(at, Modifiers::default(), 1));
+    tracks::pointer_up(&mut app, at);
+    let fourth = app.session.project.tracks[3].id;
+    assert_eq!(app.ui.edit.track, Some(fourth), "the lane drawn there");
+
+    // Scrolled a bar to the right, the Pencil draws in bar 2, not bar 1.
+    let bar = app.session.project.ticks_per_bar();
+    let beats = bar as f32 / app.session.project.ticks_per_beat() as f32;
+    let one_bar = beats * app.ui.tracks_beat_w;
+    tracks::scroll_by(&mut app, 0.0, -one_bar, false, true);
+    app.ui.edit.tracks_tool = Tool::Pencil;
+    let at = point(px(TRACKS_ORIGIN.0 + 2.0), at.y);
+    tracks::pointer_down(&mut app, &down(at, Modifiers::default(), 1));
+    tracks::pointer_up(&mut app, at);
+    let made = app.session.project.track(fourth).unwrap().regions.clone();
+    assert_eq!(made.len(), 1, "drawn on the fourth track");
+    assert_eq!(made[0].start, bar, "in bar 2");
+}
+
 #[gpui::test]
 fn dragging_a_region_to_the_next_track_moves_it(cx: &mut TestAppContext) {
     let mut app = app(cx);

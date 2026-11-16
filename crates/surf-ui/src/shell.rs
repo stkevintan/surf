@@ -74,6 +74,10 @@ pub struct Ui {
     pub track_open: bool,
     /// Tracks-area zoom: pixels per beat.
     pub tracks_beat_w: f32,
+    /// Tracks-area scroll, in pixels: right of bar 1, and below the first lane.
+    /// The headers follow the vertical one.
+    pub tracks_scroll_x: f32,
+    pub tracks_scroll_y: f32,
     /// Piano-roll zoom and scroll.
     pub roll_beat_w: f32,
     pub roll_top_key: u8,
@@ -167,6 +171,8 @@ impl Default for Ui {
             region_open: true,
             track_open: false,
             tracks_beat_w: size::TRACKS_BEAT_W,
+            tracks_scroll_x: 0.0,
+            tracks_scroll_y: 0.0,
             roll_beat_w: size::ROLL_BEAT_W,
             roll_top_key: 86,
             roll_scroll_x: 0.0,
