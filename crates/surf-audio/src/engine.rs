@@ -35,8 +35,13 @@ pub struct Route {
 
 pub enum Command {
     /// Live input, played on the input track's route (see `SetInput`).
-    NoteOn { key: u8, velocity: u8 },
-    NoteOff { key: u8 },
+    NoteOn {
+        key: u8,
+        velocity: u8,
+    },
+    NoteOff {
+        key: u8,
+    },
     Sustain(bool),
     AllNotesOff,
     /// Put an instrument in a slot, or empty it.
@@ -51,16 +56,29 @@ pub enum Command {
     SetRoutes(Vec<Route>),
     /// Linear output gain of a slot: the track's fader, or for a shared
     /// plugin the loudest of its tracks.
-    SetSlotGain { slot: u8, gain: f32 },
+    SetSlotGain {
+        slot: u8,
+        gain: f32,
+    },
     /// The track live input plays, by index.
     SetInput(u16),
-    ControlChange { slot: u8, channel: u8, controller: u8, value: u8 },
-    Play { timeline: Timeline, from: f64 },
+    ControlChange {
+        slot: u8,
+        channel: u8,
+        controller: u8,
+        value: u8,
+    },
+    Play {
+        timeline: Timeline,
+        from: f64,
+    },
     /// Swap in an edited timeline without restarting: the position stays,
     /// notes still sounding and still in it keep sounding, and only notes
     /// that were removed or changed stop. Works while paused too, so Resume
     /// plays the edit.
-    Update { timeline: Timeline },
+    Update {
+        timeline: Timeline,
+    },
     Pause,
     Resume,
     Stop,
@@ -210,7 +228,9 @@ impl Core {
     }
 
     fn slot(&mut self, route: Route) -> Option<&mut Box<dyn Instrument>> {
-        self.slots.get_mut(route.slot as usize).and_then(Option::as_mut)
+        self.slots
+            .get_mut(route.slot as usize)
+            .and_then(Option::as_mut)
     }
 
     fn all_notes_off(&mut self) {
@@ -383,7 +403,11 @@ impl Core {
             }
         });
         for &(route, key) in &self.ended {
-            if let Some(i) = self.slots.get_mut(route.slot as usize).and_then(Option::as_mut) {
+            if let Some(i) = self
+                .slots
+                .get_mut(route.slot as usize)
+                .and_then(Option::as_mut)
+            {
                 i.note_off(route.channel, key);
             }
         }
@@ -404,8 +428,15 @@ impl Core {
                 if sounding || self.active.len() == self.active.capacity() {
                     continue;
                 }
-                let route = self.routes.get(n.track as usize).copied().unwrap_or_default();
-                let Some(inst) = self.slots.get_mut(route.slot as usize).and_then(Option::as_mut)
+                let route = self
+                    .routes
+                    .get(n.track as usize)
+                    .copied()
+                    .unwrap_or_default();
+                let Some(inst) = self
+                    .slots
+                    .get_mut(route.slot as usize)
+                    .and_then(Option::as_mut)
                 else {
                     continue;
                 };
@@ -619,7 +650,11 @@ impl Core {
             }
         });
         for &(route, key) in &self.ended {
-            if let Some(i) = self.slots.get_mut(route.slot as usize).and_then(Option::as_mut) {
+            if let Some(i) = self
+                .slots
+                .get_mut(route.slot as usize)
+                .and_then(Option::as_mut)
+            {
                 i.note_off(route.channel, key);
             }
         }
@@ -643,7 +678,11 @@ impl Core {
             if self.active.len() == self.active.capacity() {
                 continue;
             }
-            let Some(i) = self.slots.get_mut(route.slot as usize).and_then(Option::as_mut) else {
+            let Some(i) = self
+                .slots
+                .get_mut(route.slot as usize)
+                .and_then(Option::as_mut)
+            else {
                 continue;
             };
             i.note_on(route.channel, note.key, note.velocity);
@@ -1047,9 +1086,18 @@ mod tests {
         }
         // Track 0 on its own piano; tracks 1 and 2 share Kontakt on ch 2 and 3.
         c.apply(Command::SetRoutes(vec![
-            Route { slot: 1, channel: 0 },
-            Route { slot: 2, channel: 1 },
-            Route { slot: 2, channel: 2 },
+            Route {
+                slot: 1,
+                channel: 0,
+            },
+            Route {
+                slot: 2,
+                channel: 1,
+            },
+            Route {
+                slot: 2,
+                channel: 2,
+            },
         ]));
         c.apply(Command::SetSlotGain { slot: 1, gain: 0.5 });
         c.apply(Command::SetVolume(1.0));
@@ -1077,14 +1125,31 @@ mod tests {
     fn live_note_off_follows_its_note_on_after_the_input_moves() {
         let mut c = core();
         let (a, b): (Log, Log) = Default::default();
-        c.apply(Command::SetSlot { slot: 0, instrument: Some(Box::new(Probe(a.clone()))), ack: None });
-        c.apply(Command::SetSlot { slot: 1, instrument: Some(Box::new(Probe(b.clone()))), ack: None });
+        c.apply(Command::SetSlot {
+            slot: 0,
+            instrument: Some(Box::new(Probe(a.clone()))),
+            ack: None,
+        });
+        c.apply(Command::SetSlot {
+            slot: 1,
+            instrument: Some(Box::new(Probe(b.clone()))),
+            ack: None,
+        });
         c.apply(Command::SetRoutes(vec![
-            Route { slot: 0, channel: 0 },
-            Route { slot: 1, channel: 4 },
+            Route {
+                slot: 0,
+                channel: 0,
+            },
+            Route {
+                slot: 1,
+                channel: 4,
+            },
         ]));
         c.apply(Command::SetInput(1));
-        c.apply(Command::NoteOn { key: 60, velocity: 90 });
+        c.apply(Command::NoteOn {
+            key: 60,
+            velocity: 90,
+        });
         c.apply(Command::SetInput(0));
         c.apply(Command::NoteOff { key: 60 });
         assert!(a.lock().is_empty());
@@ -1141,8 +1206,14 @@ mod tests {
             ack: None,
         });
         c.apply(Command::SetRoutes(vec![
-            Route { slot: 1, channel: 0 },
-            Route { slot: 1, channel: 1 },
+            Route {
+                slot: 1,
+                channel: 0,
+            },
+            Route {
+                slot: 1,
+                channel: 1,
+            },
         ]));
         (c, log)
     }
@@ -1157,7 +1228,10 @@ mod tests {
         let b = long(1, 64, 0.0, 1.0);
         let later = long(0, 67, 0.5, 0.6);
         c.apply(Command::Play {
-            timeline: Timeline { notes: vec![a, b, later], duration: 1.0 },
+            timeline: Timeline {
+                notes: vec![a, b, later],
+                duration: 1.0,
+            },
             from: 0.0,
         });
         c.render(4800); // 0.1 s in: 60 and 64 are sounding
@@ -1167,7 +1241,10 @@ mod tests {
         // Delete 64 and move the later note to 0.3 s.
         let moved = long(0, 67, 0.3, 0.4);
         c.apply(Command::Update {
-            timeline: Timeline { notes: vec![a, moved], duration: 1.0 },
+            timeline: Timeline {
+                notes: vec![a, moved],
+                duration: 1.0,
+            },
         });
         assert_eq!(c.pos_frames, pos, "position kept");
         assert_eq!(
@@ -1188,14 +1265,23 @@ mod tests {
     fn a_shortened_note_ends_on_time() {
         let (mut c, log) = probe_core();
         c.apply(Command::Play {
-            timeline: Timeline { notes: vec![long(0, 60, 0.0, 2.0)], duration: 2.0 },
+            timeline: Timeline {
+                notes: vec![long(0, 60, 0.0, 2.0)],
+                duration: 2.0,
+            },
             from: 0.0,
         });
         c.render(4800); // 0.1 s
         c.apply(Command::Update {
-            timeline: Timeline { notes: vec![long(0, 60, 0.0, 0.2)], duration: 2.0 },
+            timeline: Timeline {
+                notes: vec![long(0, 60, 0.0, 0.2)],
+                duration: 2.0,
+            },
         });
-        assert!(log.lock().iter().all(|e| e.2), "still sounding after the edit");
+        assert!(
+            log.lock().iter().all(|e| e.2),
+            "still sounding after the edit"
+        );
         c.render(9600); // to 0.3 s
         assert_eq!(log.lock().last(), Some(&(0, 60, false)), "ended near 0.2 s");
     }
@@ -1205,20 +1291,25 @@ mod tests {
     fn an_update_while_paused_plays_on_resume() {
         let (mut c, log) = probe_core();
         c.apply(Command::Play {
-            timeline: Timeline { notes: vec![long(0, 60, 0.5, 0.6)], duration: 1.0 },
+            timeline: Timeline {
+                notes: vec![long(0, 60, 0.5, 0.6)],
+                duration: 1.0,
+            },
             from: 0.0,
         });
         c.render(4800);
         c.apply(Command::Pause);
         c.apply(Command::Update {
-            timeline: Timeline { notes: vec![long(0, 72, 0.5, 0.6)], duration: 1.0 },
+            timeline: Timeline {
+                notes: vec![long(0, 72, 0.5, 0.6)],
+                duration: 1.0,
+            },
         });
         c.apply(Command::Resume);
         run(&mut c, 48_000);
         let ons: Vec<u8> = log.lock().iter().filter(|e| e.2).map(|e| e.1).collect();
         assert_eq!(ons, vec![72]);
     }
-
 
     /// Review: deleting a track shifts the others' indices. Their sounding
     /// notes must keep sounding, since they're matched by stable id.
@@ -1229,7 +1320,10 @@ mod tests {
         let a = long(1, 60, 0.0, 1.0);
         let b = long(1, 64, 0.0, 1.0);
         c.apply(Command::Play {
-            timeline: Timeline { notes: vec![a, b], duration: 1.0 },
+            timeline: Timeline {
+                notes: vec![a, b],
+                duration: 1.0,
+            },
             from: 0.0,
         });
         run(&mut c, 4800);
@@ -1239,9 +1333,15 @@ mod tests {
             n.track = 0;
             n
         };
-        c.apply(Command::SetRoutes(vec![Route { slot: 1, channel: 1 }]));
+        c.apply(Command::SetRoutes(vec![Route {
+            slot: 1,
+            channel: 1,
+        }]));
         c.apply(Command::Update {
-            timeline: Timeline { notes: vec![shift(a), shift(b)], duration: 1.0 },
+            timeline: Timeline {
+                notes: vec![shift(a), shift(b)],
+                duration: 1.0,
+            },
         });
         assert!(log.lock().is_empty(), "no note-offs: {:?}", log.lock());
     }
@@ -1253,24 +1353,36 @@ mod tests {
         let (mut c, log) = probe_core();
         let held = long(0, 60, 0.0, 1.0);
         c.apply(Command::Play {
-            timeline: Timeline { notes: vec![held], duration: 2.0 },
+            timeline: Timeline {
+                notes: vec![held],
+                duration: 2.0,
+            },
             from: 0.0,
         });
         run(&mut c, 4800); // 0.1 s
         // Drag it ahead, off the playhead: it stops.
         c.apply(Command::Update {
-            timeline: Timeline { notes: vec![long(0, 60, 0.5, 1.5)], duration: 2.0 },
+            timeline: Timeline {
+                notes: vec![long(0, 60, 0.5, 1.5)],
+                duration: 2.0,
+            },
         });
         assert_eq!(log.lock().last(), Some(&(0, 60, false)));
         log.lock().clear();
         // Drag it back under the playhead: it sounds again, once.
         c.apply(Command::Update {
-            timeline: Timeline { notes: vec![held], duration: 2.0 },
+            timeline: Timeline {
+                notes: vec![held],
+                duration: 2.0,
+            },
         });
         assert_eq!(*log.lock(), vec![(0, 60, true)]);
         // Another update with nothing changed doesn't retrigger it.
         c.apply(Command::Update {
-            timeline: Timeline { notes: vec![held], duration: 2.0 },
+            timeline: Timeline {
+                notes: vec![held],
+                duration: 2.0,
+            },
         });
         assert_eq!(log.lock().len(), 1, "no retrigger: {:?}", log.lock());
     }
@@ -1290,8 +1402,14 @@ mod tests {
         });
         let (trash, ui) = crossbeam_channel::bounded::<Retired>(2);
         let mut c = Core::new(48_000, shared, trash);
-        let tl = || Timeline { notes: vec![long(0, 60, 0.0, 1.0)], duration: 1.0 };
-        c.apply(Command::Play { timeline: tl(), from: 0.0 });
+        let tl = || Timeline {
+            notes: vec![long(0, 60, 0.0, 1.0)],
+            duration: 1.0,
+        };
+        c.apply(Command::Play {
+            timeline: tl(),
+            from: 0.0,
+        });
         for _ in 0..5 {
             c.apply(Command::Update { timeline: tl() });
         }
@@ -1483,7 +1601,15 @@ mod tests {
         });
         let (trash, ui) = crossbeam_channel::bounded::<Retired>(8);
         let mut c = Core::new(48_000, shared, trash);
-        let routes = || vec![Route { slot: 0, channel: 0 }; 256];
+        let routes = || {
+            vec![
+                Route {
+                    slot: 0,
+                    channel: 0
+                };
+                256
+            ]
+        };
         c.apply(Command::SetRoutes(routes()));
         c.apply(Command::SetRoutes(routes()));
         // The first apply retires the initial empty list, the second the first full one.
@@ -1500,7 +1626,6 @@ mod tests {
         assert_eq!(c.routes.len(), 256, "the live list stays in the core");
     }
 
-
     /// Review: `update` must not allocate in the callback. The list it
     /// tracks notes in keeps its reserved capacity, and nothing else grows.
     #[test]
@@ -1516,12 +1641,25 @@ mod tests {
             })
             .collect();
         c.apply(Command::Play {
-            timeline: Timeline { notes: Vec::new(), duration: 1.0 },
+            timeline: Timeline {
+                notes: Vec::new(),
+                duration: 1.0,
+            },
             from: 0.0,
         });
         run(&mut c, 4800);
-        c.apply(Command::Update { timeline: Timeline { notes: crowd.clone(), duration: 1.0 } });
-        c.apply(Command::Update { timeline: Timeline { notes: crowd, duration: 1.0 } });
+        c.apply(Command::Update {
+            timeline: Timeline {
+                notes: crowd.clone(),
+                duration: 1.0,
+            },
+        });
+        c.apply(Command::Update {
+            timeline: Timeline {
+                notes: crowd,
+                duration: 1.0,
+            },
+        });
         assert_eq!(c.active.capacity(), cap, "never grew");
         assert!(c.active.len() <= cap);
     }
@@ -1543,12 +1681,20 @@ mod tests {
         }
         assert!(notes.len() > cap);
         c.apply(Command::Play {
-            timeline: Timeline { notes: Vec::new(), duration: 1.0 },
+            timeline: Timeline {
+                notes: Vec::new(),
+                duration: 1.0,
+            },
             from: 0.0,
         });
         run(&mut c, 4800);
         log.lock().clear();
-        c.apply(Command::Update { timeline: Timeline { notes, duration: 1.0 } });
+        c.apply(Command::Update {
+            timeline: Timeline {
+                notes,
+                duration: 1.0,
+            },
+        });
         let ons = log.lock().iter().filter(|e| e.2).count();
         assert_eq!(ons, c.active.len(), "every started note is tracked");
         assert_eq!(ons, cap);
@@ -1557,5 +1703,4 @@ mod tests {
         let offs = log.lock().iter().filter(|e| !e.2).count();
         assert_eq!(offs, ons, "no stuck notes");
     }
-
 }

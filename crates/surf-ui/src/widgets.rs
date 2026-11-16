@@ -4,8 +4,8 @@
 //! and sizing the same way as any GPUI element.
 
 use gpui::{
-    AppContext, Div, FontWeight, InteractiveElement, IntoElement, ParentElement, Rgba, SharedString,
-    Styled, div, prelude::FluentBuilder, px, svg,
+    AppContext, Div, FontWeight, InteractiveElement, IntoElement, ParentElement, Rgba,
+    SharedString, Styled, div, prelude::FluentBuilder, px, svg,
 };
 
 use crate::icons;

@@ -13,9 +13,9 @@ use std::time::Instant;
 use surf_audio::render::{RenderOptions, RenderStats, mix_stems, render_timeline_to_wav};
 use surf_audio::{AudioEngine, Command, EngineStatus, OutputEvent, Synth};
 use surf_core::document::{self, Document};
-use surf_core::recorder::Recorder;
 use surf_core::edit::{Edit, History, TrackField};
 use surf_core::project::{Id, Project};
+use surf_core::recorder::Recorder;
 use surf_core::song::{RecordedNote, Song, Timeline};
 use surf_midi::{LiveEvent, MidiHub, NoteSink, PortChange};
 use surf_plugin::client::{RenderNote, VstClient, helper_log_path};
@@ -205,7 +205,9 @@ impl Session {
     /// The take is in seconds; it becomes ticks through the project's own
     /// tempo map, so it plays back as long as it was played.
     fn add_take(&mut self, take: &[RecordedNote]) {
-        let Some(track) = self.record_track() else { return };
+        let Some(track) = self.record_track() else {
+            return;
+        };
         let bar = self.project.ticks_per_bar().max(1);
         let mut recorded: Vec<&RecordedNote> = take.iter().filter(|r| r.end > r.start).collect();
         recorded.sort_by(|a, b| a.start.total_cmp(&b.start));
@@ -243,7 +245,15 @@ impl Session {
         };
         let count = region.notes.len();
         let id = region.id;
-        self.history.apply(&mut self.project, "Record", Edit::InsertRegion { track, index, region });
+        self.history.apply(
+            &mut self.project,
+            "Record",
+            Edit::InsertRegion {
+                track,
+                index,
+                region,
+            },
+        );
         self.project_changed();
         self.record_region = Some(id);
         self.status = format!("Recorded {count} notes into a new take");
@@ -259,7 +269,8 @@ impl Session {
     /// `record_arm` pointing at it (undo brings it back armed), so every
     /// reader goes through this.
     fn armed_track(&self) -> Option<Id> {
-        self.record_arm.filter(|id| self.project.track(*id).is_some())
+        self.record_arm
+            .filter(|id| self.project.track(*id).is_some())
     }
 
     pub fn load_demo(&mut self) {
@@ -275,7 +286,11 @@ impl Session {
     /// track's. Opening a file doesn't unload Kontakt.
     pub fn set_project(&mut self, mut project: Project) {
         self.audio.stop();
-        let fallback = self.project.tracks.first().and_then(|t| t.instrument.clone());
+        let fallback = self
+            .project
+            .tracks
+            .first()
+            .and_then(|t| t.instrument.clone());
         for t in &mut project.tracks {
             if t.instrument.is_none() {
                 t.instrument = self
@@ -358,12 +373,14 @@ impl Session {
             };
             match &source {
                 Source::Piano(_) => {
-                    self.audio.set_slot(slot, Some(Box::new(piano(sample_rate))));
+                    self.audio
+                        .set_slot(slot, Some(Box::new(piano(sample_rate))));
                     self.rack.slots[slot as usize] = Some(source);
                 }
                 Source::Plugin(path) => {
                     if let Some(client) = self.start_host(path) {
-                        self.audio.set_slot(slot, Some(Box::new(client.instrument())));
+                        self.audio
+                            .set_slot(slot, Some(Box::new(client.instrument())));
                         self.rack.hosts.push(Host {
                             path: path.clone(),
                             client,
@@ -424,11 +441,9 @@ impl Session {
         match VstClient::load(path, self.audio.sample_rate(), state.as_deref()) {
             Ok(client) => {
                 self.status = match &state {
-                    Some(state) => format!(
-                        "Loaded {} (state from {})",
-                        client.name,
-                        state.display()
-                    ),
+                    Some(state) => {
+                        format!("Loaded {} (state from {})", client.name, state.display())
+                    }
                     None => format!("Loaded {}", client.name),
                 };
                 let has_editor = surf_plugin::format::detect(path)
@@ -521,7 +536,11 @@ impl Session {
                     self.project.name,
                     notes,
                     self.project.tracks.len(),
-                    if self.project.tracks.len() == 1 { "" } else { "s" },
+                    if self.project.tracks.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
                     self.timeline.duration
                 );
             }
@@ -536,7 +555,11 @@ impl Session {
         let mut failed = Vec::new();
         for host in &mut self.rack.hosts {
             let tmp = rack::parked_state_path(&host.path).with_extension("save");
-            match host.client.save_state(&tmp).and_then(|_| Ok(std::fs::read(&tmp)?)) {
+            match host
+                .client
+                .save_state(&tmp)
+                .and_then(|_| Ok(std::fs::read(&tmp)?))
+            {
                 Ok(blob) => {
                     plugin_states.insert(host.path.clone(), blob);
                 }
@@ -566,8 +589,10 @@ impl Session {
                 self.history.mark_saved();
                 self.status = format!("Saved {}", path.display());
                 if !failed.is_empty() {
-                    self.status
-                        .push_str(&format!(" · without plugin state for {}", failed.join(", ")));
+                    self.status.push_str(&format!(
+                        " · without plugin state for {}",
+                        failed.join(", ")
+                    ));
                 }
                 self.project_path = Some(path);
                 true
@@ -640,7 +665,11 @@ impl Session {
                 "Opened {} · {} track{}",
                 self.project.name,
                 self.project.tracks.len(),
-                if self.project.tracks.len() == 1 { "" } else { "s" }
+                if self.project.tracks.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
             )
         } else {
             format!(
@@ -670,16 +699,34 @@ impl Session {
 
     /// Suggested file name for an export, without extension.
     pub fn export_stem(&self) -> String {
-        let name = if self.project.name.is_empty() { "surf-export" } else { self.project.name.as_str() };
+        let name = if self.project.name.is_empty() {
+            "surf-export"
+        } else {
+            self.project.name.as_str()
+        };
         let clean: String = name
             .chars()
-            .map(|c| if c.is_alphanumeric() || " -_".contains(c) { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || " -_".contains(c) {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
-        if clean.trim().is_empty() { "surf-export".to_string() } else { clean }
+        if clean.trim().is_empty() {
+            "surf-export".to_string()
+        } else {
+            clean
+        }
     }
 
     pub fn can_export_midi(&mut self) -> bool {
-        let any = self.project.tracks.iter().any(|t| t.regions.iter().any(|r| !r.notes.is_empty()));
+        let any = self
+            .project
+            .tracks
+            .iter()
+            .any(|t| t.regions.iter().any(|r| !r.notes.is_empty()));
         if !any {
             self.status = "Nothing to export yet".to_string();
         }
@@ -917,7 +964,8 @@ impl Session {
             let Some(client) = self.start_host(&path) else {
                 return;
             };
-            self.audio.set_slot(slot, Some(Box::new(client.instrument())));
+            self.audio
+                .set_slot(slot, Some(Box::new(client.instrument())));
             self.rack.hosts.push(Host {
                 path: path.clone(),
                 client,
@@ -939,8 +987,8 @@ impl Session {
                 " · shared by {shared} tracks, each on its own MIDI channel"
             ));
         }
-        let editor = surf_plugin::format::detect(&path)
-            .is_none_or(surf_plugin::format::Format::has_editor);
+        let editor =
+            surf_plugin::format::detect(&path).is_none_or(surf_plugin::format::Format::has_editor);
         if editor && shared == 1 && std::env::var_os("SURF_NO_EDITOR").is_none() {
             self.open_vst_editor();
         }
@@ -1183,7 +1231,12 @@ impl Session {
     pub fn active_keys(&self) -> HashSet<u8> {
         let position = self.position();
         let mut keys: HashSet<u8> = self.timeline.active_at(position).map(|n| n.key).collect();
-        keys.extend(self.live_notes.iter().filter(|n| n.end.is_none()).map(|n| n.key));
+        keys.extend(
+            self.live_notes
+                .iter()
+                .filter(|n| n.end.is_none())
+                .map(|n| n.key),
+        );
         keys.extend(self.sustained_keys.iter().copied());
         keys
     }
@@ -1361,8 +1414,6 @@ fn vst_state_path_for(plugin_path: &Path) -> PathBuf {
     surf_platform::data_dir().join(format!("vst-{:016x}.state", hasher.finish()))
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1376,14 +1427,30 @@ mod tests {
         let mut song = Song::empty();
         song.name = "Two Notes".into();
         song.notes = vec![
-            surf_core::song::Note { key: 60, velocity: 100, channel: 0, start_tick: 0, duration_ticks: 480 },
-            surf_core::song::Note { key: 67, velocity: 90, channel: 0, start_tick: 480, duration_ticks: 480 },
+            surf_core::song::Note {
+                key: 60,
+                velocity: 100,
+                channel: 0,
+                start_tick: 0,
+                duration_ticks: 480,
+            },
+            surf_core::song::Note {
+                key: 67,
+                velocity: 90,
+                channel: 0,
+                start_tick: 480,
+                duration_ticks: 480,
+            },
         ];
         surf_midi::smf::save(&song, &path).unwrap();
 
         let mut session = Session::new();
         session.load_midi_path(&path);
-        assert_eq!(session.project.name, "Two Notes", "status: {}", session.status);
+        assert_eq!(
+            session.project.name, "Two Notes",
+            "status: {}",
+            session.status
+        );
         assert_eq!(session.timeline.notes.len(), 2);
 
         // A file that is not MIDI is refused with a message, not loaded.
@@ -1402,7 +1469,13 @@ mod tests {
         let region = s.project.tracks[0].regions[0].id;
         let first = s.project.tracks[0].regions[0].notes[0].clone();
         let before = s.timeline.notes.len();
-        s.apply("Delete Note", Edit::DeleteNotes { region, notes: vec![first.id] });
+        s.apply(
+            "Delete Note",
+            Edit::DeleteNotes {
+                region,
+                notes: vec![first.id],
+            },
+        );
         assert_eq!(s.timeline.notes.len(), before - 1);
         assert_eq!(s.history.undo_label(), Some("Delete Note"));
         s.undo();
@@ -1419,7 +1492,13 @@ mod tests {
         let t = s.project.tracks[0].id;
         let before = s.timeline.notes.len();
         assert!(before > 0);
-        s.apply("Mute", Edit::SetTrack { track: t, field: surf_core::edit::TrackField::Mute(true) });
+        s.apply(
+            "Mute",
+            Edit::SetTrack {
+                track: t,
+                field: surf_core::edit::TrackField::Mute(true),
+            },
+        );
         assert_eq!(s.timeline.notes.len(), 0);
         s.undo();
         assert_eq!(s.timeline.notes.len(), before);
@@ -1431,7 +1510,12 @@ mod tests {
         let mut s = Session::new();
         let track = s.project.tracks[0].id;
         let regions = s.project.tracks[0].regions.len();
-        s.add_take(&[RecordedNote { key: 64, velocity: 100, start: 0.0, end: 0.25 }]);
+        s.add_take(&[RecordedNote {
+            key: 64,
+            velocity: 100,
+            start: 0.0,
+            end: 0.25,
+        }]);
         let t = s.project.track(track).unwrap();
         assert_eq!(t.regions.len(), regions + 1);
         let new = t.regions.last().unwrap();
@@ -1516,7 +1600,7 @@ mod tests {
         assert_eq!(s.save_project(), Saved::Failed);
         assert!(s.is_dirty());
         assert!(s.status.starts_with("Could not save"));
-        assert_eq!(s.save_project_to(s.project_path.clone().unwrap()), false);
+        assert!(!s.save_project_to(s.project_path.clone().unwrap()));
     }
 
     fn two_tracks() -> Session {
@@ -1564,7 +1648,13 @@ mod tests {
         let mut s = two_tracks();
         let before = s.timeline.clone();
         let t = s.project.tracks[0].id;
-        s.apply("Volume", Edit::SetTrack { track: t, field: TrackField::Volume(0.4) });
+        s.apply(
+            "Volume",
+            Edit::SetTrack {
+                track: t,
+                field: TrackField::Volume(0.4),
+            },
+        );
         assert_eq!(s.timeline, before, "velocities stay as written");
         let plan = rack::plan(&s.project, &s.rack.slots, &s.rack.failed);
         assert!(plan.gains.contains(&(plan.routes[0].slot, 0.4)));
@@ -1637,12 +1727,21 @@ mod tests {
         let path = temp_project("kontakt");
         s.save_project_to(path.clone());
         let doc = Document::load(&path).unwrap();
-        assert!(doc.plugin_states.get(&kontakt).is_some_and(|b| !b.is_empty()));
+        assert!(
+            doc.plugin_states
+                .get(&kontakt)
+                .is_some_and(|b| !b.is_empty())
+        );
         let mut t = Session::new();
         t.open_project(&path);
         assert!(t.status.starts_with("Opened"), "status: {}", t.status);
         assert_eq!(t.rack.hosts.len(), 1);
-        assert!(t.project.tracks.iter().all(|tr| tr.instrument.as_ref() == Some(&kontakt)));
+        assert!(
+            t.project
+                .tracks
+                .iter()
+                .all(|tr| tr.instrument.as_ref() == Some(&kontakt))
+        );
         std::fs::remove_file(path).ok();
     }
 
@@ -1657,13 +1756,25 @@ mod tests {
         let path = temp_project("roundtrip");
         let mut s = two_tracks();
         let t = s.project.tracks[1].id;
-        s.apply("Volume", Edit::SetTrack { track: t, field: TrackField::Volume(0.3) });
+        s.apply(
+            "Volume",
+            Edit::SetTrack {
+                track: t,
+                field: TrackField::Volume(0.3),
+            },
+        );
         assert!(s.is_dirty());
         s.save_project_to(path.clone());
         assert!(!s.is_dirty(), "status: {}", s.status);
         let saved = s.project.clone();
 
-        s.apply("Mute", Edit::SetTrack { track: t, field: TrackField::Mute(true) });
+        s.apply(
+            "Mute",
+            Edit::SetTrack {
+                track: t,
+                field: TrackField::Mute(true),
+            },
+        );
         assert!(s.is_dirty());
         s.open_path(&path);
         assert_eq!(s.project, saved, "status: {}", s.status);
@@ -1673,7 +1784,13 @@ mod tests {
         assert_eq!(pianos(&s).len(), 2);
 
         // ⌘S goes back to the same file.
-        s.apply("Mute", Edit::SetTrack { track: t, field: TrackField::Mute(true) });
+        s.apply(
+            "Mute",
+            Edit::SetTrack {
+                track: t,
+                field: TrackField::Mute(true),
+            },
+        );
         assert_eq!(s.save_project(), Saved::Yes);
         assert!(Document::load(&path).unwrap().project.tracks[1].mute);
         std::fs::remove_file(path).ok();
@@ -1695,7 +1812,11 @@ mod tests {
 
         let mut s = Session::new();
         s.open_project(&path);
-        assert!(s.status.contains("Ghost not available"), "status: {}", s.status);
+        assert!(
+            s.status.contains("Ghost not available"),
+            "status: {}",
+            s.status
+        );
         assert_eq!(s.project.tracks[0].instrument.as_ref(), Some(&ghost));
         assert!(s.rack.failed.contains(&ghost));
         s.save_project_to(path.clone());
@@ -1720,7 +1841,12 @@ mod tests {
         s.export_midi_to(&path);
         let back = Project::from_song(&surf_midi::smf::load(&path).unwrap());
         assert_eq!(back.tracks.len(), 2);
-        let count = |p: &Project| p.tracks.iter().map(|t| t.regions[0].notes.len()).collect::<Vec<_>>();
+        let count = |p: &Project| {
+            p.tracks
+                .iter()
+                .map(|t| t.regions[0].notes.len())
+                .collect::<Vec<_>>()
+        };
         assert_eq!(count(&back), count(&s.project));
         std::fs::remove_dir_all(&dir).unwrap();
     }

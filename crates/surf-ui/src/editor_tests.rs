@@ -486,7 +486,9 @@ fn the_in_window_menu_bar_mirrors_the_native_one(cx: &mut TestAppContext) {
     let names: Vec<String> = menus.iter().map(|m| m.name.to_string()).collect();
     assert_eq!(
         names,
-        vec!["Surf", "File", "Edit", "Track", "Navigate", "View", "Window"]
+        vec![
+            "Surf", "File", "Edit", "Track", "Navigate", "View", "Window"
+        ]
     );
 
     // Every command in the menus has a handler, so none of them is dead.
@@ -513,7 +515,10 @@ fn the_in_window_menu_bar_mirrors_the_native_one(cx: &mut TestAppContext) {
         vcx.update(|window, _| crate::views::menu_bar::shortcut(action, window))
     };
     let save = shortcut(&crate::menu::SaveProject);
-    assert!(save.to_lowercase().ends_with('s'), "Save shortcut: {save:?}");
+    assert!(
+        save.to_lowercase().ends_with('s'),
+        "Save shortcut: {save:?}"
+    );
     assert_eq!(shortcut(&crate::menu::OpenEventList), "");
 
     // The bar draws, with a menu open, and Escape closes it.
@@ -579,7 +584,10 @@ fn dragging_a_note_auditions_only_when_stopped(cx: &mut TestAppContext) {
 
     let mut stopped = app(cx);
     let (down_key, move_key) = drag_once(&mut stopped);
-    assert!(down_key.is_some() && move_key.is_some(), "stopped: auditioned");
+    assert!(
+        down_key.is_some() && move_key.is_some(),
+        "stopped: auditioned"
+    );
 
     let mut playing = app(cx);
     playing.session.engine.playing = true;

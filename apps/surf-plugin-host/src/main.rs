@@ -9,17 +9,17 @@ mod protocol_out;
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use surf_audio::Instrument;
 use surf_audio::render::{RenderOptions, render_with_instrument};
 use surf_core::song::{TimedNote, Timeline};
-use surf_plugin::backends::vst3::{VstPlugin, render_vst_to_wav};
 use surf_plugin::backends::vst2::{Vst2EditorWindow, Vst2Plugin};
+use surf_plugin::backends::vst3::{VstPlugin, render_vst_to_wav};
 use surf_plugin::format::{self, Format};
 use surf_plugin::protocol::{HelperEvent, HelperRequest, RenderNote};
 use surf_plugin::shm::{MidiKind, SharedMap};
@@ -209,22 +209,19 @@ fn main() -> Result<()> {
     // parent directory, matching what the standalone launcher does.
     if let Some(search_dir) = plugin_search_dir(&args.plugin) {
         if let Err(err) = std::env::set_current_dir(search_dir) {
-                eprintln!(
-                    "helper: could not chdir to {}: {err}",
-                    search_dir.display()
-                );
-            } else {
-                eprintln!("helper: cwd set to {}", search_dir.display());
-                #[cfg(windows)]
-                {
-                    let wide = HSTRING::from(search_dir.to_string_lossy().as_ref());
-                    if let Err(err) = unsafe { SetDllDirectoryW(&wide) } {
-                        eprintln!("helper: SetDllDirectoryW failed: {err}");
-                    } else {
-                        eprintln!("helper: DLL directory set to {}", search_dir.display());
-                    }
+            eprintln!("helper: could not chdir to {}: {err}", search_dir.display());
+        } else {
+            eprintln!("helper: cwd set to {}", search_dir.display());
+            #[cfg(windows)]
+            {
+                let wide = HSTRING::from(search_dir.to_string_lossy().as_ref());
+                if let Err(err) = unsafe { SetDllDirectoryW(&wide) } {
+                    eprintln!("helper: SetDllDirectoryW failed: {err}");
+                } else {
+                    eprintln!("helper: DLL directory set to {}", search_dir.display());
                 }
             }
+        }
     }
 
     eprintln!("helper: loading plugin {}", args.plugin.display());
@@ -253,13 +250,7 @@ fn main() -> Result<()> {
         .spawn(move || audio_loop(instrument, audio_map, audio_stop))
         .context("could not spawn helper audio thread")?;
 
-    send_event(
-        &mut out,
-        &HelperEvent::Ready {
-            name,
-            sample_rate,
-        },
-    )?;
+    send_event(&mut out, &HelperEvent::Ready { name, sample_rate })?;
 
     let (tx, rx) = channel();
     std::thread::Builder::new()
@@ -459,10 +450,7 @@ fn parse_args() -> Result<Args> {
             "--shm" => shm = args.next(),
             "--plugin" => plugin = args.next().map(PathBuf::from),
             "--sample-rate" => {
-                sample_rate = args
-                    .next()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(48_000);
+                sample_rate = args.next().and_then(|v| v.parse().ok()).unwrap_or(48_000);
             }
             "--state" => state = args.next().map(PathBuf::from),
             other => eprintln!("helper: ignoring argument {other}"),
@@ -673,6 +661,8 @@ fn timeline_from_notes(notes: &[RenderNote], duration: f64) -> Timeline {
     }
 }
 
+// One argument per field of the render request it serves.
+#[allow(clippy::too_many_arguments)]
 fn render_to_wav(
     plugin: &std::path::Path,
     state: Option<&[u8]>,
@@ -700,6 +690,8 @@ fn render_to_wav(
     Ok((stats.path, stats.duration, stats.peak))
 }
 
+// One argument per field of the render request it serves.
+#[allow(clippy::too_many_arguments)]
 fn render_vst2_to_wav(
     plugin: &std::path::Path,
     state: Option<&[u8]>,

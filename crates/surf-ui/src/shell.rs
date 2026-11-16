@@ -212,7 +212,8 @@ impl SurfApp {
             let Some(entity) = entity.upgrade() else {
                 return true;
             };
-            let (dirty, closing) = entity.read_with(cx, |app, _| (app.session.is_dirty(), app.ui.closing));
+            let (dirty, closing) =
+                entity.read_with(cx, |app, _| (app.session.is_dirty(), app.ui.closing));
             if !dirty || closing {
                 return true;
             }
@@ -226,7 +227,12 @@ impl SurfApp {
     pub fn project_title(&self) -> String {
         if self.session.project_path.is_none() && self.session.project.name.is_empty() {
             "Untitled".to_string()
-        } else if let Some(stem) = self.session.project_path.as_ref().and_then(|p| p.file_stem()) {
+        } else if let Some(stem) = self
+            .session
+            .project_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+        {
             stem.to_string_lossy().into_owned()
         } else {
             self.session.project.name.clone()
@@ -273,18 +279,23 @@ impl SurfApp {
         if !self.session.is_dirty() {
             return then(self, cx);
         }
-        crate::dialogs::confirm_unsaved(window, cx, &self.project_title(), move |app, answer, cx| {
-            match answer {
-                Unsaved::Cancel => {}
-                Unsaved::Discard => then(app, cx),
-                Unsaved::Save => match app.session.save_project() {
-                    Saved::Yes => then(app, cx),
-                    // Stay put: the status says why, and the changes are still here.
-                    Saved::Failed => {}
-                    Saved::NoFile => save_project(app, cx, true),
-                },
-            }
-        });
+        crate::dialogs::confirm_unsaved(
+            window,
+            cx,
+            &self.project_title(),
+            move |app, answer, cx| {
+                match answer {
+                    Unsaved::Cancel => {}
+                    Unsaved::Discard => then(app, cx),
+                    Unsaved::Save => match app.session.save_project() {
+                        Saved::Yes => then(app, cx),
+                        // Stay put: the status says why, and the changes are still here.
+                        Saved::Failed => {}
+                        Saved::NoFile => save_project(app, cx, true),
+                    },
+                }
+            },
+        );
     }
 
     /// Reset the editors after the whole project was replaced.
@@ -625,7 +636,9 @@ impl Render for SurfApp {
                     window.focus(&this.focus)
                 }),
             )
-            .when(self.ui.musical_typing, |d| d.key_context(menu::TYPING_CONTEXT))
+            .when(self.ui.musical_typing, |d| {
+                d.key_context(menu::TYPING_CONTEXT)
+            })
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
                 this.key_down(e);
                 cx.notify();
@@ -826,7 +839,8 @@ pub fn pane_header() -> gpui::Div {
 /// File ▸ New: an empty project with one track, after unsaved changes.
 pub fn new_project(app: &mut SurfApp, window: &mut Window, cx: &mut Context<SurfApp>) {
     app.leave(window, cx, |app, _| {
-        app.session.set_project(surf_core::project::Project::empty());
+        app.session
+            .set_project(surf_core::project::Project::empty());
         app.after_project_replaced();
         app.session.status = "New project".to_string();
     });

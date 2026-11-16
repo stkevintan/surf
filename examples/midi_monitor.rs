@@ -35,7 +35,10 @@ fn main() -> anyhow::Result<()> {
         .and_then(|a| a.parse::<usize>().ok())
         .unwrap_or(0);
     hub.connect(index)?;
-    println!("connected to [{index}] {}", ports[index.min(ports.len() - 1)]);
+    println!(
+        "connected to [{index}] {}",
+        ports[index.min(ports.len() - 1)]
+    );
     if let Some(err) = hub.error() {
         println!("hub error: {err}");
     }

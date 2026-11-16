@@ -60,10 +60,10 @@ pub fn render_with_instrument(
     options: &RenderOptions,
 ) -> Result<RenderStats> {
     let path = path.as_ref();
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).ok();
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).ok();
     }
     let spec = hound::WavSpec {
         channels: 2,
@@ -260,7 +260,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(half.frames, stats.frames);
-        assert!((half.peak - stats.peak).abs() < 1e-3, "{} vs {}", half.peak, stats.peak);
+        assert!(
+            (half.peak - stats.peak).abs() < 1e-3,
+            "{} vs {}",
+            half.peak,
+            stats.peak
+        );
         std::fs::remove_file(mixed).ok();
         std::fs::remove_file(path).ok();
     }

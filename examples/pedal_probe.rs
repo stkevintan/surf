@@ -84,7 +84,10 @@ fn main() -> anyhow::Result<()> {
     if wet <= 0.0001 && dry <= 0.0001 {
         println!("verdict: silent either way — load an instrument into Kontakt first");
     } else if wet > dry * 2.0 {
-        println!("verdict: PEDAL WORKS — note sustains {:.1}x longer", wet / dry.max(1e-6));
+        println!(
+            "verdict: PEDAL WORKS — note sustains {:.1}x longer",
+            wet / dry.max(1e-6)
+        );
     } else {
         println!("verdict: NO PEDAL EFFECT — plugin is not receiving CC 64");
     }

@@ -7,11 +7,11 @@ mod probe {
 
     use vst::host::{Host, PluginLoader};
     use vst::plugin::Plugin;
-    use windows::core::HSTRING;
     use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, WINDOW_EX_STYLE, WS_OVERLAPPEDWINDOW,
     };
+    use windows::core::HSTRING;
 
     struct ProbeHost {
         version: isize,
@@ -117,7 +117,10 @@ mod probe {
         instance.set_block_size(64);
         instance.resume();
         println!("editor={}", instance.get_editor().is_some());
-        println!("bank_bytes={}", instance.get_parameter_object().get_bank_data().len());
+        println!(
+            "bank_bytes={}",
+            instance.get_parameter_object().get_bank_data().len()
+        );
         instance.suspend();
         Ok(())
     }

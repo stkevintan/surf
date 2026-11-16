@@ -31,7 +31,8 @@ mod probe {
             let mut len = 0;
             let mut handle = Default::default();
             if GetModuleHandleExW(
-                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                 PCWSTR(address as *const u16),
                 &mut handle,
             )

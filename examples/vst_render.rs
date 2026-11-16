@@ -4,8 +4,8 @@
 //! This is the same code path the app uses for "Export WAV" with Kontakt.
 
 use surf::audio::render::RenderOptions;
-use surf::plugin::backends::vst3::render_vst_to_wav;
 use surf::core::song::Song;
+use surf::plugin::backends::vst3::render_vst_to_wav;
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);

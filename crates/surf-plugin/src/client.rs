@@ -492,15 +492,15 @@ const HELPER_PID_FILE: &str = ".surf-helper-pid";
 /// spawn wrote into it. A directory with neither a recognisable name nor a live owner
 /// is leftover from an exited run and can go.
 fn helper_dir_in_use(dir: &Path, name: &str, own_pid: u32) -> bool {
-    if let Some(owner) = helper_dir_owner(name) {
-        if owner == own_pid || process_is_alive(owner) {
-            return true;
-        }
+    if let Some(owner) = helper_dir_owner(name)
+        && (owner == own_pid || process_is_alive(owner))
+    {
+        return true;
     }
-    if let Ok(text) = std::fs::read_to_string(dir.join(HELPER_PID_FILE)) {
-        if let Ok(helper) = text.trim().parse::<u32>() {
-            return process_is_alive(helper);
-        }
+    if let Ok(text) = std::fs::read_to_string(dir.join(HELPER_PID_FILE))
+        && let Ok(helper) = text.trim().parse::<u32>()
+    {
+        return process_is_alive(helper);
     }
     false
 }
