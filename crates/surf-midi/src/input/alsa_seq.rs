@@ -89,11 +89,12 @@ pub(crate) fn list_ports() -> Result<Vec<String>> {
     Ok(sources(&seq).into_iter().map(|(_, name)| name).collect())
 }
 
-pub(crate) fn open(name: &str, deliver: Deliver) -> Result<Connection> {
+pub(crate) fn open(name: &str, nth: usize, deliver: Deliver) -> Result<Connection> {
     let seq = open_seq()?;
     let (source, _) = sources(&seq)
         .into_iter()
-        .find(|(_, n)| n == name)
+        .filter(|(_, n)| n == name)
+        .nth(nth)
         .with_context(|| format!("no MIDI input named {name}"))?;
     let port = seq.create_simple_port(
         &CString::new("Surf Input").unwrap(),
