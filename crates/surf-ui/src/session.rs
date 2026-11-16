@@ -173,7 +173,7 @@ impl Session {
     }
 
     pub fn stop_playback(&mut self) {
-        self.audio.stop();
+        self.stop_audio_keeping_pedals();
         self.status = "Stopped".to_string();
     }
 
@@ -216,9 +216,11 @@ impl Session {
         }
     }
 
-    /// Stop the engine around a take without letting go of pedals that are
-    /// still held. The engine keeps its own pedal state, which the MIDI thread
-    /// updates directly, so this does not resend the UI's (possibly older) one.
+    /// Stop the engine without letting go of pedals that are still held. Every
+    /// stop goes through here (Stop, a take, a new project), so the engine's
+    /// pedals always match the session's, which a take starts from. The engine
+    /// keeps its own pedal state, which the MIDI thread updates directly, so
+    /// this does not resend the UI's (possibly older) one.
     fn stop_audio_keeping_pedals(&mut self) {
         self.audio.stop_keeping_pedals();
     }
@@ -309,7 +311,7 @@ impl Session {
     /// the plugin of the old track on its MIDI channel, else the first old
     /// track's. Opening a file doesn't unload Kontakt.
     pub fn set_project(&mut self, mut project: Project) {
-        self.audio.stop();
+        self.stop_audio_keeping_pedals();
         let fallback = self
             .project
             .tracks
@@ -658,7 +660,7 @@ impl Session {
                 return;
             }
         };
-        self.audio.stop();
+        self.stop_audio_keeping_pedals();
         // Every plugin restarts from the project's state.
         let hosts: Vec<u8> = self.rack.hosts.iter().map(|h| h.slot).collect();
         for slot in hosts {
@@ -1869,6 +1871,37 @@ mod tests {
         assert!(
             notes[0].end - notes[0].start > 0.5,
             "held to the pedal: {:?}",
+            notes[0]
+        );
+    }
+
+    /// Review: Stop does not lift a pedal that is still held, so a take started
+    /// after it monitors and records the pedal alike. (The engine side is
+    /// `stop_keeping_pedals_uses_the_engines_pedals`.)
+    #[test]
+    fn stop_keeps_a_held_pedal() {
+        let mut s = two_tracks();
+        s.typing_sustain(true);
+        s.stop_playback();
+        assert!(s.sustain, "Tab still held after Stop");
+        s.toggle_record();
+        let t0 = Instant::now();
+        s.handle_live(
+            LiveEvent::NoteOn {
+                key: 62,
+                velocity: 90,
+            },
+            t0,
+            false,
+        );
+        s.handle_live(LiveEvent::NoteOff { key: 62 }, t0, false);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        s.typing_sustain(false);
+        let notes = s.recorder.finish(Instant::now());
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].end - notes[0].start > 0.1,
+            "held to Tab-up: {:?}",
             notes[0]
         );
     }
