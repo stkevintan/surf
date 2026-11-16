@@ -204,7 +204,12 @@ impl Session {
             }
             self.add_take(&notes);
         } else {
-            self.recorder.start(Instant::now());
+            let now = Instant::now();
+            self.recorder.start(now);
+            // A pedal already held when the take starts holds its notes too.
+            if self.sustain {
+                self.recorder.sustain(true, now);
+            }
             self.live_notes.clear();
             self.audio.stop();
             self.status = "Recording… play your MIDI keyboard or use Musical Typing".to_string();
@@ -1209,6 +1214,11 @@ impl Session {
     /// Update the combined pedal after one of the two moved.
     fn pedal_changed(&mut self, at: Instant) {
         let down = self.hw_pedal || self.typing_pedal;
+        // The recorder hears every pedal event: it may have started a take (and
+        // reset its own pedal) while one was already held.
+        if self.recorder.is_recording() {
+            self.recorder.sustain(down, at);
+        }
         if down == self.sustain {
             return;
         }
@@ -1216,9 +1226,6 @@ impl Session {
         if !down {
             // Pedal up: everything it was holding stops ringing.
             self.sustained_keys.clear();
-        }
-        if self.recorder.is_recording() {
-            self.recorder.sustain(down, at);
         }
     }
 
@@ -1820,6 +1827,43 @@ mod tests {
         s.open_path(&path);
         assert!(!s.is_dirty(), "a freshly opened project is clean");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Review: a pedal held when the take starts (Tab), then the hardware pedal,
+    /// still holds the recorded notes until both pedals are up.
+    #[test]
+    fn a_pedal_held_into_a_take_still_sustains() {
+        let mut s = two_tracks();
+        let t0 = Instant::now();
+        s.typing_sustain(true);
+        s.toggle_record();
+        s.handle_live(LiveEvent::Sustain(true), t0, false);
+        s.handle_live(
+            LiveEvent::NoteOn {
+                key: 60,
+                velocity: 90,
+            },
+            t0,
+            false,
+        );
+        s.handle_live(
+            LiveEvent::NoteOff { key: 60 },
+            t0 + std::time::Duration::from_millis(100),
+            false,
+        );
+        s.typing_sustain(false);
+        s.handle_live(
+            LiveEvent::Sustain(false),
+            t0 + std::time::Duration::from_millis(900),
+            false,
+        );
+        let notes = s.recorder.finish(t0 + std::time::Duration::from_secs(1));
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].end - notes[0].start > 0.5,
+            "held to the pedal: {:?}",
+            notes[0]
+        );
     }
 
     #[test]

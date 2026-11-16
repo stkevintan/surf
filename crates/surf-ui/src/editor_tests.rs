@@ -310,6 +310,31 @@ fn clicks_follow_the_tracks_scroll(cx: &mut TestAppContext) {
     assert_eq!(made[0].start, bar, "in bar 2");
 }
 
+/// Review: the wheel does not scroll the lanes under a region being dragged,
+/// which would drop it on another track than the one under the pointer.
+#[gpui::test]
+fn the_wheel_waits_for_a_region_drag(cx: &mut TestAppContext) {
+    let mut app = app(cx);
+    for _ in 0..8 {
+        editing::new_track(&mut app.session, &mut app.ui.edit);
+    }
+    let start = point(
+        px(TRACKS_ORIGIN.0 + 20.0),
+        px(TRACKS_ORIGIN.1 + sz::RULER_TRACKS_H + 20.0),
+    );
+    tracks::pointer_down(&mut app, &down(start, Modifiers::default(), 1));
+    assert!(matches!(
+        app.ui.drag,
+        Some(crate::shell::Drag::MoveRegions { .. })
+    ));
+    tracks::scroll_by(&mut app, 0.0, -sz::LANE_H, false, false);
+    tracks::scroll_by(&mut app, 0.0, -100.0, false, true);
+    assert_eq!((app.ui.tracks_scroll_x, app.ui.tracks_scroll_y), (0.0, 0.0));
+    tracks::pointer_up(&mut app, start);
+    tracks::scroll_by(&mut app, 0.0, -sz::LANE_H, false, false);
+    assert_eq!(app.ui.tracks_scroll_y, sz::LANE_H, "scrolls again after");
+}
+
 /// A replaced project starts at bar 1 and its first track, wherever the last
 /// one was scrolled to.
 #[gpui::test]

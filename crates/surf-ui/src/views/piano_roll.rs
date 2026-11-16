@@ -667,12 +667,13 @@ fn grid(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
                 tracks::ruler_paint(
                     window,
                     cx,
-                    point(gx - px(scroll_x), o.y),
-                    w + scroll_x,
+                    point(gx, o.y),
+                    w - keys_w,
                     ruler,
                     beat_w,
                     per_bar,
                     None,
+                    scroll_x,
                 );
                 if let Some((tc, r)) = &region {
                     window.paint_quad(fill(

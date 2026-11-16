@@ -626,12 +626,13 @@ fn timeline(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
                 ruler_paint(
                     window,
                     cx,
-                    point(o.x - px(scroll_x), o.y),
-                    w + scroll_x,
+                    o,
+                    w,
                     ruler,
                     beat_w,
                     per_bar,
                     looping.then(|| p.end() as f64 / p.ticks_per_beat() as f64),
+                    scroll_x,
                 );
             },
         );
@@ -685,6 +686,14 @@ fn wheel(app: &mut SurfApp, e: &ScrollWheelEvent, window: &Window) {
 }
 
 pub(crate) fn scroll_by(app: &mut SurfApp, dx: f32, dy: f32, zoom: bool, sideways: bool) {
+    // A move, resize or marquee is anchored to where the drag began on screen:
+    // scrolling or zooming under it would drop it on the wrong track or time.
+    if matches!(
+        app.ui.drag,
+        Some(Drag::MoveRegions { .. } | Drag::ResizeRegion { .. } | Drag::Marquee { tracks: true })
+    ) {
+        return;
+    }
     if zoom {
         let factor = if dy > 0.0 { 1.1 } else { 1.0 / 1.1 };
         app.ui.tracks_beat_w =
@@ -920,7 +929,9 @@ fn copy_regions(p: &mut Project, regions: &[Id], ticks: i64, tracks: i32) -> Edi
     Edit::Batch(edits)
 }
 
-/// Ruler shared by the tracks area and the piano roll.
+/// Ruler shared by the tracks area and the piano roll: `w` wide at `o`,
+/// scrolled `scroll` pixels right of bar 1. Only the bars in view are drawn,
+/// so the cost follows the view's width.
 #[allow(clippy::too_many_arguments)]
 pub fn ruler_paint(
     window: &mut Window,
@@ -931,6 +942,7 @@ pub fn ruler_paint(
     beat_w: f32,
     per_bar: f64,
     cycle_beats: Option<f64>,
+    scroll: f32,
 ) {
     window.paint_quad(fill(Bounds::new(o, gsize(px(w), px(h))), color::CHROME));
     window.paint_quad(fill(
@@ -941,7 +953,7 @@ pub fn ruler_paint(
         window.paint_quad(
             fill(
                 Bounds::new(
-                    point(o.x, o.y + px(3.0)),
+                    point(o.x - px(scroll), o.y + px(3.0)),
                     gsize(px(end as f32 * beat_w), px(9.0)),
                 ),
                 color::CYCLE,
@@ -957,9 +969,10 @@ pub fn ruler_paint(
     } else {
         1
     };
-    let bars = (w / bar_w).ceil() as i64 + 1;
-    for bar in 0..=bars {
-        let x = o.x + px(bar as f32 * bar_w);
+    let first = (scroll / bar_w).floor().max(0.0) as i64;
+    let last = ((scroll + w) / bar_w).ceil() as i64 + 1;
+    for bar in first..=last {
+        let x = o.x + px(bar as f32 * bar_w - scroll);
         window.paint_quad(fill(
             Bounds::new(point(x, o.y + px(h - 12.0)), gsize(px(1.0), px(11.0))),
             color::TEXT_DISABLED,
