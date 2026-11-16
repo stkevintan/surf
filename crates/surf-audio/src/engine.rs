@@ -534,7 +534,7 @@ impl Core {
     /// Apply queued commands. A command that hands a timeline or route list back
     /// for freeing waits (with everything queued after it, so order is kept) while
     /// the retirement storage is full, rather than be applied and freed here.
-    fn drain(&mut self, rx: &CommandRx) {
+    fn drain(&mut self, rx: &mut CommandRx) {
         // Hand held payloads back on every call, even with nothing queued, so the
         // reserve empties as soon as the UI makes room.
         let room = self.has_retire_room();
@@ -772,7 +772,7 @@ impl AudioEngine {
             glitches: AtomicU32::new(0),
         });
         let (event_tx, events) = crossbeam_channel::unbounded();
-        let (tx, rx) = command_channel(COMMAND_CAP);
+        let (tx, mut rx) = command_channel(COMMAND_CAP);
         let (trash_tx, trash) = crossbeam_channel::bounded::<Retired>(8);
 
         // Try the default output device first.
@@ -807,7 +807,7 @@ impl AudioEngine {
                                 data.fill(0.0);
                                 return;
                             };
-                            core.drain(&rx);
+                            core.drain(&mut rx);
                             core.fill_output(data, channels as usize);
                         },
                         err_fn,
@@ -846,7 +846,7 @@ impl AudioEngine {
                         let start = Instant::now();
                         let mut produced_frames = 0u64;
                         while !thread_stop.load(Ordering::Acquire) {
-                            thread_core.lock().drain(&rx);
+                            thread_core.lock().drain(&mut rx);
                             let elapsed = start.elapsed().as_secs_f64();
                             let target = (elapsed * sample_rate as f64) as u64;
                             while produced_frames < target {
@@ -1025,9 +1025,12 @@ const COMMAND_CAP: usize = 1024;
 /// (a stalled device) touches the allocator on the audio side.
 #[derive(Clone)]
 pub struct CommandTx {
-    fast: crossbeam_channel::Sender<Command>,
-    overflow: crossbeam_channel::Sender<Command>,
+    fast: crossbeam_channel::Sender<(u64, Command)>,
+    overflow: crossbeam_channel::Sender<(u64, Command)>,
     pending: Arc<AtomicUsize>,
+    /// Numbers commands as they are sent, so the receiver can merge the two
+    /// queues back into each sender's order.
+    seq: Arc<AtomicU64>,
 }
 
 /// The audio thread went away; the command was not queued.
@@ -1037,18 +1040,19 @@ pub struct Disconnected;
 impl CommandTx {
     /// Queue `command`. Never blocks and never drops it.
     pub fn send(&self, command: Command) -> Result<(), Disconnected> {
-        let command = if self.pending.load(Ordering::Acquire) == 0 {
-            match self.fast.try_send(command) {
+        let item = (self.seq.fetch_add(1, Ordering::AcqRel), command);
+        let item = if self.pending.load(Ordering::Acquire) == 0 {
+            match self.fast.try_send(item) {
                 Ok(()) => return Ok(()),
                 Err(crossbeam_channel::TrySendError::Disconnected(_)) => return Err(Disconnected),
-                Err(crossbeam_channel::TrySendError::Full(c)) => c,
+                Err(crossbeam_channel::TrySendError::Full(item)) => item,
             }
         } else {
-            command
+            item
         };
         // Count it before it can be received, so later sends follow it here.
         self.pending.fetch_add(1, Ordering::AcqRel);
-        self.overflow.send(command).map_err(|_| {
+        self.overflow.send(item).map_err(|_| {
             self.pending.fetch_sub(1, Ordering::AcqRel);
             Disconnected
         })
@@ -1056,27 +1060,64 @@ impl CommandTx {
 }
 
 /// The audio thread's end of [`CommandTx`].
+///
+/// It holds the next command of each queue and hands out the lower-numbered one.
+/// A sender's commands are numbered in the order it sends them, and one that went
+/// to the bounded queue before another went to overflow was in the bounded queue
+/// before that one could be received. So after taking from overflow the receiver
+/// looks at the bounded queue again before choosing: an older command from the
+/// same sender cannot be passed over, however the threads interleave.
 pub(crate) struct CommandRx {
-    fast: crossbeam_channel::Receiver<Command>,
-    overflow: crossbeam_channel::Receiver<Command>,
+    fast: crossbeam_channel::Receiver<(u64, Command)>,
+    overflow: crossbeam_channel::Receiver<(u64, Command)>,
     pending: Arc<AtomicUsize>,
+    next_fast: Option<(u64, Command)>,
+    next_overflow: Option<(u64, Command)>,
 }
 
 impl CommandRx {
-    /// The next command. Everything in the bounded queue is older than anything in
-    /// the overflow queue, so it goes first.
-    fn try_recv(&self) -> Option<Command> {
-        if let Ok(c) = self.fast.try_recv() {
-            return Some(c);
+    fn pull_overflow(&mut self) {
+        if self.next_overflow.is_none() {
+            self.next_overflow = self.overflow.try_recv().ok();
         }
-        let c = self.overflow.try_recv().ok()?;
-        self.pending.fetch_sub(1, Ordering::AcqRel);
-        Some(c)
+    }
+
+    fn pull_fast(&mut self) {
+        if self.next_fast.is_none() {
+            self.next_fast = self.fast.try_recv().ok();
+        }
+    }
+
+    /// The lower-numbered of the held commands.
+    fn pop(&mut self) -> Option<Command> {
+        let take_fast = match (&self.next_fast, &self.next_overflow) {
+            (Some(f), Some(o)) => f.0 < o.0,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => return None,
+        };
+        if take_fast {
+            self.next_fast.take().map(|(_, c)| c)
+        } else {
+            self.pending.fetch_sub(1, Ordering::AcqRel);
+            self.next_overflow.take().map(|(_, c)| c)
+        }
+    }
+
+    /// The next command, in each sender's order. Overflow first, then the bounded
+    /// queue: see the type's docs for why this order matters.
+    fn try_recv(&mut self) -> Option<Command> {
+        self.pull_overflow();
+        self.pull_fast();
+        self.pop()
     }
 
     #[cfg(test)]
     fn is_empty(&self) -> bool {
-        self.fast.is_empty() && self.overflow.is_empty()
+        self.fast.is_empty()
+            && self.overflow.is_empty()
+            && self.next_fast.is_none()
+            && self.next_overflow.is_none()
     }
 }
 
@@ -1089,11 +1130,14 @@ fn command_channel(cap: usize) -> (CommandTx, CommandRx) {
             fast: fast_tx,
             overflow: overflow_tx,
             pending: pending.clone(),
+            seq: Arc::new(AtomicU64::new(0)),
         },
         CommandRx {
             fast,
             overflow,
             pending,
+            next_fast: None,
+            next_overflow: None,
         },
     )
 }
@@ -1523,7 +1567,7 @@ mod tests {
     /// until the audio thread has caught up.
     #[test]
     fn a_full_command_queue_keeps_every_command_in_order() {
-        let (tx, rx) = command_channel(2);
+        let (tx, mut rx) = command_channel(2);
         for v in 0..6 {
             tx.send(Command::SetVolume(v as f32 / 10.0)).unwrap();
         }
@@ -1548,12 +1592,39 @@ mod tests {
         assert!(rx.fast.len() == 1);
     }
 
+    /// Review: the receiver pauses right after finding the bounded queue empty.
+    /// Meanwhile a sender puts a NoteOn in the bounded queue, fills it, and the
+    /// matching NoteOff goes to overflow. The NoteOn must still come out first.
+    #[test]
+    fn a_receiver_paused_between_queues_keeps_order() {
+        let (tx, mut rx) = command_channel(2);
+        rx.pull_fast(); // empty: the receiver pauses here
+        tx.send(Command::NoteOn {
+            key: 60,
+            velocity: 90,
+        })
+        .unwrap();
+        tx.send(Command::SetVolume(0.5)).unwrap();
+        tx.send(Command::NoteOff { key: 60 }).unwrap(); // full: overflow
+        let order: Vec<&str> = std::iter::from_fn(|| rx.try_recv())
+            .map(|c| match c {
+                Command::NoteOn { .. } => "on",
+                Command::SetVolume(_) => "volume",
+                Command::NoteOff { .. } => "off",
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(order, ["on", "volume", "off"]);
+        assert!(rx.is_empty());
+        assert_eq!(rx.pending.load(Ordering::Acquire), 0);
+    }
+
     /// Review: a note-off sent while the queue is full is not lost, so a held key
     /// does not stay stuck once the device calls back again.
     #[test]
     fn a_release_sent_into_a_full_queue_still_arrives() {
         let (mut c, calls) = recorder_core();
-        let (tx, rx) = command_channel(1);
+        let (tx, mut rx) = command_channel(1);
         tx.send(Command::NoteOn {
             key: 60,
             velocity: 90,
@@ -1563,7 +1634,7 @@ mod tests {
             tx.send(Command::SetVolume(0.5)).unwrap();
         }
         tx.send(Command::NoteOff { key: 60 }).unwrap();
-        c.drain(&rx);
+        c.drain(&mut rx);
         assert_eq!(*calls.lock(), ["on 60", "off 60"]);
         assert!(c.held[60].is_none());
     }
@@ -1745,7 +1816,7 @@ mod tests {
         });
         let (trash, ui) = crossbeam_channel::bounded::<Retired>(2);
         let mut c = Core::new(48_000, shared, trash);
-        let (tx, rx) = command_channel(COMMAND_CAP);
+        let (tx, mut rx) = command_channel(COMMAND_CAP);
         let tl = || Timeline {
             notes: vec![long(0, 60, 0.0, 1.0)],
             duration: 1.0,
@@ -1755,7 +1826,7 @@ mod tests {
             tx.send(Command::Update { timeline: tl() }).unwrap();
         }
         tx.send(Command::SetVolume(0.25)).unwrap();
-        c.drain(&rx);
+        c.drain(&mut rx);
         assert_eq!(ui.len(), 2);
         assert_eq!(
             c.retired.len(),
@@ -1771,7 +1842,7 @@ mod tests {
             while ui.try_recv().is_ok() {
                 received += 1;
             }
-            c.drain(&rx);
+            c.drain(&mut rx);
         }
         assert!(c.deferred.is_none());
         assert_eq!(c.volume, 0.25);
@@ -1796,7 +1867,7 @@ mod tests {
         });
         let (trash, ui) = crossbeam_channel::bounded::<Retired>(2);
         let mut c = Core::new(48_000, shared, trash);
-        let (tx, rx) = command_channel(COMMAND_CAP);
+        let (tx, mut rx) = command_channel(COMMAND_CAP);
         let tl = || Timeline {
             notes: vec![long(0, 60, 0.0, 1.0)],
             duration: 1.0,
@@ -1810,12 +1881,12 @@ mod tests {
             tx.send(Command::Update { timeline: tl() }).unwrap();
         }
         tx.send(Command::Stop).unwrap();
-        c.drain(&rx);
+        c.drain(&mut rx);
         assert!(c.playing, "Stop is still queued behind the held update");
         // Callback blocks and UI frames alternate; the UI sends nothing more.
         for _ in 0..200 {
             while ui.try_recv().is_ok() {}
-            c.drain(&rx);
+            c.drain(&mut rx);
             run(&mut c, 256);
             if !c.playing && c.deferred.is_none() && rx.is_empty() {
                 break;
