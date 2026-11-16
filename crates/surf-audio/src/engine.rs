@@ -86,6 +86,10 @@ pub enum Command {
     Pause,
     Resume,
     Stop,
+    /// `Stop`, but the pedals the player holds stay down (around a take). The
+    /// engine's own pedal state is used, so a pedal-up already queued ahead of
+    /// this is not undone.
+    StopKeepingPedals,
     Seek(f64),
     SetLoop(bool),
     SetVolume(f32),
@@ -254,6 +258,16 @@ impl Core {
 
     fn sustain(&self) -> bool {
         self.pedals != 0
+    }
+
+    fn stop(&mut self) {
+        self.playing = false;
+        self.pos_frames = 0;
+        self.next_note = 0;
+        self.active.clear();
+        self.all_notes_off();
+        self.shared.playing.store(false, Ordering::Release);
+        self.shared.position_frames.store(0, Ordering::Release);
     }
 
     /// Set one pedal; the instrument hears only the combined pedal changing.
@@ -440,14 +454,16 @@ impl Core {
                     self.shared.playing.store(true, Ordering::Release);
                 }
             }
-            Command::Stop => {
-                self.playing = false;
-                self.pos_frames = 0;
-                self.next_note = 0;
-                self.active.clear();
-                self.all_notes_off();
-                self.shared.playing.store(false, Ordering::Release);
-                self.shared.position_frames.store(0, Ordering::Release);
+            Command::Stop => self.stop(),
+            Command::StopKeepingPedals => {
+                let pedals = self.pedals;
+                self.stop();
+                // all_notes_off lifted the instrument's pedal: put it back down.
+                for which in [HW_PEDAL, TYPING_PEDAL] {
+                    if pedals & which != 0 {
+                        self.set_pedal(which, true);
+                    }
+                }
             }
             Command::Seek(sec) => {
                 let sec = sec.max(0.0);
@@ -1014,6 +1030,11 @@ impl AudioEngine {
 
     pub fn stop(&self) {
         self.send(Command::Stop);
+    }
+
+    /// Stop, keeping the pedals that are down (see [`Command::StopKeepingPedals`]).
+    pub fn stop_keeping_pedals(&self) {
+        self.send(Command::StopKeepingPedals);
     }
 
     pub fn seek(&self, sec: f64) {
@@ -1642,6 +1663,28 @@ mod tests {
         assert_eq!(*calls.lock(), ["pedal true"], "pedal up kept Tab's");
         c.apply(Command::TypingSustain(false));
         assert_eq!(*calls.lock(), ["pedal true", "pedal false"]);
+    }
+
+    /// Review: stopping around a take keeps the pedals held then, by the
+    /// engine's own state: a pedal-up queued just before is not undone.
+    #[test]
+    fn stop_keeping_pedals_uses_the_engines_pedals() {
+        let (mut c, calls) = recorder_core();
+        c.apply(Command::TypingSustain(true));
+        c.apply(Command::StopKeepingPedals);
+        assert!(c.sustain(), "Tab still held");
+        assert_eq!(
+            *calls.lock(),
+            ["pedal true", "all off", "pedal true"],
+            "the instrument's pedal is put back"
+        );
+        calls.lock().clear();
+        c.apply(Command::TypingSustain(false));
+        c.apply(Command::Sustain(true));
+        c.apply(Command::Sustain(false));
+        c.apply(Command::StopKeepingPedals);
+        assert!(!c.sustain(), "released before the stop: stays up");
+        assert!(!calls.lock().iter().skip(3).any(|e| e == "pedal true"));
     }
 
     /// Stop still resets everything, pedal included.

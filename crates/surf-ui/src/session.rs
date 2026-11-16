@@ -217,15 +217,10 @@ impl Session {
     }
 
     /// Stop the engine around a take without letting go of pedals that are
-    /// still held: the engine's stop lifts them, so put the held ones back.
+    /// still held. The engine keeps its own pedal state, which the MIDI thread
+    /// updates directly, so this does not resend the UI's (possibly older) one.
     fn stop_audio_keeping_pedals(&mut self) {
-        self.audio.stop();
-        if self.hw_pedal {
-            self.audio.sustain(true);
-        }
-        if self.typing_pedal {
-            self.audio.typing_sustain(true);
-        }
+        self.audio.stop_keeping_pedals();
     }
 
     /// Put a recorded take on the record track as a new region, starting at
