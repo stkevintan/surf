@@ -289,7 +289,6 @@ impl Song {
         let duration = notes.iter().map(|n| n.end).fold(0.0, f64::max);
         Timeline { notes, duration }
     }
-
 }
 
 fn ticks_to_secs(ticks: u64, ppq: u16, bpm: f64) -> f64 {

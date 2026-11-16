@@ -105,11 +105,11 @@ impl Vst2Plugin {
         instance.set_block_size(VST2_BLOCK as i64);
 
         let mut state_restored = false;
-        if let Some(bytes) = state {
-            if !bytes.is_empty() {
-                instance.get_parameter_object().load_bank_data(bytes);
-                state_restored = true;
-            }
+        if let Some(bytes) = state
+            && !bytes.is_empty()
+        {
+            instance.get_parameter_object().load_bank_data(bytes);
+            state_restored = true;
         }
         instance.resume();
 
@@ -479,7 +479,7 @@ mod tests {
         let mut batch = EventBatch::with_capacity(4);
         let events = batch.events.as_ptr();
         let block = batch.block.as_ptr();
-        batch.fill(std::iter::repeat([0x90, 60, 100]).take(10));
+        batch.fill(std::iter::repeat_n([0x90, 60, 100], 10));
         assert_eq!(
             batch.events.len(),
             4,

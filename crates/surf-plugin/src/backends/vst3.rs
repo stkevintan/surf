@@ -158,18 +158,18 @@ impl VstInstrument {
 
 impl Instrument for VstInstrument {
     fn note_on(&mut self, channel: u8, key: u8, velocity: u8) {
-        if let Ok(mut plugin) = self.plugin.lock() {
-            if let Err(err) = plugin.send_midi_note(key, velocity, midi_channel(channel)) {
-                eprintln!("VST note_on failed: {err}");
-            }
+        if let Ok(mut plugin) = self.plugin.lock()
+            && let Err(err) = plugin.send_midi_note(key, velocity, midi_channel(channel))
+        {
+            eprintln!("VST note_on failed: {err}");
         }
     }
 
     fn note_off(&mut self, channel: u8, key: u8) {
-        if let Ok(mut plugin) = self.plugin.lock() {
-            if let Err(err) = plugin.send_midi_note_off(key, midi_channel(channel)) {
-                eprintln!("VST note_off failed: {err}");
-            }
+        if let Ok(mut plugin) = self.plugin.lock()
+            && let Err(err) = plugin.send_midi_note_off(key, midi_channel(channel))
+        {
+            eprintln!("VST note_off failed: {err}");
         }
     }
 

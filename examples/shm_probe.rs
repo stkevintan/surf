@@ -5,8 +5,8 @@
 //! cargo run --example shm_probe -- "C:\Program Files\Common Files\VST3\Kontakt 8.vst3"
 //! ```
 
-use surf::plugin::shm::SharedMap;
 use surf::plugin::backends::vst3::VstPlugin;
+use surf::plugin::shm::SharedMap;
 
 fn main() -> anyhow::Result<()> {
     let path = std::env::args()

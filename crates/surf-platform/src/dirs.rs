@@ -28,12 +28,12 @@ pub fn data_dir() -> PathBuf {
         if cwd.join("Cargo.toml").exists() && writable_dir(&cwd.join(".surf")) {
             return cwd.join(".surf");
         }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                let dir = parent.join("surf-state");
-                if writable_dir(&dir) {
-                    return dir;
-                }
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(parent) = exe.parent()
+        {
+            let dir = parent.join("surf-state");
+            if writable_dir(&dir) {
+                return dir;
             }
         }
         let dir = std::env::temp_dir().join("surf-state");

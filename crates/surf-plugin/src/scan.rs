@@ -227,7 +227,6 @@ fn walk(dir: &Path, depth: usize, accept_vst2: bool, out: &mut Vec<PluginEntry>)
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -17,6 +17,37 @@ env:
   CARGO_NET_RETRY: 10
 
 jobs:
+  # Formatting and lints. Linux only: clippy there covers the shared code, and the
+  # platform matrix below still builds and tests every OS.
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Linux system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libasound2-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libfontconfig1-dev libfreetype-dev libvulkan-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # --no-deps keeps the vendored vst/vst3-host forks (deprecated upstream) out of it.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked --no-deps -- -D warnings
+
   build-test:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}

@@ -57,12 +57,17 @@ impl Voice {
     #[inline]
     fn sample(&mut self, sample_rate: f32) -> f32 {
         let mut value = 0.0f32;
-        for i in 0..PARTIALS {
-            self.phases[i] += self.phase_incs[i];
-            if self.phases[i] > std::f64::consts::TAU {
-                self.phases[i] -= std::f64::consts::TAU;
+        for ((phase, inc), gain) in self
+            .phases
+            .iter_mut()
+            .zip(self.phase_incs)
+            .zip(PARTIAL_GAINS)
+        {
+            *phase += inc;
+            if *phase > std::f64::consts::TAU {
+                *phase -= std::f64::consts::TAU;
             }
-            value += self.phases[i].sin() as f32 * PARTIAL_GAINS[i];
+            value += phase.sin() as f32 * gain;
         }
         let attack = (self.age / 0.006).min(1.0);
         let decay = (-self.age / self.tau).exp();

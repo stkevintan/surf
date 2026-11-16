@@ -71,7 +71,11 @@ fn tool_picker(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
 /// Quantize, Split at Playhead and Join, as icons. They act on the area
 /// that was clicked last, like their shortcuts.
 fn region_commands(cx: &mut Context<SurfApp>) -> impl IntoElement {
-    let cmd = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl+" };
+    let cmd = if cfg!(target_os = "macos") {
+        "⌘"
+    } else {
+        "Ctrl+"
+    };
     let button = |id: &'static str,
                   icon: &'static str,
                   name: &'static str,
@@ -93,9 +97,14 @@ fn region_commands(cx: &mut Context<SurfApp>) -> impl IntoElement {
         .flex_none()
         .items_center()
         .gap(px(1.0))
-        .child(button("rc-quantize", "quantize", "Quantize", "Q".into(), cx, |a| {
-            editing::quantize(&mut a.session, &a.ui.edit)
-        }))
+        .child(button(
+            "rc-quantize",
+            "quantize",
+            "Quantize",
+            "Q".into(),
+            cx,
+            |a| editing::quantize(&mut a.session, &a.ui.edit),
+        ))
         .child(button(
             "rc-split",
             "split",

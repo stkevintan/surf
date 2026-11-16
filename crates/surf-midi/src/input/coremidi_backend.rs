@@ -173,7 +173,9 @@ mod tests {
     static COREMIDI_TESTS: Mutex<()> = Mutex::new(());
 
     fn coremidi_lock() -> std::sync::MutexGuard<'static, ()> {
-        COREMIDI_TESTS.lock().unwrap_or_else(|poison| poison.into_inner())
+        COREMIDI_TESTS
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     /// End to end through CoreMIDI: a virtual source shows up as a port, and
@@ -261,7 +263,11 @@ mod tests {
                 "an existing connection is kept"
             ),
             None => {
-                assert_eq!(connected_to.as_deref(), Some(name.as_str()), "auto-connected");
+                assert_eq!(
+                    connected_to.as_deref(),
+                    Some(name.as_str()),
+                    "auto-connected"
+                );
                 assert!(changes.contains(&PortChange::Connected(name.clone())));
             }
         }

@@ -178,8 +178,14 @@ mod tests {
         assert_eq!(
             plan.routes,
             vec![
-                Route { slot: 1, channel: 0 },
-                Route { slot: 2, channel: 1 }
+                Route {
+                    slot: 1,
+                    channel: 0
+                },
+                Route {
+                    slot: 2,
+                    channel: 1
+                }
             ]
         );
         assert_eq!(plan.gains, vec![(1, 1.0), (2, 0.5)]);
@@ -197,8 +203,20 @@ mod tests {
         slots[1] = Some(Source::Piano(p.tracks[0].id));
         slots[2] = Some(Source::Plugin(kontakt()));
         let plan = plan(&p, &slots, &HashSet::new());
-        assert_eq!(plan.routes[1], Route { slot: 2, channel: 1 });
-        assert_eq!(plan.routes[2], Route { slot: 2, channel: 2 });
+        assert_eq!(
+            plan.routes[1],
+            Route {
+                slot: 2,
+                channel: 1
+            }
+        );
+        assert_eq!(
+            plan.routes[2],
+            Route {
+                slot: 2,
+                channel: 2
+            }
+        );
         assert_eq!(plan.gains, vec![(1, 1.0), (2, 1.0)]);
         assert_eq!(plan.cc7, vec![(2, 1, 100), (2, 2, 50)]);
     }
@@ -211,7 +229,13 @@ mod tests {
         let mut slots = vec![None; MAX_SLOTS];
         slots[3] = Some(Source::Plugin(kontakt()));
         let plan = plan(&p, &slots, &HashSet::new());
-        assert_eq!(plan.routes, vec![Route { slot: 3, channel: 0 }]);
+        assert_eq!(
+            plan.routes,
+            vec![Route {
+                slot: 3,
+                channel: 0
+            }]
+        );
         assert_eq!(plan.gains, vec![(3, 1.2)]);
         assert!(plan.cc7.is_empty());
     }
@@ -224,7 +248,10 @@ mod tests {
         slots[1] = Some(Source::Piano(p.tracks[0].id));
         let failed: HashSet<PathBuf> = [kontakt()].into();
         let plan = plan(&p, &slots, &failed);
-        assert_eq!(plan.routes[0].slot, 1, "its own piano while Kontakt is down");
+        assert_eq!(
+            plan.routes[0].slot, 1,
+            "its own piano while Kontakt is down"
+        );
         assert_eq!(plan.routes[1].slot, 0, "no slot of its own: the spare");
         assert!(plan.gains.contains(&(0, 1.0)));
     }

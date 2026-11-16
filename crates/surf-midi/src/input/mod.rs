@@ -236,6 +236,8 @@ impl MidiHub {
 }
 
 /// Parse a channel voice message. Surf only acts on notes and the sustain pedal.
+// The WinMM and CoreMIDI backends use it; ALSA hands over parsed events.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn parse_message(status_byte: u8, data1: u8, data2: u8) -> Option<LiveEvent> {
     let status = status_byte & 0xF0;
     let key = data1 & 0x7F;

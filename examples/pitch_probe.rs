@@ -129,9 +129,11 @@ fn main() -> anyhow::Result<()> {
         let map = client.shared_map();
         println!("helper reports      : {} Hz", map.sample_rate());
         if map.sample_rate() != device_rate {
-            println!("verdict             : MISMATCH -> pitch shifts by {:.4}x ({:+.2} semitones)",
+            println!(
+                "verdict             : MISMATCH -> pitch shifts by {:.4}x ({:+.2} semitones)",
                 device_rate as f64 / map.sample_rate() as f64,
-                12.0 * (device_rate as f64 / map.sample_rate() as f64).log2());
+                12.0 * (device_rate as f64 / map.sample_rate() as f64).log2()
+            );
         } else {
             println!("verdict             : helper and device agree");
         }

@@ -21,8 +21,8 @@ mod probe {
 
     use windows::Win32::Networking::WinSock::{
         AF_INET, AF_UNIX, INVALID_SOCKET, IPPROTO_TCP, SOCK_STREAM, SOCKADDR, SOCKADDR_IN,
-        SOCKET_ERROR, WSADATA, WSAGetLastError, WSAStartup, bind, closesocket, connect, getsockname,
-        listen, socket,
+        SOCKET_ERROR, WSADATA, WSAGetLastError, WSAStartup, bind, closesocket, connect,
+        getsockname, listen, socket,
     };
 
     /// Build a loopback TCP pair the way libzmq's fallback does: listen on an
@@ -58,7 +58,9 @@ mod probe {
             }
             let mut bound: SOCKADDR_IN = zeroed();
             let mut len = size_of::<SOCKADDR_IN>() as i32;
-            if getsockname(listener, &mut bound as *mut _ as *mut SOCKADDR, &mut len) == SOCKET_ERROR {
+            if getsockname(listener, &mut bound as *mut _ as *mut SOCKADDR, &mut len)
+                == SOCKET_ERROR
+            {
                 let err = WSAGetLastError();
                 closesocket(listener);
                 return Err(format!("getsockname failed: {err:?}"));
@@ -76,7 +78,10 @@ mod probe {
                 size_of::<SOCKADDR_IN>() as i32,
             );
             let result = if rc == SOCKET_ERROR {
-                Err(format!("connect to loopback failed: {:?}", WSAGetLastError()))
+                Err(format!(
+                    "connect to loopback failed: {:?}",
+                    WSAGetLastError()
+                ))
             } else {
                 Ok(())
             };

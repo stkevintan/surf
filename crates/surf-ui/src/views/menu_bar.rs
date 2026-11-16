@@ -6,8 +6,8 @@
 //! the shortcut on the right comes from the keymap.
 
 use gpui::{
-    Context, IntoElement, MouseButton, MouseDownEvent, OwnedMenu,
-    OwnedMenuItem, ParentElement, SharedString, Styled, Window, deferred, div, prelude::*, px,
+    Context, IntoElement, MouseButton, MouseDownEvent, OwnedMenu, OwnedMenuItem, ParentElement,
+    SharedString, Styled, Window, deferred, div, prelude::*, px,
 };
 
 use crate::shell::SurfApp;

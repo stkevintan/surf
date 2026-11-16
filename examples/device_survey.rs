@@ -23,7 +23,10 @@ fn main() -> anyhow::Result<()> {
     let default_name = host
         .default_output_device()
         .and_then(|d| d.description().ok().map(|desc| desc.name().to_string()));
-    println!("default output: {}\n", default_name.as_deref().unwrap_or("(none)"));
+    println!(
+        "default output: {}\n",
+        default_name.as_deref().unwrap_or("(none)")
+    );
 
     for device in host.output_devices()? {
         let name = device
@@ -40,7 +43,12 @@ fn main() -> anyhow::Result<()> {
         match device.default_output_config() {
             Ok(cfg) => {
                 let rate = cfg.sample_rate();
-                print!("  default: {} Hz, {} ch, {:?}", rate, cfg.channels(), cfg.sample_format());
+                print!(
+                    "  default: {} Hz, {} ch, {:?}",
+                    rate,
+                    cfg.channels(),
+                    cfg.sample_format()
+                );
                 match cfg.buffer_size() {
                     cpal::SupportedBufferSize::Range { min, max } => {
                         println!(

@@ -294,7 +294,11 @@ pub fn sync_native_checks(state: impl Fn(&dyn gpui::Action) -> Option<bool>) {
                     continue;
                 };
                 if let Some(native) = sub.itemWithTitle(&NSString::from_str(name)) {
-                    let want = if on { NSControlStateValueOn } else { NSControlStateValueOff };
+                    let want = if on {
+                        NSControlStateValueOn
+                    } else {
+                        NSControlStateValueOff
+                    };
                     if native.state() != want {
                         native.setState(want);
                     }

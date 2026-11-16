@@ -34,10 +34,7 @@ fn main() -> anyhow::Result<()> {
     println!("plugin loaded; settling for 1s");
     std::thread::sleep(Duration::from_secs(1));
 
-    println!(
-        "{:>7}  {:>9}  {:>9}",
-        "t (s)", "queued", "latency"
-    );
+    println!("{:>7}  {:>9}  {:>9}", "t (s)", "queued", "latency");
 
     let start = Instant::now();
     let mut buffer = vec![0.0f32; BLOCK * 2];
@@ -55,7 +52,7 @@ fn main() -> anyhow::Result<()> {
 
         let queued = map.audio_backlog();
         let secs = start.elapsed().as_secs_f64();
-        if (secs * 100.0) as u64 % 50 == 0 {
+        if ((secs * 100.0) as u64).is_multiple_of(50) {
             println!(
                 "{:>7.2}  {:>9}  {:>7.1}ms",
                 secs,
