@@ -7,7 +7,7 @@ pub mod engine;
 pub mod render;
 pub mod synth;
 
-pub use engine::{AudioEngine, Command, EngineStatus, MAX_SLOTS, OutputEvent, Route};
+pub use engine::{AudioEngine, Command, CommandTx, EngineStatus, MAX_SLOTS, OutputEvent, Route};
 pub use synth::Synth;
 
 pub const MIN_KEY: u8 = 21;

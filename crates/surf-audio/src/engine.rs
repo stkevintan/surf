@@ -6,7 +6,7 @@
 //! thread runs the same code path so the visualizer remains usable.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -134,6 +134,8 @@ struct ActiveNote {
     route: Route,
     key: u8,
     end_frame: u64,
+    /// The block in which its voice was struck (its start frame).
+    struck_at: u64,
 }
 
 /// Something the audio thread swapped out and wants the UI thread to free.
@@ -237,24 +239,96 @@ impl Core {
         for instrument in self.slots.iter_mut().flatten() {
             instrument.all_notes_off();
         }
+        // Nothing sounds any more, so no note owns a key: a later live press and
+        // release of one must not be held back on behalf of a silenced note.
+        self.active.clear();
         self.held = [None; 128];
         self.sustain = false;
+    }
+
+    /// Whether a playback note or the player is sounding `key` on `route`.
+    fn sounding(&self, route: Route, key: u8) -> bool {
+        self.active.iter().any(|a| a.route == route && a.key == key)
+            || self.held[key as usize & 127] == Some(route)
+    }
+
+    /// Note-on for `key` on `route`. If it is already sounding there (another
+    /// playback note, or the player), end that voice first: one voice per key and
+    /// route, as on an instrument, so every note-on is matched by one note-off.
+    fn strike(&mut self, route: Route, key: u8, velocity: u8) {
+        self.strike_at(route, key, velocity, None);
+    }
+
+    /// `strike` for playback. Notes struck in the same block (frames from
+    /// `block`) on a voice already struck in that block share it instead of
+    /// retriggering: hundreds of identical starts would otherwise send an
+    /// off/on pair each and overflow a plugin's per-block event batch.
+    fn strike_at(&mut self, route: Route, key: u8, velocity: u8, block: Option<u64>) {
+        if let Some(block) = block
+            && self
+                .active
+                .iter()
+                .any(|a| a.route == route && a.key == key && a.struck_at >= block)
+        {
+            return;
+        }
+        let again = self.sounding(route, key);
+        if let Some(i) = self.slot(route) {
+            if again {
+                i.note_off(route.channel, key);
+            }
+            i.note_on(route.channel, key, velocity);
+        }
+    }
+
+    /// Note-off for a playback note, unless that voice still has to sound:
+    /// another playback note of the same key on the same route, or the player
+    /// holding the key there. Whichever ends last sends the note-off.
+    fn release(&mut self, route: Route, key: u8) {
+        if !self.sounding(route, key)
+            && let Some(i) = self.slot(route)
+        {
+            i.note_off(route.channel, key);
+        }
+    }
+
+    /// Note-offs for the voices in `ended`. A key and route is one voice (see
+    /// `strike`), so several owners ending together send one note-off. Sorting
+    /// and dedup work in place: nothing allocates in the callback.
+    fn release_ended(&mut self) {
+        self.ended
+            .sort_unstable_by_key(|(r, k)| (r.slot, r.channel, *k));
+        self.ended.dedup();
+        for i in 0..self.ended.len() {
+            let (route, key) = self.ended[i];
+            self.release(route, key);
+        }
+    }
+
+    /// End every playback note, leaving what the player holds alone: keys still
+    /// down and the sustain pedal. Transport moves (loop, seek, play, pause) use
+    /// this; only Stop and AllNotesOff reset everything.
+    fn release_playback(&mut self) {
+        self.ended.clear();
+        self.ended
+            .extend(self.active.drain(..).map(|a| (a.route, a.key)));
+        self.release_ended();
     }
 
     fn apply(&mut self, command: Command) {
         match command {
             Command::NoteOn { key, velocity } => {
                 let route = self.route(self.input);
+                self.strike(route, key, velocity);
                 self.held[key as usize & 127] = Some(route);
-                if let Some(i) = self.slot(route) {
-                    i.note_on(route.channel, key, velocity);
-                }
             }
             Command::NoteOff { key } => {
                 let route = self.held[key as usize & 127]
                     .take()
                     .unwrap_or_else(|| self.route(self.input));
-                if let Some(i) = self.slot(route) {
+                // Playback is sounding the same key there: it ends it.
+                let playing = self.active.iter().any(|a| a.route == route && a.key == key);
+                if !playing && let Some(i) = self.slot(route) {
                     i.note_off(route.channel, key);
                 }
             }
@@ -319,11 +393,10 @@ impl Core {
                 }
             }
             Command::Play { timeline, from } => {
-                self.all_notes_off();
+                self.release_playback();
                 self.duration_frames = (timeline.duration * self.sample_rate).ceil() as u64;
                 self.pos_frames = (from.max(0.0) * self.sample_rate) as u64;
                 self.next_note = timeline.notes.partition_point(|n| n.start < from.max(0.0));
-                self.active.clear();
                 if let Some(old) = self.timeline.replace(timeline) {
                     self.retire(Retired::Timeline(old));
                 }
@@ -336,7 +409,7 @@ impl Core {
             Command::Update { timeline } => self.update(timeline),
             Command::Pause => {
                 self.playing = false;
-                self.all_notes_off();
+                self.release_playback();
                 self.shared.playing.store(false, Ordering::Release);
             }
             Command::Resume => {
@@ -357,8 +430,7 @@ impl Core {
             Command::Seek(sec) => {
                 let sec = sec.max(0.0);
                 self.pos_frames = (sec * self.sample_rate) as u64;
-                self.active.clear();
-                self.all_notes_off();
+                self.release_playback();
                 if let Some(timeline) = &self.timeline {
                     self.next_note = timeline.notes.partition_point(|n| n.start < sec);
                     self.shared
@@ -402,15 +474,7 @@ impl Core {
                 }
             }
         });
-        for &(route, key) in &self.ended {
-            if let Some(i) = self
-                .slots
-                .get_mut(route.slot as usize)
-                .and_then(Option::as_mut)
-            {
-                i.note_off(route.channel, key);
-            }
-        }
+        self.release_ended();
 
         // While playing, start edited notes that now cover the playhead but
         // aren't sounding: one dragged back under it, or a new one drawn
@@ -433,19 +497,16 @@ impl Core {
                     .get(n.track as usize)
                     .copied()
                     .unwrap_or_default();
-                let Some(inst) = self
-                    .slots
-                    .get_mut(route.slot as usize)
-                    .and_then(Option::as_mut)
-                else {
+                if self.slot(route).is_none() {
                     continue;
-                };
-                inst.note_on(route.channel, n.key, n.velocity);
+                }
+                self.strike_at(route, n.key, n.velocity, Some(pos));
                 self.active.push(ActiveNote {
                     track_id: n.track_id,
                     route,
                     key: n.key,
                     end_frame: frame(n.end).max(pos + 1),
+                    struck_at: pos,
                 });
             }
         }
@@ -485,15 +546,14 @@ impl Core {
     fn reset_to_start(&mut self) {
         self.pos_frames = 0;
         self.next_note = 0;
-        self.active.clear();
-        self.all_notes_off();
+        self.release_playback();
         self.shared.position_frames.store(0, Ordering::Release);
     }
 
     /// Apply queued commands. A command that hands a timeline or route list back
     /// for freeing waits (with everything queued after it, so order is kept) while
     /// the retirement storage is full, rather than be applied and freed here.
-    fn drain(&mut self, rx: &crossbeam_channel::Receiver<Command>) {
+    fn drain(&mut self, rx: &mut CommandRx) {
         // Hand held payloads back on every call, even with nothing queued, so the
         // reserve empties as soon as the UI makes room.
         let room = self.has_retire_room();
@@ -504,7 +564,7 @@ impl Core {
             }
             self.apply(command);
         }
-        while let Ok(command) = rx.try_recv() {
+        while let Some(command) = rx.try_recv() {
             let retires = matches!(
                 command,
                 Command::Play { .. } | Command::Update { .. } | Command::SetRoutes(_)
@@ -601,7 +661,7 @@ impl Core {
                     } else {
                         self.pos_frames = self.duration_frames;
                         self.playing = false;
-                        self.all_notes_off();
+                        self.release_playback();
                         self.shared.playing.store(false, Ordering::Release);
                     }
                 } else {
@@ -634,9 +694,9 @@ impl Core {
     }
 
     fn trigger(&mut self, start: u64, end: u64) {
-        let Some(timeline) = &self.timeline else {
+        if self.timeline.is_none() {
             return;
-        };
+        }
 
         // Note-offs first so back-to-back notes on the same key retrigger cleanly.
         let ended = &mut self.ended;
@@ -649,18 +709,16 @@ impl Core {
                 true
             }
         });
-        for &(route, key) in &self.ended {
-            if let Some(i) = self
-                .slots
-                .get_mut(route.slot as usize)
-                .and_then(Option::as_mut)
-            {
-                i.note_off(route.channel, key);
-            }
-        }
+        self.release_ended();
 
-        while self.next_note < timeline.notes.len() {
-            let note = &timeline.notes[self.next_note];
+        loop {
+            let Some(timeline) = &self.timeline else {
+                return;
+            };
+            let Some(note) = timeline.notes.get(self.next_note) else {
+                return;
+            };
+            let note = *note;
             let note_start = (note.start * self.sample_rate) as u64;
             if note_start >= end {
                 break;
@@ -678,20 +736,17 @@ impl Core {
             if self.active.len() == self.active.capacity() {
                 continue;
             }
-            let Some(i) = self
-                .slots
-                .get_mut(route.slot as usize)
-                .and_then(Option::as_mut)
-            else {
+            if self.slot(route).is_none() {
                 continue;
-            };
-            i.note_on(route.channel, note.key, note.velocity);
+            }
+            self.strike_at(route, note.key, note.velocity, Some(start));
             let note_end = ((note.end * self.sample_rate) as u64).max(note_start + 1);
             self.active.push(ActiveNote {
                 track_id: note.track_id,
                 route,
                 key: note.key,
                 end_frame: note_end,
+                struck_at: note_start,
             });
         }
     }
@@ -713,7 +768,7 @@ impl Drop for NullClock {
 
 pub struct AudioEngine {
     shared: Arc<Shared>,
-    tx: crossbeam_channel::Sender<Command>,
+    tx: CommandTx,
     _stream: Option<cpal::Stream>,
     _null_clock: Option<NullClock>,
     sample_rate: u32,
@@ -737,7 +792,7 @@ impl AudioEngine {
             glitches: AtomicU32::new(0),
         });
         let (event_tx, events) = crossbeam_channel::unbounded();
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx, mut rx) = command_channel(COMMAND_CAP);
         let (trash_tx, trash) = crossbeam_channel::bounded::<Retired>(8);
 
         // Try the default output device first.
@@ -772,7 +827,7 @@ impl AudioEngine {
                                 data.fill(0.0);
                                 return;
                             };
-                            core.drain(&rx);
+                            core.drain(&mut rx);
                             core.fill_output(data, channels as usize);
                         },
                         err_fn,
@@ -811,7 +866,7 @@ impl AudioEngine {
                         let start = Instant::now();
                         let mut produced_frames = 0u64;
                         while !thread_stop.load(Ordering::Acquire) {
-                            thread_core.lock().drain(&rx);
+                            thread_core.lock().drain(&mut rx);
                             let elapsed = start.elapsed().as_secs_f64();
                             let target = (elapsed * sample_rate as f64) as u64;
                             while produced_frames < target {
@@ -887,8 +942,8 @@ impl AudioEngine {
     }
 
     /// A cloneable command sender, used by the MIDI callback to reach the audio
-    /// thread without going through the UI at 60 fps.
-    pub fn sender(&self) -> crossbeam_channel::Sender<Command> {
+    /// thread without going through the UI at 60 fps. Sending never blocks.
+    pub fn sender(&self) -> CommandTx {
         self.tx.clone()
     }
 
@@ -899,8 +954,6 @@ impl AudioEngine {
 
     pub fn send(&self, command: Command) {
         self.reclaim();
-        // The audio side drains at block rate; an unbounded queue keeps the UI
-        // responsive even if the device stalls.
         let _ = self.tx.send(command);
     }
 
@@ -954,21 +1007,159 @@ impl AudioEngine {
     /// last reference to its plugin host on the UI thread.
     pub fn set_slot(&self, slot: u8, instrument: Option<Box<dyn Instrument>>) {
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
-        let _ = self.tx.send(Command::SetSlot {
+        let command = Command::SetSlot {
             slot,
             instrument,
             ack: Some(ack_tx),
-        });
+        };
+        if self.tx.send(command).is_err() {
+            return; // The audio thread is gone.
+        }
         // Keep freeing retired payloads while waiting: the callback may be holding
         // a retiring command (and this one behind it) until there is room.
         let deadline = Instant::now() + Duration::from_millis(750);
         while Instant::now() < deadline {
             self.reclaim();
-            if ack_rx.recv_timeout(Duration::from_millis(5)).is_ok() {
-                return;
+            match ack_rx.recv_timeout(Duration::from_millis(5)) {
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                // Acknowledged, or dropped unapplied with the audio thread.
+                _ => return,
             }
         }
     }
+}
+
+/// Commands the bounded queue holds. The callback drains it every block, so it
+/// only fills if the device stops calling back.
+const COMMAND_CAP: usize = 1024;
+
+/// The audio thread's command queue, as the senders see it.
+///
+/// Commands go to a bounded queue, so in normal use the audio callback never
+/// calls the allocator (crossbeam's unbounded channel frees a block about every
+/// 31 messages on the receiving side). Nothing is ever dropped or blocks the
+/// sender, though: losing a note-off, pedal-up, `Stop` or `SetSlot` would leave
+/// state stuck. When the bounded queue is full, commands go to an unbounded
+/// overflow queue instead, and keep going there until the audio thread has
+/// taken them all, so each sender's commands stay in order. Only that rare case
+/// (a stalled device) touches the allocator on the audio side.
+#[derive(Clone)]
+pub struct CommandTx {
+    fast: crossbeam_channel::Sender<(u64, Command)>,
+    overflow: crossbeam_channel::Sender<(u64, Command)>,
+    pending: Arc<AtomicUsize>,
+    /// Numbers commands as they are sent, so the receiver can merge the two
+    /// queues back into each sender's order.
+    seq: Arc<AtomicU64>,
+}
+
+/// The audio thread went away; the command was not queued.
+#[derive(Debug)]
+pub struct Disconnected;
+
+impl CommandTx {
+    /// Queue `command`. Never blocks and never drops it.
+    pub fn send(&self, command: Command) -> Result<(), Disconnected> {
+        let item = (self.seq.fetch_add(1, Ordering::AcqRel), command);
+        let item = if self.pending.load(Ordering::Acquire) == 0 {
+            match self.fast.try_send(item) {
+                Ok(()) => return Ok(()),
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => return Err(Disconnected),
+                Err(crossbeam_channel::TrySendError::Full(item)) => item,
+            }
+        } else {
+            item
+        };
+        // Count it before it can be received, so later sends follow it here.
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        self.overflow.send(item).map_err(|_| {
+            self.pending.fetch_sub(1, Ordering::AcqRel);
+            Disconnected
+        })
+    }
+}
+
+/// The audio thread's end of [`CommandTx`].
+///
+/// It holds the next command of each queue and hands out the lower-numbered one.
+/// A sender's commands are numbered in the order it sends them, and one that went
+/// to the bounded queue before another went to overflow was in the bounded queue
+/// before that one could be received. So after taking from overflow the receiver
+/// looks at the bounded queue again before choosing: an older command from the
+/// same sender cannot be passed over, however the threads interleave.
+pub(crate) struct CommandRx {
+    fast: crossbeam_channel::Receiver<(u64, Command)>,
+    overflow: crossbeam_channel::Receiver<(u64, Command)>,
+    pending: Arc<AtomicUsize>,
+    next_fast: Option<(u64, Command)>,
+    next_overflow: Option<(u64, Command)>,
+}
+
+impl CommandRx {
+    fn pull_overflow(&mut self) {
+        if self.next_overflow.is_none() {
+            self.next_overflow = self.overflow.try_recv().ok();
+        }
+    }
+
+    fn pull_fast(&mut self) {
+        if self.next_fast.is_none() {
+            self.next_fast = self.fast.try_recv().ok();
+        }
+    }
+
+    /// The lower-numbered of the held commands.
+    fn pop(&mut self) -> Option<Command> {
+        let take_fast = match (&self.next_fast, &self.next_overflow) {
+            (Some(f), Some(o)) => f.0 < o.0,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => return None,
+        };
+        if take_fast {
+            self.next_fast.take().map(|(_, c)| c)
+        } else {
+            self.pending.fetch_sub(1, Ordering::AcqRel);
+            self.next_overflow.take().map(|(_, c)| c)
+        }
+    }
+
+    /// The next command, in each sender's order. Overflow first, then the bounded
+    /// queue: see the type's docs for why this order matters.
+    fn try_recv(&mut self) -> Option<Command> {
+        self.pull_overflow();
+        self.pull_fast();
+        self.pop()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.fast.is_empty()
+            && self.overflow.is_empty()
+            && self.next_fast.is_none()
+            && self.next_overflow.is_none()
+    }
+}
+
+fn command_channel(cap: usize) -> (CommandTx, CommandRx) {
+    let (fast_tx, fast) = crossbeam_channel::bounded(cap);
+    let (overflow_tx, overflow) = crossbeam_channel::unbounded();
+    let pending = Arc::new(AtomicUsize::new(0));
+    (
+        CommandTx {
+            fast: fast_tx,
+            overflow: overflow_tx,
+            pending: pending.clone(),
+            seq: Arc::new(AtomicU64::new(0)),
+        },
+        CommandRx {
+            fast,
+            overflow,
+            pending,
+            next_fast: None,
+            next_overflow: None,
+        },
+    )
 }
 
 impl Default for AudioEngine {
@@ -1218,46 +1409,277 @@ mod tests {
         (c, log)
     }
 
-    /// An edit while playing keeps the position and leaves sounding notes
-    /// alone; it doesn't restart the song or cut every note.
+    /// Every call an instrument gets, in order.
+    type Calls = Arc<parking_lot::Mutex<Vec<String>>>;
+
+    struct Recorder(Calls);
+
+    impl Instrument for Recorder {
+        fn note_on(&mut self, _: u8, key: u8, _: u8) {
+            self.0.lock().push(format!("on {key}"));
+        }
+        fn note_off(&mut self, _: u8, key: u8) {
+            self.0.lock().push(format!("off {key}"));
+        }
+        fn all_notes_off(&mut self) {
+            self.0.lock().push("all off".into());
+        }
+        fn set_sustain(&mut self, _: u8, down: bool) {
+            self.0.lock().push(format!("pedal {down}"));
+        }
+        fn process(&mut self, out: &mut [f32], frames: usize) {
+            out[..frames * 2].fill(0.0);
+        }
+        fn name(&self) -> &str {
+            "recorder"
+        }
+    }
+
+    fn recorder_core() -> (Core, Calls) {
+        let mut c = core();
+        let calls: Calls = Default::default();
+        c.apply(Command::SetSlot {
+            slot: 1,
+            instrument: Some(Box::new(Recorder(calls.clone()))),
+            ack: None,
+        });
+        c.apply(Command::SetRoutes(vec![Route {
+            slot: 1,
+            channel: 0,
+        }]));
+        calls.lock().clear();
+        (c, calls)
+    }
+
+    fn secs(c: &mut Core, s: f64) {
+        run(c, (s * 48_000.0) as usize);
+    }
+
+    /// Review M6: two overlapping playback notes on one key. The first ending
+    /// must not cut the second; the key goes off once, when the last one ends.
     #[test]
-    fn an_edit_while_playing_keeps_sounding_notes() {
-        let (mut c, log) = probe_core();
-        // A held chord (60 + 64) and a later note 67.
-        let a = long(0, 60, 0.0, 1.0);
-        let b = long(1, 64, 0.0, 1.0);
-        let later = long(0, 67, 0.5, 0.6);
+    fn overlapping_notes_on_a_key_end_with_the_last() {
+        let (mut c, calls) = recorder_core();
         c.apply(Command::Play {
             timeline: Timeline {
-                notes: vec![a, b, later],
-                duration: 1.0,
+                notes: vec![long(0, 60, 0.0, 1.0), long(0, 60, 0.5, 2.0)],
+                duration: 3.0,
             },
             from: 0.0,
         });
-        c.render(4800); // 0.1 s in: 60 and 64 are sounding
-        let pos = c.pos_frames;
-        log.lock().clear();
+        secs(&mut c, 1.5);
+        // One voice per key: the re-strike ends the first, so every note-on is
+        // matched by one note-off, and the first ending at 1 s cut nothing.
+        assert_eq!(*calls.lock(), ["on 60", "off 60", "on 60"]);
+        secs(&mut c, 1.0);
+        assert_eq!(*calls.lock(), ["on 60", "off 60", "on 60", "off 60"]);
+    }
 
-        // Delete 64 and move the later note to 0.3 s.
-        let moved = long(0, 67, 0.3, 0.4);
-        c.apply(Command::Update {
-            timeline: Timeline {
-                notes: vec![a, moved],
-                duration: 1.0,
-            },
+    /// Review M6: playback ending a note must not cut the same key the player is
+    /// holding, and the player letting go must not cut playback's note.
+    #[test]
+    fn playback_and_the_player_do_not_cut_each_other() {
+        let (mut c, calls) = recorder_core();
+        c.apply(Command::NoteOn {
+            key: 60,
+            velocity: 90,
         });
-        assert_eq!(c.pos_frames, pos, "position kept");
-        assert_eq!(
-            *log.lock(),
-            vec![(1, 64, false)],
-            "only the deleted note stops; 60 keeps ringing"
-        );
-        log.lock().clear();
+        c.apply(Command::Play {
+            timeline: Timeline {
+                notes: vec![long(0, 60, 0.0, 0.5), long(0, 62, 0.0, 2.0)],
+                duration: 3.0,
+            },
+            from: 0.0,
+        });
+        secs(&mut c, 1.0);
+        let count = |e: &str| calls.lock().iter().filter(|x| *x == e).count();
+        // Playback's strike ended the player's voice first (one voice per key);
+        // playback's own end at 0.5 s did not cut the key the player still holds.
+        assert_eq!(count("off 60"), 1, "{:?}", calls.lock());
+        c.apply(Command::NoteOff { key: 60 });
+        assert_eq!(calls.lock().last().map(String::as_str), Some("off 60"));
+        assert_eq!(count("on 60"), count("off 60"), "balanced");
 
-        // Play on past 0.5 s: the moved note sounds at its new time, once.
-        run(&mut c, 24_000);
-        let ons: Vec<u8> = log.lock().iter().filter(|e| e.2).map(|e| e.1).collect();
-        assert_eq!(ons, vec![67], "moved note plays once, nothing replays");
+        // The other way round: the player lets go while playback still sounds it.
+        calls.lock().clear();
+        c.apply(Command::NoteOn {
+            key: 62,
+            velocity: 90,
+        });
+        c.apply(Command::NoteOff { key: 62 });
+        // The press re-struck playback's voice (off, on); letting go kept it.
+        assert_eq!(*calls.lock(), ["off 62", "on 62"]);
+        secs(&mut c, 1.5);
+        assert_eq!(*calls.lock(), ["off 62", "on 62", "off 62"]);
+    }
+
+    /// Review: many identical starts on one key in one block share one voice, so
+    /// they send one note-on (not an off/on pair each, which would overflow a
+    /// VST2 plugin's 512-event batch) and one note-off when the last one ends.
+    #[test]
+    fn identical_starts_in_a_block_share_one_voice() {
+        let (mut c, calls) = recorder_core();
+        let notes: Vec<TimedNote> = (0..300)
+            .map(|i| long(0, 60, 0.0, 0.5 + i as f64 * 0.001))
+            .collect();
+        c.apply(Command::Play {
+            timeline: Timeline {
+                notes,
+                duration: 2.0,
+            },
+            from: 0.0,
+        });
+        secs(&mut c, 0.1);
+        assert_eq!(*calls.lock(), ["on 60"]);
+        assert_eq!(c.active.len(), 300, "every note is tracked");
+        secs(&mut c, 1.5);
+        assert_eq!(*calls.lock(), ["on 60", "off 60"]);
+    }
+
+    /// Review: after AllNotesOff, a silenced playback note no longer owns its key,
+    /// so the player pressing and releasing that key does end it.
+    #[test]
+    fn all_notes_off_clears_playback_ownership() {
+        let (mut c, calls) = recorder_core();
+        c.apply(Command::Play {
+            timeline: Timeline {
+                notes: vec![long(0, 60, 0.0, 5.0)],
+                duration: 6.0,
+            },
+            from: 0.0,
+        });
+        secs(&mut c, 0.5);
+        c.apply(Command::AllNotesOff);
+        calls.lock().clear();
+        c.apply(Command::NoteOn {
+            key: 60,
+            velocity: 90,
+        });
+        c.apply(Command::NoteOff { key: 60 });
+        assert_eq!(*calls.lock(), ["on 60", "off 60"]);
+    }
+
+    /// Review M4: looping back to the start, seeking or pausing must not drop the
+    /// sustain pedal or a key the player holds.
+    #[test]
+    fn transport_moves_keep_the_players_pedal_and_keys() {
+        let (mut c, calls) = recorder_core();
+        c.apply(Command::SetLoop(true));
+        c.apply(Command::Sustain(true));
+        c.apply(Command::NoteOn {
+            key: 50,
+            velocity: 90,
+        });
+        c.apply(Command::Play {
+            timeline: Timeline {
+                notes: vec![long(0, 72, 0.0, 0.2)],
+                duration: 0.5,
+            },
+            from: 0.0,
+        });
+        secs(&mut c, 1.2); // wraps twice
+        c.apply(Command::Seek(0.1));
+        c.apply(Command::Pause);
+        let calls = calls.lock().clone();
+        assert!(
+            !calls
+                .iter()
+                .any(|e| e == "all off" || e == "pedal false" || e == "off 50"),
+            "{calls:?}"
+        );
+        assert!(c.sustain, "pedal still down");
+        assert!(c.held[50].is_some(), "key still held");
+        assert!(
+            calls.iter().filter(|e| *e == "on 72").count() >= 2,
+            "playback looped: {calls:?}"
+        );
+    }
+
+    /// Stop still resets everything, pedal included.
+    #[test]
+    fn stop_resets_the_pedal() {
+        let (mut c, calls) = recorder_core();
+        c.apply(Command::Sustain(true));
+        c.apply(Command::Stop);
+        assert!(!c.sustain);
+        assert!(calls.lock().contains(&"all off".to_string()));
+    }
+
+    /// Review M3: the queue is bounded, but a full one never drops or blocks.
+    /// Overflow keeps each sender's order, and later sends follow the overflow
+    /// until the audio thread has caught up.
+    #[test]
+    fn a_full_command_queue_keeps_every_command_in_order() {
+        let (tx, mut rx) = command_channel(2);
+        for v in 0..6 {
+            tx.send(Command::SetVolume(v as f32 / 10.0)).unwrap();
+        }
+        // The audio thread takes one; the next send must still queue behind the
+        // overflow, not jump ahead into the freed bounded slot.
+        let first = rx.try_recv();
+        tx.send(Command::SetVolume(0.6)).unwrap();
+        let mut got: Vec<f32> = first
+            .into_iter()
+            .chain(std::iter::from_fn(|| rx.try_recv()))
+            .map(|c| match c {
+                Command::SetVolume(v) => v,
+                _ => unreachable!(),
+            })
+            .collect();
+        got.iter_mut().for_each(|v| *v = (*v * 10.0).round());
+        assert_eq!(got, [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert!(rx.is_empty());
+        // Caught up: the bounded queue is used again.
+        tx.send(Command::Pause).unwrap();
+        assert_eq!(tx.pending.load(Ordering::Acquire), 0);
+        assert!(rx.fast.len() == 1);
+    }
+
+    /// Review: the receiver pauses right after finding the bounded queue empty.
+    /// Meanwhile a sender puts a NoteOn in the bounded queue, fills it, and the
+    /// matching NoteOff goes to overflow. The NoteOn must still come out first.
+    #[test]
+    fn a_receiver_paused_between_queues_keeps_order() {
+        let (tx, mut rx) = command_channel(2);
+        rx.pull_fast(); // empty: the receiver pauses here
+        tx.send(Command::NoteOn {
+            key: 60,
+            velocity: 90,
+        })
+        .unwrap();
+        tx.send(Command::SetVolume(0.5)).unwrap();
+        tx.send(Command::NoteOff { key: 60 }).unwrap(); // full: overflow
+        let order: Vec<&str> = std::iter::from_fn(|| rx.try_recv())
+            .map(|c| match c {
+                Command::NoteOn { .. } => "on",
+                Command::SetVolume(_) => "volume",
+                Command::NoteOff { .. } => "off",
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(order, ["on", "volume", "off"]);
+        assert!(rx.is_empty());
+        assert_eq!(rx.pending.load(Ordering::Acquire), 0);
+    }
+
+    /// Review: a note-off sent while the queue is full is not lost, so a held key
+    /// does not stay stuck once the device calls back again.
+    #[test]
+    fn a_release_sent_into_a_full_queue_still_arrives() {
+        let (mut c, calls) = recorder_core();
+        let (tx, mut rx) = command_channel(1);
+        tx.send(Command::NoteOn {
+            key: 60,
+            velocity: 90,
+        })
+        .unwrap();
+        for _ in 0..10 {
+            tx.send(Command::SetVolume(0.5)).unwrap();
+        }
+        tx.send(Command::NoteOff { key: 60 }).unwrap();
+        c.drain(&mut rx);
+        assert_eq!(*calls.lock(), ["on 60", "off 60"]);
+        assert!(c.held[60].is_none());
     }
 
     /// Shortening a sounding note ends it at its new end, not the old one.
@@ -1437,7 +1859,7 @@ mod tests {
         });
         let (trash, ui) = crossbeam_channel::bounded::<Retired>(2);
         let mut c = Core::new(48_000, shared, trash);
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx, mut rx) = command_channel(COMMAND_CAP);
         let tl = || Timeline {
             notes: vec![long(0, 60, 0.0, 1.0)],
             duration: 1.0,
@@ -1447,7 +1869,7 @@ mod tests {
             tx.send(Command::Update { timeline: tl() }).unwrap();
         }
         tx.send(Command::SetVolume(0.25)).unwrap();
-        c.drain(&rx);
+        c.drain(&mut rx);
         assert_eq!(ui.len(), 2);
         assert_eq!(
             c.retired.len(),
@@ -1463,7 +1885,7 @@ mod tests {
             while ui.try_recv().is_ok() {
                 received += 1;
             }
-            c.drain(&rx);
+            c.drain(&mut rx);
         }
         assert!(c.deferred.is_none());
         assert_eq!(c.volume, 0.25);
@@ -1488,7 +1910,7 @@ mod tests {
         });
         let (trash, ui) = crossbeam_channel::bounded::<Retired>(2);
         let mut c = Core::new(48_000, shared, trash);
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx, mut rx) = command_channel(COMMAND_CAP);
         let tl = || Timeline {
             notes: vec![long(0, 60, 0.0, 1.0)],
             duration: 1.0,
@@ -1502,12 +1924,12 @@ mod tests {
             tx.send(Command::Update { timeline: tl() }).unwrap();
         }
         tx.send(Command::Stop).unwrap();
-        c.drain(&rx);
+        c.drain(&mut rx);
         assert!(c.playing, "Stop is still queued behind the held update");
         // Callback blocks and UI frames alternate; the UI sends nothing more.
         for _ in 0..200 {
             while ui.try_recv().is_ok() {}
-            c.drain(&rx);
+            c.drain(&mut rx);
             run(&mut c, 256);
             if !c.playing && c.deferred.is_none() && rx.is_empty() {
                 break;
@@ -1696,8 +2118,12 @@ mod tests {
             },
         });
         let ons = log.lock().iter().filter(|e| e.2).count();
-        assert_eq!(ons, c.active.len(), "every started note is tracked");
-        assert_eq!(ons, cap);
+        assert_eq!(c.active.len(), cap, "tracked up to the cap, no further");
+        // Notes on one key and route share a voice: one note-on per voice.
+        let mut voices: Vec<(u8, u8)> = c.active.iter().map(|a| (a.route.channel, a.key)).collect();
+        voices.sort_unstable();
+        voices.dedup();
+        assert_eq!(ons, voices.len(), "one note-on per tracked voice");
         // Play to the end: every one of them is released.
         run(&mut c, 48_000);
         let offs = log.lock().iter().filter(|e| !e.2).count();

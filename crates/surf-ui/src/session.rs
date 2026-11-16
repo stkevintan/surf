@@ -96,6 +96,7 @@ impl Session {
                 LiveEvent::NoteOff { key } => Command::NoteOff { key },
                 LiveEvent::Sustain(down) => Command::Sustain(down),
             };
+            // Never blocks the driver's thread, and never drops a note-off.
             let _ = audio_tx.send(command);
         });
         let midi = MidiHub::new(sink);
