@@ -64,8 +64,12 @@ pub struct Session {
     pub status: String,
     /// Engine state sampled once per frame by [`Session::tick`].
     pub engine: EngineStatus,
-    /// Sustain pedal state, for the UI indicator and the held-note highlight.
+    /// Sustain pedal state, for the UI indicator and the held-note highlight:
+    /// down while the hardware pedal or Musical Typing's pedal key is.
     pub sustain: bool,
+    /// The two pedals behind `sustain`. Each lifts only itself.
+    hw_pedal: bool,
+    typing_pedal: bool,
     /// Keys whose note-off arrived while the pedal was down. They sound until the
     /// pedal lifts, so the keyboard should keep showing them as ringing.
     pub sustained_keys: HashSet<u8>,
@@ -75,6 +79,10 @@ pub struct Session {
     input_track: Option<Id>,
     /// The `.surf` file the project was opened from or last saved to.
     pub project_path: Option<PathBuf>,
+    /// A plugin's editor was opened since the last save or open. What happens
+    /// inside it (a new Kontakt instrument) is not an undoable edit, and Surf
+    /// cannot see it, so it counts as an unsaved change.
+    plugins_touched: bool,
     /// Plugin states from the opened project, used when each plugin's host
     /// first starts.
     project_states: std::collections::BTreeMap<PathBuf, Vec<u8>>,
@@ -125,9 +133,12 @@ impl Session {
             rack: Rack::new(),
             render_rx: None,
             rendering: false,
+            plugins_touched: false,
             pending_vst: std::env::var_os("SURF_VST").map(PathBuf::from),
             plugin_scan,
             sustain: false,
+            hw_pedal: false,
+            typing_pedal: false,
             sustained_keys: HashSet::new(),
             record_arm: None,
             input_track: None,
@@ -162,7 +173,7 @@ impl Session {
     }
 
     pub fn stop_playback(&mut self) {
-        self.audio.stop();
+        self.stop_audio_keeping_pedals();
         self.status = "Stopped".to_string();
     }
 
@@ -186,18 +197,32 @@ impl Session {
     pub fn toggle_record(&mut self) {
         if self.recorder.is_recording() {
             let notes = self.recorder.finish(Instant::now());
-            self.audio.stop();
+            self.stop_audio_keeping_pedals();
             if notes.is_empty() {
                 self.status = "Recording stopped: no notes captured".to_string();
                 return;
             }
             self.add_take(&notes);
         } else {
-            self.recorder.start(Instant::now());
+            let now = Instant::now();
+            self.recorder.start(now);
+            // A pedal already held when the take starts holds its notes too.
+            if self.sustain {
+                self.recorder.sustain(true, now);
+            }
             self.live_notes.clear();
-            self.audio.stop();
+            self.stop_audio_keeping_pedals();
             self.status = "Recording… play your MIDI keyboard or use Musical Typing".to_string();
         }
+    }
+
+    /// Stop the engine without letting go of pedals that are still held. Every
+    /// stop goes through here (Stop, a take, a new project), so the engine's
+    /// pedals always match the session's, which a take starts from. The engine
+    /// keeps its own pedal state, which the MIDI thread updates directly, so
+    /// this does not resend the UI's (possibly older) one.
+    fn stop_audio_keeping_pedals(&mut self) {
+        self.audio.stop_keeping_pedals();
     }
 
     /// Put a recorded take on the record track as a new region, starting at
@@ -286,7 +311,7 @@ impl Session {
     /// the plugin of the old track on its MIDI channel, else the first old
     /// track's. Opening a file doesn't unload Kontakt.
     pub fn set_project(&mut self, mut project: Project) {
-        self.audio.stop();
+        self.stop_audio_keeping_pedals();
         let fallback = self
             .project
             .tracks
@@ -304,6 +329,7 @@ impl Session {
         }
         self.project = project;
         self.history.clear();
+        self.plugins_touched = false;
         self.record_arm = None;
         self.record_region = None;
         self.project_path = None;
@@ -398,7 +424,18 @@ impl Session {
     /// Routes, slot gains and channel volumes for the current project.
     fn send_plan(&mut self) {
         let plan = rack::plan(&self.project, &self.rack.slots, &self.rack.failed);
-        self.audio.send(Command::SetRoutes(plan.routes));
+        // Live input plays the record-armed track, else the selected one.
+        let input = self
+            .armed_track()
+            .or(self.input_track)
+            .and_then(|id| self.project.tracks.iter().position(|t| t.id == id))
+            .unwrap_or(0);
+        // Routes and input in one command, so a held pedal never passes through
+        // the new routes paired with the old input index.
+        self.audio.send(Command::SetRoutesAndInput {
+            routes: plan.routes,
+            input: input as u16,
+        });
         for (slot, gain) in plan.gains {
             self.audio.send(Command::SetSlotGain { slot, gain });
         }
@@ -412,13 +449,6 @@ impl Session {
                 });
             }
         }
-        // Live input plays the record-armed track, else the selected one.
-        let input = self
-            .armed_track()
-            .or(self.input_track)
-            .and_then(|id| self.project.tracks.iter().position(|t| t.id == id))
-            .unwrap_or(0);
-        self.audio.send(Command::SetInput(input as u16));
     }
 
     /// Start a plugin host, restoring the state saved for the plugin (or
@@ -588,15 +618,23 @@ impl Session {
         match doc.save(&path) {
             Ok(()) => {
                 self.history.mark_saved();
-                self.status = format!("Saved {}", path.display());
-                if !failed.is_empty() {
-                    self.status.push_str(&format!(
-                        " · without plugin state for {}",
+                self.project_path = Some(path.clone());
+                if failed.is_empty() {
+                    self.plugins_touched = false;
+                    self.status = format!("Saved {}", path.display());
+                    true
+                } else {
+                    // The file holds an older state for these plugins: their
+                    // changes are not saved, so the project stays unsaved and
+                    // closing it asks again.
+                    self.plugins_touched = true;
+                    self.status = format!(
+                        "Saved {} without the current plugin state for {}",
+                        path.display(),
                         failed.join(", ")
-                    ));
+                    );
+                    false
                 }
-                self.project_path = Some(path);
-                true
             }
             Err(err) => {
                 self.status = format!("Could not save: {err:#}");
@@ -626,7 +664,7 @@ impl Session {
                 return;
             }
         };
-        self.audio.stop();
+        self.stop_audio_keeping_pedals();
         // Every plugin restarts from the project's state.
         let hosts: Vec<u8> = self.rack.hosts.iter().map(|h| h.slot).collect();
         for slot in hosts {
@@ -642,6 +680,7 @@ impl Session {
         }
         self.project = doc.project;
         self.history.clear();
+        self.plugins_touched = false;
         self.record_arm = None;
         self.record_region = None;
         self.project_path = Some(path.to_path_buf());
@@ -695,7 +734,7 @@ impl Session {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.history.is_dirty()
+        self.history.is_dirty() || self.plugins_touched
     }
 
     /// Suggested file name for an export, without extension.
@@ -1023,14 +1062,16 @@ impl Session {
             self.status = "This track plays the built-in piano".to_string();
             return;
         };
-        let status = match host.client.open_editor() {
-            Ok(()) => format!(
-                "{} editor opened — tracks sharing it play on their own MIDI channels",
-                host.client.name
-            ),
+        let name = host.client.name.clone();
+        let opened = host.client.open_editor();
+        self.status = match opened {
+            Ok(()) => {
+                // Whatever the user changes in there is not an undo step.
+                self.plugins_touched = true;
+                format!("{name} editor opened — tracks sharing it play on their own MIDI channels")
+            }
             Err(err) => format!("Could not open plugin editor: {err:#}"),
         };
-        self.status = status;
     }
 
     pub fn save_vst_state(&mut self) {
@@ -1161,18 +1202,43 @@ impl Session {
                 }
             }
             LiveEvent::Sustain(down) => {
-                self.sustain = down;
-                if !down {
-                    // Pedal up: everything it was holding stops ringing.
-                    self.sustained_keys.clear();
-                }
-                if self.recorder.is_recording() {
-                    self.recorder.sustain(down, at);
-                }
+                self.hw_pedal = down;
                 if send_audio {
                     self.audio.sustain(down);
                 }
+                self.pedal_changed(at);
             }
+        }
+    }
+
+    /// Musical Typing's pedal key went down or up. It is a pedal of its own:
+    /// lifting it does not lift a hardware pedal that is still down.
+    pub fn typing_sustain(&mut self, down: bool) {
+        self.typing_pedal = down;
+        self.audio.typing_sustain(down);
+        self.pedal_changed(Instant::now());
+    }
+
+    /// Whether Musical Typing's pedal key is down.
+    pub fn typing_pedal(&self) -> bool {
+        self.typing_pedal
+    }
+
+    /// Update the combined pedal after one of the two moved.
+    fn pedal_changed(&mut self, at: Instant) {
+        let down = self.hw_pedal || self.typing_pedal;
+        // The recorder hears every pedal event: it may have started a take (and
+        // reset its own pedal) while one was already held.
+        if self.recorder.is_recording() {
+            self.recorder.sustain(down, at);
+        }
+        if down == self.sustain {
+            return;
+        }
+        self.sustain = down;
+        if !down {
+            // Pedal up: everything it was holding stops ringing.
+            self.sustained_keys.clear();
         }
     }
 
@@ -1191,6 +1257,11 @@ impl Session {
     /// Advance per-frame state: drain MIDI, react to devices and plugin
     /// crashes, finish background renders, sample the engine.
     pub fn tick(&mut self) {
+        // Changes inside a plugin's editor are not undo steps: while one is open,
+        // even after a save, the project may have changed.
+        if self.rack.hosts.iter_mut().any(|h| h.client.editor_open()) {
+            self.plugins_touched = true;
+        }
         if let Some(path) = self.pending_vst.take()
             && path.exists()
         {
@@ -1752,6 +1823,93 @@ mod tests {
 
     /// Save, edit, reopen: the file brings back the tracks and mix as saved,
     /// with a clean undo stack.
+    /// Review M23: changes made inside a plugin's editor are not undo steps, so
+    /// opening the editor counts as unsaved; saving clears it. (While an editor
+    /// stays open, `tick` sets it again; that needs a running plugin host.)
+    #[test]
+    fn using_a_plugin_editor_counts_as_unsaved() {
+        let path = temp_project("plugin-touched");
+        let mut s = two_tracks();
+        s.save_project_to(path.clone());
+        assert!(!s.is_dirty());
+        s.plugins_touched = true; // what a successful open_vst_editor sets
+        assert!(s.is_dirty(), "the plugin may have changed");
+        s.save_project_to(path.clone());
+        assert!(!s.is_dirty(), "saved with the plugin's state");
+        s.plugins_touched = true;
+        s.open_path(&path);
+        assert!(!s.is_dirty(), "a freshly opened project is clean");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Review: a pedal held when the take starts (Tab), then the hardware pedal,
+    /// still holds the recorded notes until both pedals are up.
+    #[test]
+    fn a_pedal_held_into_a_take_still_sustains() {
+        let mut s = two_tracks();
+        let t0 = Instant::now();
+        s.typing_sustain(true);
+        s.toggle_record();
+        s.handle_live(LiveEvent::Sustain(true), t0, false);
+        s.handle_live(
+            LiveEvent::NoteOn {
+                key: 60,
+                velocity: 90,
+            },
+            t0,
+            false,
+        );
+        s.handle_live(
+            LiveEvent::NoteOff { key: 60 },
+            t0 + std::time::Duration::from_millis(100),
+            false,
+        );
+        s.typing_sustain(false);
+        s.handle_live(
+            LiveEvent::Sustain(false),
+            t0 + std::time::Duration::from_millis(900),
+            false,
+        );
+        let notes = s.recorder.finish(t0 + std::time::Duration::from_secs(1));
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].end - notes[0].start > 0.5,
+            "held to the pedal: {:?}",
+            notes[0]
+        );
+    }
+
+    /// Review: Stop does not lift a pedal that is still held, so a take started
+    /// after it monitors and records the pedal alike. (The engine side is
+    /// `stop_keeping_pedals_uses_the_engines_pedals`.)
+    #[test]
+    fn stop_keeps_a_held_pedal() {
+        let mut s = two_tracks();
+        s.typing_sustain(true);
+        s.stop_playback();
+        assert!(s.sustain, "Tab still held after Stop");
+        s.toggle_record();
+        let t0 = Instant::now();
+        s.handle_live(
+            LiveEvent::NoteOn {
+                key: 62,
+                velocity: 90,
+            },
+            t0,
+            false,
+        );
+        s.handle_live(LiveEvent::NoteOff { key: 62 }, t0, false);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        s.typing_sustain(false);
+        let notes = s.recorder.finish(Instant::now());
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].end - notes[0].start > 0.1,
+            "held to Tab-up: {:?}",
+            notes[0]
+        );
+    }
+
     #[test]
     fn a_saved_project_opens_as_it_was() {
         let path = temp_project("roundtrip");

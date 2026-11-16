@@ -155,6 +155,44 @@ fn dragging_a_note_edge_resizes_it(cx: &mut TestAppContext) {
     assert_eq!(app.session.history.undo_label(), Some("Resize Notes"));
 }
 
+/// Review M22: grabbing a short note's edge and moving a pixel or two leaves it
+/// as it was, instead of snapping it up to a whole grid step, and records no
+/// edit.
+#[gpui::test]
+fn a_tiny_resize_leaves_a_short_note_alone(cx: &mut TestAppContext) {
+    let mut app = app(cx);
+    // Zoomed in, so a half-grid note is wide enough to grab by its edge.
+    app.ui.roll_beat_w = sz::ROLL_BEAT_W_MAX;
+    let n = first_note(&app);
+    let grid = app.ui.edit.roll_snap.ticks(&app.session.project);
+    let short = (grid / 2).max(1);
+    let r = &mut app.session.project.tracks[0].regions[0];
+    r.notes.iter_mut().find(|m| m.id == n.id).unwrap().len = short;
+    let n = r.note(n.id).unwrap().clone();
+    let label = app.session.history.undo_label().map(str::to_owned);
+    let edge = roll_pos(&app, n.end(), n.key, -1.0);
+    piano_roll::pointer_down(&mut app, &down(edge, Modifiers::default(), 1));
+    assert!(
+        matches!(app.ui.drag, Some(crate::shell::Drag::ResizeNotes { .. })),
+        "grabbed by its edge"
+    );
+    // Out past the threshold (a preview is applied), then back within it.
+    for dx in [1.0, 1.5, 40.0, 1.0] {
+        piano_roll::pointer_move(&mut app, &drag(point(edge.x + px(dx), edge.y)));
+    }
+    piano_roll::pointer_up(&mut app);
+    let after = app.session.project.tracks[0].regions[0]
+        .note(n.id)
+        .unwrap()
+        .len;
+    assert_eq!(after, short, "still {short} ticks");
+    assert_eq!(
+        app.session.history.undo_label().map(str::to_owned),
+        label,
+        "jitter is not an edit"
+    );
+}
+
 #[gpui::test]
 fn pencil_adds_a_note_and_double_click_removes_it(cx: &mut TestAppContext) {
     let mut app = app(cx);
@@ -225,6 +263,87 @@ fn marquee_selects_notes_under_it(cx: &mut TestAppContext) {
     for id in &want {
         assert!(app.ui.edit.notes.contains(id));
     }
+}
+
+/// Review M19: with the lanes scrolled, a click lands on the lane and the time
+/// drawn under the pointer, not on the unscrolled one.
+#[gpui::test]
+fn clicks_follow_the_tracks_scroll(cx: &mut TestAppContext) {
+    let mut app = app(cx);
+    // Enough tracks to scroll past the 300 px view.
+    for _ in 0..8 {
+        editing::new_track(&mut app.session, &mut app.ui.edit);
+    }
+    let n = app.session.project.tracks.len();
+    assert!(n as f32 * sz::LANE_H > 300.0 - sz::RULER_TRACKS_H);
+    // Scroll down one lane with the wheel; it stops at the last lane.
+    tracks::scroll_by(&mut app, 0.0, -sz::LANE_H, false, false);
+    assert_eq!(app.ui.tracks_scroll_y, sz::LANE_H);
+    tracks::scroll_by(&mut app, 0.0, -100_000.0, false, false);
+    let max = n as f32 * sz::LANE_H - (300.0 - sz::RULER_TRACKS_H);
+    assert_eq!(app.ui.tracks_scroll_y, max, "stops at the last lane");
+    tracks::scroll_by(&mut app, 0.0, 100_000.0, false, false);
+    assert_eq!(app.ui.tracks_scroll_y, 0.0);
+
+    // Three lanes down: the top visible lane is track 4, a new empty one.
+    tracks::scroll_by(&mut app, 0.0, -3.0 * sz::LANE_H, false, false);
+    let at = point(
+        px(TRACKS_ORIGIN.0 + 20.0),
+        px(TRACKS_ORIGIN.1 + sz::RULER_TRACKS_H + 10.0),
+    );
+    tracks::pointer_down(&mut app, &down(at, Modifiers::default(), 1));
+    tracks::pointer_up(&mut app, at);
+    let fourth = app.session.project.tracks[3].id;
+    assert_eq!(app.ui.edit.track, Some(fourth), "the lane drawn there");
+
+    // Scrolled a bar to the right, the Pencil draws in bar 2, not bar 1.
+    let bar = app.session.project.ticks_per_bar();
+    let beats = bar as f32 / app.session.project.ticks_per_beat() as f32;
+    let one_bar = beats * app.ui.tracks_beat_w;
+    tracks::scroll_by(&mut app, 0.0, -one_bar, false, true);
+    app.ui.edit.tracks_tool = Tool::Pencil;
+    let at = point(px(TRACKS_ORIGIN.0 + 2.0), at.y);
+    tracks::pointer_down(&mut app, &down(at, Modifiers::default(), 1));
+    tracks::pointer_up(&mut app, at);
+    let made = app.session.project.track(fourth).unwrap().regions.clone();
+    assert_eq!(made.len(), 1, "drawn on the fourth track");
+    assert_eq!(made[0].start, bar, "in bar 2");
+}
+
+/// Review: the wheel does not scroll the lanes under a region being dragged,
+/// which would drop it on another track than the one under the pointer.
+#[gpui::test]
+fn the_wheel_waits_for_a_region_drag(cx: &mut TestAppContext) {
+    let mut app = app(cx);
+    for _ in 0..8 {
+        editing::new_track(&mut app.session, &mut app.ui.edit);
+    }
+    let start = point(
+        px(TRACKS_ORIGIN.0 + 20.0),
+        px(TRACKS_ORIGIN.1 + sz::RULER_TRACKS_H + 20.0),
+    );
+    tracks::pointer_down(&mut app, &down(start, Modifiers::default(), 1));
+    assert!(matches!(
+        app.ui.drag,
+        Some(crate::shell::Drag::MoveRegions { .. })
+    ));
+    tracks::scroll_by(&mut app, 0.0, -sz::LANE_H, false, false);
+    tracks::scroll_by(&mut app, 0.0, -100.0, false, true);
+    assert_eq!((app.ui.tracks_scroll_x, app.ui.tracks_scroll_y), (0.0, 0.0));
+    tracks::pointer_up(&mut app, start);
+    tracks::scroll_by(&mut app, 0.0, -sz::LANE_H, false, false);
+    assert_eq!(app.ui.tracks_scroll_y, sz::LANE_H, "scrolls again after");
+}
+
+/// A replaced project starts at bar 1 and its first track, wherever the last
+/// one was scrolled to.
+#[gpui::test]
+fn a_new_project_resets_the_tracks_scroll(cx: &mut TestAppContext) {
+    let mut app = app(cx);
+    app.ui.tracks_scroll_x = 5_000.0;
+    app.ui.tracks_scroll_y = 200.0;
+    app.after_project_replaced();
+    assert_eq!((app.ui.tracks_scroll_x, app.ui.tracks_scroll_y), (0.0, 0.0));
 }
 
 #[gpui::test]
@@ -475,6 +594,123 @@ fn musical_typing_letters_are_notes_not_shortcuts(cx: &mut TestAppContext) {
     assert!(!view.read_with(vcx, |a, _| a.ui.musical_typing));
     vcx.simulate_keystrokes("e");
     assert_eq!(view.read_with(vcx, |a, _| a.ui.show_editor), !editor);
+}
+
+fn key(key: &str, shift: bool) -> gpui::Keystroke {
+    gpui::Keystroke {
+        modifiers: Modifiers {
+            shift,
+            ..Default::default()
+        },
+        key: key.into(),
+        key_char: None,
+    }
+}
+
+fn press(vcx: &mut gpui::VisualTestContext, k: &str, shift: bool) {
+    vcx.simulate_event(gpui::KeyDownEvent {
+        keystroke: key(k, shift),
+        is_held: false,
+    });
+}
+
+fn release(vcx: &mut gpui::VisualTestContext, k: &str) {
+    vcx.simulate_event(gpui::KeyUpEvent {
+        keystroke: key(k, false),
+    });
+}
+
+/// Review M20: Shift is a modifier (Shift-click, ⇧⌘S), never the sustain pedal.
+#[gpui::test]
+fn shift_is_not_the_sustain_pedal(cx: &mut TestAppContext) {
+    let (view, vcx) = window(cx);
+    press(vcx, "shift", true);
+    assert!(!view.read_with(vcx, |a, _| a.session.sustain), "Shift down");
+    // A pedal held on a keyboard is not lifted by letting go of Shift.
+    view.update(vcx, |a, _| {
+        a.session.handle_live(
+            surf_midi::LiveEvent::Sustain(true),
+            std::time::Instant::now(),
+            true,
+        )
+    });
+    release(vcx, "shift");
+    assert!(
+        view.read_with(vcx, |a, _| a.session.sustain),
+        "hardware pedal kept"
+    );
+}
+
+/// Musical Typing's pedal is Tab: down while held, and lifting it lifts only the
+/// pedal it put down.
+#[gpui::test]
+fn tab_is_the_musical_typing_pedal(cx: &mut TestAppContext) {
+    let (view, vcx) = window(cx);
+    vcx.simulate_keystrokes("secondary-k");
+    press(vcx, "tab", false);
+    assert!(view.read_with(vcx, |a, _| a.session.sustain), "Tab down");
+    release(vcx, "tab");
+    assert!(!view.read_with(vcx, |a, _| a.session.sustain), "Tab up");
+    // A hardware pedal already down: Tab neither takes it over nor lifts it.
+    view.update(vcx, |a, _| {
+        a.session.handle_live(
+            surf_midi::LiveEvent::Sustain(true),
+            std::time::Instant::now(),
+            true,
+        )
+    });
+    press(vcx, "tab", false);
+    release(vcx, "tab");
+    assert!(
+        view.read_with(vcx, |a, _| a.session.sustain),
+        "hardware pedal kept"
+    );
+    // Tab first, then the hardware pedal: letting go of Tab keeps the pedal.
+    let hw = |vcx: &mut gpui::VisualTestContext, down: bool| {
+        view.update(vcx, |a, _| {
+            a.session.handle_live(
+                surf_midi::LiveEvent::Sustain(down),
+                std::time::Instant::now(),
+                true,
+            )
+        })
+    };
+    hw(vcx, false);
+    press(vcx, "tab", false);
+    hw(vcx, true);
+    release(vcx, "tab");
+    assert!(
+        view.read_with(vcx, |a, _| a.session.sustain),
+        "pedal still held"
+    );
+    hw(vcx, false);
+    assert!(!view.read_with(vcx, |a, _| a.session.sustain), "both up");
+}
+
+/// Review M21: with Musical Typing on (recording turns it on), R still stops
+/// recording and the transport keys still work.
+#[gpui::test]
+fn transport_keys_work_while_typing(cx: &mut TestAppContext) {
+    let (view, vcx) = window(cx);
+    vcx.simulate_keystrokes("secondary-k");
+    assert!(view.read_with(vcx, |a, _| a.ui.musical_typing));
+    vcx.simulate_keystrokes("r");
+    assert!(
+        view.read_with(vcx, |a, _| a.session.is_recording()),
+        "R starts"
+    );
+    vcx.simulate_keystrokes("r");
+    assert!(
+        !view.read_with(vcx, |a, _| a.session.is_recording()),
+        "R stops"
+    );
+    // Other letters stay notes: M plays nothing, mutes nothing.
+    let muted = view.read_with(vcx, |a, _| a.session.project.tracks[0].mute);
+    vcx.simulate_keystrokes("m");
+    assert_eq!(
+        view.read_with(vcx, |a, _| a.session.project.tracks[0].mute),
+        muted
+    );
 }
 
 /// The in-window menu bar is built from the same menus macOS gets, and its

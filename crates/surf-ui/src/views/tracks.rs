@@ -161,6 +161,7 @@ fn zoom_buttons(cx: &mut Context<SurfApp>) -> impl IntoElement {
 
 fn headers(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
     let p = &app.session.project;
+    let scroll_y = Geom::of(app).scroll_y;
     let selected = app.ui.edit.track;
     let armed = app.session.record_track();
     let recording = app.session.is_recording();
@@ -293,7 +294,11 @@ fn headers(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
         .bg(color::HEAD)
         .border_r_1()
         .border_color(color::LINE)
-        .overflow_y_scroll()
+        .overflow_hidden()
+        .on_scroll_wheel(cx.listener(|this, e: &ScrollWheelEvent, window, cx| {
+            wheel(this, e, window);
+            cx.notify();
+        }))
         .child(
             div()
                 .flex()
@@ -331,7 +336,17 @@ fn headers(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
                 .child(div().flex_1())
                 .child(label("Global ▸").opacity(0.4)),
         )
-        .children(rows)
+        // Rows scroll with the lanes beside them.
+        .child(
+            div().flex_1().min_h(px(0.0)).overflow_hidden().child(
+                div()
+                    .relative()
+                    .top(px(-scroll_y))
+                    .flex()
+                    .flex_col()
+                    .children(rows),
+            ),
+        )
 }
 
 fn track_toggle(
@@ -361,15 +376,36 @@ fn track_toggle(
 struct Geom {
     origin: Point<Pixels>,
     tick_w: f32,
+    scroll_x: f32,
+    scroll_y: f32,
+}
+
+/// How far the lanes can scroll down: until the last lane's bottom reaches the
+/// bottom of a view `view_h` tall.
+fn max_scroll_y(tracks: usize, view_h: f32) -> f32 {
+    (tracks as f32 * size::LANE_H - (view_h - size::RULER_TRACKS_H)).max(0.0)
 }
 
 impl Geom {
     fn of(app: &SurfApp) -> Self {
         let p = &app.session.project;
+        let b = app.ui.tracks_bounds.get();
+        // Clamped here, so painting and hit testing agree after tracks go away.
+        let max_y = max_scroll_y(p.tracks.len(), f32::from(b.size.height));
         Self {
-            origin: app.ui.tracks_bounds.get().origin,
+            origin: b.origin,
             tick_w: app.ui.tracks_beat_w / p.ticks_per_beat() as f32,
+            scroll_x: app.ui.tracks_scroll_x.max(0.0),
+            scroll_y: app.ui.tracks_scroll_y.clamp(0.0, max_y),
         }
+    }
+    /// Ticks (fractional) under local x.
+    fn tick_f(&self, x: f32) -> f32 {
+        (x + self.scroll_x) / self.tick_w
+    }
+    /// Local y of the top of lane `i`.
+    fn lane_y(&self, i: usize) -> f32 {
+        size::RULER_TRACKS_H + i as f32 * size::LANE_H - self.scroll_y
     }
     fn local(&self, pos: Point<Pixels>) -> (f32, f32) {
         (
@@ -378,11 +414,13 @@ impl Geom {
         )
     }
     fn tick_at(&self, x: f32) -> u64 {
-        (x / self.tick_w).max(0.0) as u64
+        self.tick_f(x).max(0.0) as u64
     }
     fn track_at(&self, y: f32) -> Option<usize> {
-        let y = y - size::RULER_TRACKS_H;
-        (y >= 0.0).then(|| (y / size::LANE_H) as usize)
+        if y < size::RULER_TRACKS_H {
+            return None;
+        }
+        Some(((y - size::RULER_TRACKS_H + self.scroll_y) / size::LANE_H) as usize)
     }
 }
 
@@ -403,7 +441,7 @@ fn hit(p: &Project, g: &Geom, x: f32, y: f32) -> Hit {
     let Some(t) = p.tracks.get(ti) else {
         return Hit::Nothing;
     };
-    let tick = x / g.tick_w;
+    let tick = g.tick_f(x);
     for r in t.regions.iter().rev() {
         let (a, b) = (r.start as f32, r.end() as f32);
         if tick >= a && tick <= b {
@@ -435,6 +473,8 @@ fn timeline(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
     let selected_track = app.ui.edit.track;
     let marquee = app.ui.marquee;
     let bounds_cell = app.ui.tracks_bounds.clone();
+    let g = Geom::of(app);
+    let (scroll_x, scroll_y) = (g.scroll_x, g.scroll_y);
 
     let paint = move |bounds: Bounds<Pixels>, _: (), window: &mut Window, cx: &mut gpui::App| {
         bounds_cell.set(bounds);
@@ -442,11 +482,12 @@ fn timeline(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
         let w = f32::from(bounds.size.width);
         let h = f32::from(bounds.size.height);
         let ruler = size::RULER_TRACKS_H;
-        let x_of = |tick: f32| o.x + px(tick * tick_w);
+        let x_of = |tick: f32| o.x + px(tick * tick_w - scroll_x);
+        let lane_top = |i: usize| ruler + i as f32 * size::LANE_H - scroll_y;
 
         window.paint_quad(fill(bounds, color::LANE));
         for (i, t) in p.tracks.iter().enumerate() {
-            let y = o.y + px(ruler + i as f32 * size::LANE_H);
+            let y = o.y + px(lane_top(i));
             if selected_track == Some(t.id) {
                 window.paint_quad(fill(
                     Bounds::new(point(o.x, y), gsize(px(w), px(size::LANE_H))),
@@ -462,14 +503,16 @@ fn timeline(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
             ));
         }
         // Grid: bars brighter than beats; beats hidden when zoomed far out.
-        let total_beats = (w / beat_w).ceil() as i64 + 1;
         let step = if beat_w < 8.0 { per_bar as i64 } else { 1 };
-        let mut b = 0;
-        while b <= total_beats {
+        // Start at the first visible line, on the step's own grid.
+        let first = (scroll_x / beat_w).floor() as i64;
+        let mut b = first - first.rem_euclid(step);
+        let last = ((scroll_x + w) / beat_w).ceil() as i64 + 1;
+        while b <= last {
             let bar = b as f64 % per_bar == 0.0;
             window.paint_quad(fill(
                 Bounds::new(
-                    point(o.x + px(b as f32 * beat_w), o.y + px(ruler)),
+                    point(o.x + px(b as f32 * beat_w - scroll_x), o.y + px(ruler)),
                     gsize(px(1.0), px(h - ruler)),
                 ),
                 if bar {
@@ -494,7 +537,7 @@ fn timeline(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
         for (i, t) in p.tracks.iter().enumerate() {
             let tc = views::track_color(t);
             let audible = p.audible(t);
-            let ry = o.y + px(ruler + i as f32 * size::LANE_H + 2.0);
+            let ry = o.y + px(lane_top(i) + 2.0);
             let rh = size::LANE_H - 5.0;
             for r in &t.regions {
                 let x = x_of(r.start as f32);
@@ -556,7 +599,7 @@ fn timeline(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
                 let rw = (playhead * tick_w).max(2.0);
                 window.paint_quad(
                     fill(
-                        Bounds::new(point(o.x, ry), gsize(px(rw), px(rh))),
+                        Bounds::new(point(x_of(0.0), ry), gsize(px(rw), px(rh))),
                         with_alpha(color::RECORD, 0.4),
                     )
                     .corner_radii(px(radius::SM))
@@ -574,15 +617,24 @@ fn timeline(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
                     .border_color(with_alpha(color::ACCENT_FG, 0.7)),
             );
         }
-        ruler_paint(
-            window,
-            cx,
-            o,
-            w,
-            ruler,
-            beat_w,
-            per_bar,
-            looping.then(|| p.end() as f64 / p.ticks_per_beat() as f64),
+        // The ruler scrolls in time with the lanes; clip it to the view.
+        window.with_content_mask(
+            Some(gpui::ContentMask {
+                bounds: Bounds::new(o, gsize(px(w), px(ruler))),
+            }),
+            |window| {
+                ruler_paint(
+                    window,
+                    cx,
+                    o,
+                    w,
+                    ruler,
+                    beat_w,
+                    per_bar,
+                    looping.then(|| p.end() as f64 / p.ticks_per_beat() as f64),
+                    scroll_x,
+                );
+            },
         );
         let phx = x_of(playhead);
         window.paint_quad(fill(
@@ -620,14 +672,41 @@ fn timeline(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
             }),
         )
         .on_scroll_wheel(cx.listener(|this, e: &ScrollWheelEvent, window, cx| {
-            if e.modifiers.secondary() {
-                let dy = f32::from(e.delta.pixel_delta(window.line_height()).y);
-                let factor = if dy > 0.0 { 1.1 } else { 1.0 / 1.1 };
-                this.ui.tracks_beat_w = (this.ui.tracks_beat_w * factor)
-                    .clamp(size::TRACKS_BEAT_W_MIN, size::TRACKS_BEAT_W_MAX);
-                cx.notify();
-            }
+            wheel(this, e, window);
+            cx.notify();
         }))
+}
+
+/// The wheel over the tracks area: ⌘ zooms, Shift (or a sideways swipe)
+/// scrolls in time, otherwise it scrolls the lanes and headers together.
+fn wheel(app: &mut SurfApp, e: &ScrollWheelEvent, window: &Window) {
+    let d = e.delta.pixel_delta(window.line_height());
+    let (dx, dy) = (f32::from(d.x), f32::from(d.y));
+    scroll_by(app, dx, dy, e.modifiers.secondary(), e.modifiers.shift);
+}
+
+pub(crate) fn scroll_by(app: &mut SurfApp, dx: f32, dy: f32, zoom: bool, sideways: bool) {
+    // A move, resize or marquee is anchored to where the drag began on screen:
+    // scrolling or zooming under it would drop it on the wrong track or time.
+    if matches!(
+        app.ui.drag,
+        Some(Drag::MoveRegions { .. } | Drag::ResizeRegion { .. } | Drag::Marquee { tracks: true })
+    ) {
+        return;
+    }
+    if zoom {
+        let factor = if dy > 0.0 { 1.1 } else { 1.0 / 1.1 };
+        app.ui.tracks_beat_w =
+            (app.ui.tracks_beat_w * factor).clamp(size::TRACKS_BEAT_W_MIN, size::TRACKS_BEAT_W_MAX);
+    } else if sideways || dx.abs() > dy.abs() {
+        let delta = if dx.abs() > dy.abs() { dx } else { dy };
+        app.ui.tracks_scroll_x = (app.ui.tracks_scroll_x - delta).max(0.0);
+    } else {
+        let g = Geom::of(app);
+        let h = f32::from(app.ui.tracks_bounds.get().size.height);
+        let max_y = max_scroll_y(app.session.project.tracks.len(), h);
+        app.ui.tracks_scroll_y = (g.scroll_y - dy).clamp(0.0, max_y);
+    }
 }
 
 fn cursor_for(app: &SurfApp) -> gpui::CursorStyle {
@@ -747,7 +826,7 @@ pub(crate) fn pointer_move(app: &mut SurfApp, e: &MouseMoveEvent) -> bool {
             let p = &app.session.project;
             let mut picked = Vec::new();
             for (i, t) in p.tracks.iter().enumerate() {
-                let top = size::RULER_TRACKS_H + i as f32 * size::LANE_H;
+                let top = g.lane_y(i);
                 if top + size::LANE_H < y0 || top > y1 {
                     continue;
                 }
@@ -850,7 +929,9 @@ fn copy_regions(p: &mut Project, regions: &[Id], ticks: i64, tracks: i32) -> Edi
     Edit::Batch(edits)
 }
 
-/// Ruler shared by the tracks area and the piano roll.
+/// Ruler shared by the tracks area and the piano roll: `w` wide at `o`,
+/// scrolled `scroll` pixels right of bar 1. Only the bars in view are drawn,
+/// so the cost follows the view's width.
 #[allow(clippy::too_many_arguments)]
 pub fn ruler_paint(
     window: &mut Window,
@@ -861,6 +942,7 @@ pub fn ruler_paint(
     beat_w: f32,
     per_bar: f64,
     cycle_beats: Option<f64>,
+    scroll: f32,
 ) {
     window.paint_quad(fill(Bounds::new(o, gsize(px(w), px(h))), color::CHROME));
     window.paint_quad(fill(
@@ -871,7 +953,7 @@ pub fn ruler_paint(
         window.paint_quad(
             fill(
                 Bounds::new(
-                    point(o.x, o.y + px(3.0)),
+                    point(o.x - px(scroll), o.y + px(3.0)),
                     gsize(px(end as f32 * beat_w), px(9.0)),
                 ),
                 color::CYCLE,
@@ -887,9 +969,10 @@ pub fn ruler_paint(
     } else {
         1
     };
-    let bars = (w / bar_w).ceil() as i64 + 1;
-    for bar in 0..=bars {
-        let x = o.x + px(bar as f32 * bar_w);
+    let first = (scroll / bar_w).floor().max(0.0) as i64;
+    let last = ((scroll + w) / bar_w).ceil() as i64 + 1;
+    for bar in first..=last {
+        let x = o.x + px(bar as f32 * bar_w - scroll);
         window.paint_quad(fill(
             Bounds::new(point(x, o.y + px(h - 12.0)), gsize(px(1.0), px(11.0))),
             color::TEXT_DISABLED,

@@ -667,12 +667,13 @@ fn grid(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
                 tracks::ruler_paint(
                     window,
                     cx,
-                    point(gx - px(scroll_x), o.y),
-                    w + scroll_x,
+                    point(gx, o.y),
+                    w - keys_w,
                     ruler,
                     beat_w,
                     per_bar,
                     None,
+                    scroll_x,
                 );
                 if let Some((tc, r)) = &region {
                     window.paint_quad(fill(
@@ -1017,6 +1018,13 @@ pub(crate) fn pointer_move(app: &mut SurfApp, e: &MouseMoveEvent) -> bool {
             );
         }
         Drag::ResizeNotes { x0, notes } => {
+            // A click on the edge, or a pixel of jitter, is not a resize; coming
+            // back within it undoes the preview, so letting go keeps the length.
+            if (x - x0).abs() < DRAG_SLOP {
+                app.session.history.cancel(&mut app.session.project);
+                app.session.project_changed();
+                return true;
+            }
             let delta = snap(((x - x0) / g.tick_w) as f64, grid);
             app.session.preview(
                 "Resize Notes",

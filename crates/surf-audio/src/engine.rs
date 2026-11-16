@@ -42,7 +42,11 @@ pub enum Command {
     NoteOff {
         key: u8,
     },
+    /// The hardware sustain pedal.
     Sustain(bool),
+    /// Musical Typing's pedal key. Held together with the hardware pedal, the
+    /// pedal stays down until both are up.
+    TypingSustain(bool),
     AllNotesOff,
     /// Put an instrument in a slot, or empty it.
     SetSlot {
@@ -54,6 +58,13 @@ pub enum Command {
     },
     /// The route of every track, by track index (`TimedNote::track`).
     SetRoutes(Vec<Route>),
+    /// New routes and live-input track together, as one change: a held pedal
+    /// moves only from the old input route to the final one, never through an
+    /// in-between pairing of new routes with the old input index.
+    SetRoutesAndInput {
+        routes: Vec<Route>,
+        input: u16,
+    },
     /// Linear output gain of a slot: the track's fader, or for a shared
     /// plugin the loudest of its tracks.
     SetSlotGain {
@@ -82,6 +93,10 @@ pub enum Command {
     Pause,
     Resume,
     Stop,
+    /// `Stop`, but the pedals the player holds stay down (around a take). The
+    /// engine's own pedal state is used, so a pedal-up already queued ahead of
+    /// this is not undone.
+    StopKeepingPedals,
     Seek(f64),
     SetLoop(bool),
     SetVolume(f32),
@@ -157,7 +172,9 @@ struct Core {
     /// Where each live key went, so its note-off follows it even if the
     /// input track changes while the key is down.
     held: [Option<Route>; 128],
-    sustain: bool,
+    /// Which pedals are down: `HW_PEDAL` and `TYPING_PEDAL`. The instrument's
+    /// pedal is down while any is.
+    pedals: u8,
     timeline: Option<Timeline>,
     next_note: usize,
     active: Vec<ActiveNote>,
@@ -205,7 +222,7 @@ impl Core {
             routes: Vec::new(),
             input: 0,
             held: [None; 128],
-            sustain: false,
+            pedals: 0,
             timeline: None,
             next_note: 0,
             active: Vec::with_capacity(MAX_ACTIVE),
@@ -243,7 +260,52 @@ impl Core {
         // release of one must not be held back on behalf of a silenced note.
         self.active.clear();
         self.held = [None; 128];
-        self.sustain = false;
+        self.pedals = 0;
+    }
+
+    fn sustain(&self) -> bool {
+        self.pedals != 0
+    }
+
+    /// The live input moved from `before` to the current input route (a new
+    /// input track, or new routes): a held pedal follows it.
+    fn hand_pedal_over(&mut self, before: Route) {
+        let now = self.route(self.input);
+        if self.sustain() && before != now {
+            if let Some(i) = self.slot(before) {
+                i.set_sustain(before.channel, false);
+            }
+            if let Some(i) = self.slot(now) {
+                i.set_sustain(now.channel, true);
+            }
+        }
+    }
+
+    fn stop(&mut self) {
+        self.playing = false;
+        self.pos_frames = 0;
+        self.next_note = 0;
+        self.active.clear();
+        self.all_notes_off();
+        self.shared.playing.store(false, Ordering::Release);
+        self.shared.position_frames.store(0, Ordering::Release);
+    }
+
+    /// Set one pedal; the instrument hears only the combined pedal changing.
+    fn set_pedal(&mut self, which: u8, down: bool) {
+        let was = self.sustain();
+        if down {
+            self.pedals |= which;
+        } else {
+            self.pedals &= !which;
+        }
+        let now = self.sustain();
+        if now != was {
+            let route = self.route(self.input);
+            if let Some(i) = self.slot(route) {
+                i.set_sustain(route.channel, now);
+            }
+        }
     }
 
     /// Whether a playback note or the player is sounding `key` on `route`.
@@ -332,13 +394,8 @@ impl Core {
                     i.note_off(route.channel, key);
                 }
             }
-            Command::Sustain(down) => {
-                self.sustain = down;
-                let route = self.route(self.input);
-                if let Some(i) = self.slot(route) {
-                    i.set_sustain(route.channel, down);
-                }
-            }
+            Command::Sustain(down) => self.set_pedal(HW_PEDAL, down),
+            Command::TypingSustain(down) => self.set_pedal(TYPING_PEDAL, down),
             Command::AllNotesOff => self.all_notes_off(),
             Command::SetSlot {
                 slot,
@@ -355,32 +412,41 @@ impl Core {
                     });
                     // Notes on the old instrument are gone with it.
                     self.active.retain(|n| n.route.slot != slot);
+                    // A pedal still held reaches the instrument that replaced it.
+                    let input = self.route(self.input);
+                    if self.sustain()
+                        && input.slot == slot
+                        && let Some(i) = self.slot(input)
+                    {
+                        i.set_sustain(input.channel, true);
+                    }
                 }
                 if let Some(ack) = ack {
                     let _ = ack.send(());
                 }
             }
             Command::SetRoutes(routes) => {
+                let before = self.route(self.input);
                 let old = std::mem::replace(&mut self.routes, routes);
                 self.retire(Retired::Routes(old));
+                self.hand_pedal_over(before);
             }
             Command::SetSlotGain { slot, gain } => {
                 if let Some(g) = self.gains.get_mut(slot as usize) {
                     *g = gain.clamp(0.0, 2.0);
                 }
             }
+            Command::SetRoutesAndInput { routes, input } => {
+                let before = self.route(self.input);
+                let old = std::mem::replace(&mut self.routes, routes);
+                self.input = input;
+                self.retire(Retired::Routes(old));
+                self.hand_pedal_over(before);
+            }
             Command::SetInput(track) => {
-                let (old, new) = (self.route(self.input), self.route(track));
+                let before = self.route(self.input);
                 self.input = track;
-                // Hand the pedal over to the new instrument.
-                if self.sustain && old != new {
-                    if let Some(i) = self.slot(old) {
-                        i.set_sustain(old.channel, false);
-                    }
-                    if let Some(i) = self.slot(new) {
-                        i.set_sustain(new.channel, true);
-                    }
-                }
+                self.hand_pedal_over(before);
             }
             Command::ControlChange {
                 slot,
@@ -418,14 +484,16 @@ impl Core {
                     self.shared.playing.store(true, Ordering::Release);
                 }
             }
-            Command::Stop => {
-                self.playing = false;
-                self.pos_frames = 0;
-                self.next_note = 0;
-                self.active.clear();
-                self.all_notes_off();
-                self.shared.playing.store(false, Ordering::Release);
-                self.shared.position_frames.store(0, Ordering::Release);
+            Command::Stop => self.stop(),
+            Command::StopKeepingPedals => {
+                let pedals = self.pedals;
+                self.stop();
+                // all_notes_off lifted the instrument's pedal: put it back down.
+                for which in [HW_PEDAL, TYPING_PEDAL] {
+                    if pedals & which != 0 {
+                        self.set_pedal(which, true);
+                    }
+                }
             }
             Command::Seek(sec) => {
                 let sec = sec.max(0.0);
@@ -567,7 +635,10 @@ impl Core {
         while let Some(command) = rx.try_recv() {
             let retires = matches!(
                 command,
-                Command::Play { .. } | Command::Update { .. } | Command::SetRoutes(_)
+                Command::Play { .. }
+                    | Command::Update { .. }
+                    | Command::SetRoutes(_)
+                    | Command::SetRoutesAndInput { .. }
             );
             if retires && !self.has_retire_room() {
                 self.deferred = Some(command);
@@ -969,6 +1040,10 @@ impl AudioEngine {
         self.send(Command::Sustain(down));
     }
 
+    pub fn typing_sustain(&self, down: bool) {
+        self.send(Command::TypingSustain(down));
+    }
+
     pub fn play(&self, timeline: Timeline, from: f64) {
         self.send(Command::Play { timeline, from });
     }
@@ -988,6 +1063,11 @@ impl AudioEngine {
 
     pub fn stop(&self) {
         self.send(Command::Stop);
+    }
+
+    /// Stop, keeping the pedals that are down (see [`Command::StopKeepingPedals`]).
+    pub fn stop_keeping_pedals(&self) {
+        self.send(Command::StopKeepingPedals);
     }
 
     pub fn seek(&self, sec: f64) {
@@ -1028,6 +1108,9 @@ impl AudioEngine {
         }
     }
 }
+
+const HW_PEDAL: u8 = 1;
+const TYPING_PEDAL: u8 = 2;
 
 /// Commands the bounded queue holds. The callback drains it every block, so it
 /// only fills if the device stops calling back.
@@ -1587,12 +1670,110 @@ mod tests {
                 .any(|e| e == "all off" || e == "pedal false" || e == "off 50"),
             "{calls:?}"
         );
-        assert!(c.sustain, "pedal still down");
+        assert!(c.sustain(), "pedal still down");
         assert!(c.held[50].is_some(), "key still held");
         assert!(
             calls.iter().filter(|e| *e == "on 72").count() >= 2,
             "playback looped: {calls:?}"
         );
+    }
+
+    /// Review: the hardware pedal and Musical Typing's are held together; the
+    /// instrument's pedal lifts only once both are up, whichever goes first.
+    #[test]
+    fn hardware_and_typing_pedals_combine() {
+        let (mut c, calls) = recorder_core();
+        c.apply(Command::TypingSustain(true));
+        c.apply(Command::Sustain(true));
+        c.apply(Command::TypingSustain(false));
+        assert_eq!(*calls.lock(), ["pedal true"], "Tab up kept the pedal");
+        c.apply(Command::Sustain(false));
+        assert_eq!(*calls.lock(), ["pedal true", "pedal false"]);
+        calls.lock().clear();
+        c.apply(Command::Sustain(true));
+        c.apply(Command::TypingSustain(true));
+        c.apply(Command::Sustain(false));
+        assert_eq!(*calls.lock(), ["pedal true"], "pedal up kept Tab's");
+        c.apply(Command::TypingSustain(false));
+        assert_eq!(*calls.lock(), ["pedal true", "pedal false"]);
+    }
+
+    /// Review: stopping around a take keeps the pedals held then, by the
+    /// engine's own state: a pedal-up queued just before is not undone.
+    #[test]
+    fn stop_keeping_pedals_uses_the_engines_pedals() {
+        let (mut c, calls) = recorder_core();
+        c.apply(Command::TypingSustain(true));
+        c.apply(Command::StopKeepingPedals);
+        assert!(c.sustain(), "Tab still held");
+        assert_eq!(
+            *calls.lock(),
+            ["pedal true", "all off", "pedal true"],
+            "the instrument's pedal is put back"
+        );
+        calls.lock().clear();
+        c.apply(Command::TypingSustain(false));
+        c.apply(Command::Sustain(true));
+        c.apply(Command::Sustain(false));
+        c.apply(Command::StopKeepingPedals);
+        assert!(!c.sustain(), "released before the stop: stays up");
+        assert!(!calls.lock().iter().skip(3).any(|e| e == "pedal true"));
+    }
+
+    /// Review: a pedal held while the input's instrument is replaced (a project
+    /// reopened, a plugin reloaded) holds the new instrument too.
+    #[test]
+    fn a_held_pedal_reaches_a_replaced_instrument() {
+        let (mut c, calls) = recorder_core();
+        c.apply(Command::Sustain(true));
+        let fresh: Calls = Default::default();
+        c.apply(Command::SetSlot {
+            slot: 1,
+            instrument: Some(Box::new(Recorder(fresh.clone()))),
+            ack: None,
+        });
+        assert_eq!(*fresh.lock(), ["pedal true"]);
+        assert!(
+            calls.lock().contains(&"all off".to_string()),
+            "old one silenced"
+        );
+        // Routes that move the input to another channel take the pedal along.
+        fresh.lock().clear();
+        c.apply(Command::SetRoutes(vec![Route {
+            slot: 1,
+            channel: 3,
+        }]));
+        assert_eq!(*fresh.lock(), ["pedal false", "pedal true"]);
+    }
+
+    /// Review: deleting an earlier track shifts both the routes and the input
+    /// index. Applied together, the instrument the input stays on keeps its
+    /// pedal: no up-down blip that would release a sustained note.
+    #[test]
+    fn routes_and_input_move_together() {
+        let (mut c, calls) = recorder_core();
+        c.apply(Command::SetRoutes(vec![
+            Route {
+                slot: 0,
+                channel: 0,
+            },
+            Route {
+                slot: 1,
+                channel: 0,
+            },
+        ]));
+        c.apply(Command::SetInput(1));
+        c.apply(Command::Sustain(true));
+        calls.lock().clear();
+        // Track 0 deleted: track 1 (slot 1) is now index 0.
+        c.apply(Command::SetRoutesAndInput {
+            routes: vec![Route {
+                slot: 1,
+                channel: 0,
+            }],
+            input: 0,
+        });
+        assert!(calls.lock().is_empty(), "{:?}", calls.lock());
     }
 
     /// Stop still resets everything, pedal included.
@@ -1601,7 +1782,7 @@ mod tests {
         let (mut c, calls) = recorder_core();
         c.apply(Command::Sustain(true));
         c.apply(Command::Stop);
-        assert!(!c.sustain);
+        assert!(!c.sustain());
         assert!(calls.lock().contains(&"all off".to_string()));
     }
 

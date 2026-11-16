@@ -74,6 +74,10 @@ pub struct Ui {
     pub track_open: bool,
     /// Tracks-area zoom: pixels per beat.
     pub tracks_beat_w: f32,
+    /// Tracks-area scroll, in pixels: right of bar 1, and below the first lane.
+    /// The headers follow the vertical one.
+    pub tracks_scroll_x: f32,
+    pub tracks_scroll_y: f32,
     /// Piano-roll zoom and scroll.
     pub roll_beat_w: f32,
     pub roll_top_key: u8,
@@ -163,6 +167,8 @@ impl Default for Ui {
             region_open: true,
             track_open: false,
             tracks_beat_w: size::TRACKS_BEAT_W,
+            tracks_scroll_x: 0.0,
+            tracks_scroll_y: 0.0,
             roll_beat_w: size::ROLL_BEAT_W,
             roll_top_key: 86,
             roll_scroll_x: 0.0,
@@ -301,6 +307,9 @@ impl SurfApp {
     /// Reset the editors after the whole project was replaced.
     pub fn after_project_replaced(&mut self) {
         self.ui.edit = Editing::default();
+        // A new project starts at bar 1 and its first track.
+        self.ui.tracks_scroll_x = 0.0;
+        self.ui.tracks_scroll_y = 0.0;
         self.ui.edit.reconcile(&self.session.project);
         self.center_roll_on_song();
     }
@@ -397,6 +406,15 @@ impl SurfApp {
         let cmd = ks.modifiers.secondary();
 
         if self.ui.musical_typing && !cmd {
+            // Tab is the sustain pedal, as in Logic's Musical Typing.
+            if key == TYPING_PEDAL_KEY {
+                // A pedal of its own: held with the hardware pedal, the pedal
+                // stays down until both are up.
+                if !event.is_held && !self.session.typing_pedal() {
+                    self.session.typing_sustain(true);
+                }
+                return;
+            }
             if let Some(note) = typing_note(&key, self.ui.typing_octave) {
                 if !event.is_held && self.ui.typing_keys.insert(key, note).is_none() {
                     self.session.handle_live(
@@ -452,20 +470,14 @@ impl SurfApp {
                 }
                 self.ui.marquee = None;
             }
-            // Shift doubles as a sustain pedal when no pedal is plugged in.
-            (false, "shift") if !self.session.sustain => {
-                self.session
-                    .handle_live(LiveEvent::Sustain(true), Instant::now(), true)
-            }
             _ => {}
         }
     }
 
     fn key_up(&mut self, event: &KeyUpEvent) {
         let key = event.keystroke.key.to_lowercase();
-        if key == "shift" && self.session.sustain {
-            self.session
-                .handle_live(LiveEvent::Sustain(false), Instant::now(), true);
+        if key == TYPING_PEDAL_KEY {
+            self.release_typing_pedal();
             return;
         }
         if let Some(note) = self.ui.typing_keys.remove(&key) {
@@ -506,15 +518,23 @@ impl SurfApp {
     pub fn toggle_typing(&mut self) {
         self.ui.musical_typing = !self.ui.musical_typing;
         self.session.status = if self.ui.musical_typing {
-            "Musical Typing on · A W S E D F T G Y H U J K O L P ; play C3–E4, Z/X change octave"
+            "Musical Typing on · A W S E D F T G Y H U J K O L P ; play C3–E4, Z/X change octave, Tab is the pedal"
                 .to_string()
         } else {
             for (_, note) in self.ui.typing_keys.drain() {
                 self.session
                     .handle_live(LiveEvent::NoteOff { key: note }, Instant::now(), true);
             }
+            self.release_typing_pedal();
             "Musical Typing off · letters are shortcuts again".to_string()
         };
+    }
+
+    /// Lift Musical Typing's pedal, if it is down. A hardware pedal stays down.
+    fn release_typing_pedal(&mut self) {
+        if self.session.typing_pedal() {
+            self.session.typing_sustain(false);
+        }
     }
 
     pub fn toggle_metronome(&mut self) {
@@ -554,6 +574,9 @@ impl SurfApp {
         self.started.elapsed().as_secs_f32()
     }
 }
+
+/// Musical Typing's sustain pedal key (Logic's).
+const TYPING_PEDAL_KEY: &str = "tab";
 
 /// Musical Typing: letters to notes, Logic layout. C3 = MIDI 60.
 fn typing_note(key: &str, octave: i8) -> Option<u8> {
