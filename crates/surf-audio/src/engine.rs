@@ -6,7 +6,7 @@
 //! thread runs the same code path so the visualizer remains usable.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -237,18 +237,53 @@ impl Core {
         for instrument in self.slots.iter_mut().flatten() {
             instrument.all_notes_off();
         }
+        // Nothing sounds any more, so no note owns a key: a later live press and
+        // release of one must not be held back on behalf of a silenced note.
+        self.active.clear();
         self.held = [None; 128];
         self.sustain = false;
+    }
+
+    /// Whether a playback note or the player is sounding `key` on `route`.
+    fn sounding(&self, route: Route, key: u8) -> bool {
+        self.active.iter().any(|a| a.route == route && a.key == key)
+            || self.held[key as usize & 127] == Some(route)
+    }
+
+    /// Note-on for `key` on `route`. If it is already sounding there (another
+    /// playback note, or the player), end that voice first: one voice per key and
+    /// route, as on an instrument, so every note-on is matched by one note-off.
+    fn strike(&mut self, route: Route, key: u8, velocity: u8) {
+        let again = self.sounding(route, key);
+        if let Some(i) = self.slot(route) {
+            if again {
+                i.note_off(route.channel, key);
+            }
+            i.note_on(route.channel, key, velocity);
+        }
     }
 
     /// Note-off for a playback note, unless that voice still has to sound:
     /// another playback note of the same key on the same route, or the player
     /// holding the key there. Whichever ends last sends the note-off.
     fn release(&mut self, route: Route, key: u8) {
-        let still = self.active.iter().any(|a| a.route == route && a.key == key)
-            || self.held[key as usize & 127] == Some(route);
-        if !still && let Some(i) = self.slot(route) {
+        if !self.sounding(route, key)
+            && let Some(i) = self.slot(route)
+        {
             i.note_off(route.channel, key);
+        }
+    }
+
+    /// Note-offs for the voices in `ended`. A key and route is one voice (see
+    /// `strike`), so several owners ending together send one note-off. Sorting
+    /// and dedup work in place: nothing allocates in the callback.
+    fn release_ended(&mut self) {
+        self.ended
+            .sort_unstable_by_key(|(r, k)| (r.slot, r.channel, *k));
+        self.ended.dedup();
+        for i in 0..self.ended.len() {
+            let (route, key) = self.ended[i];
+            self.release(route, key);
         }
     }
 
@@ -259,20 +294,15 @@ impl Core {
         self.ended.clear();
         self.ended
             .extend(self.active.drain(..).map(|a| (a.route, a.key)));
-        for i in 0..self.ended.len() {
-            let (route, key) = self.ended[i];
-            self.release(route, key);
-        }
+        self.release_ended();
     }
 
     fn apply(&mut self, command: Command) {
         match command {
             Command::NoteOn { key, velocity } => {
                 let route = self.route(self.input);
+                self.strike(route, key, velocity);
                 self.held[key as usize & 127] = Some(route);
-                if let Some(i) = self.slot(route) {
-                    i.note_on(route.channel, key, velocity);
-                }
             }
             Command::NoteOff { key } => {
                 let route = self.held[key as usize & 127]
@@ -426,10 +456,7 @@ impl Core {
                 }
             }
         });
-        for i in 0..self.ended.len() {
-            let (route, key) = self.ended[i];
-            self.release(route, key);
-        }
+        self.release_ended();
 
         // While playing, start edited notes that now cover the playhead but
         // aren't sounding: one dragged back under it, or a new one drawn
@@ -452,14 +479,10 @@ impl Core {
                     .get(n.track as usize)
                     .copied()
                     .unwrap_or_default();
-                let Some(inst) = self
-                    .slots
-                    .get_mut(route.slot as usize)
-                    .and_then(Option::as_mut)
-                else {
+                if self.slot(route).is_none() {
                     continue;
-                };
-                inst.note_on(route.channel, n.key, n.velocity);
+                }
+                self.strike(route, n.key, n.velocity);
                 self.active.push(ActiveNote {
                     track_id: n.track_id,
                     route,
@@ -511,7 +534,7 @@ impl Core {
     /// Apply queued commands. A command that hands a timeline or route list back
     /// for freeing waits (with everything queued after it, so order is kept) while
     /// the retirement storage is full, rather than be applied and freed here.
-    fn drain(&mut self, rx: &crossbeam_channel::Receiver<Command>) {
+    fn drain(&mut self, rx: &CommandRx) {
         // Hand held payloads back on every call, even with nothing queued, so the
         // reserve empties as soon as the UI makes room.
         let room = self.has_retire_room();
@@ -522,7 +545,7 @@ impl Core {
             }
             self.apply(command);
         }
-        while let Ok(command) = rx.try_recv() {
+        while let Some(command) = rx.try_recv() {
             let retires = matches!(
                 command,
                 Command::Play { .. } | Command::Update { .. } | Command::SetRoutes(_)
@@ -667,16 +690,16 @@ impl Core {
                 true
             }
         });
-        for i in 0..self.ended.len() {
-            let (route, key) = self.ended[i];
-            self.release(route, key);
-        }
+        self.release_ended();
 
-        let Some(timeline) = &self.timeline else {
-            return;
-        };
-        while self.next_note < timeline.notes.len() {
-            let note = &timeline.notes[self.next_note];
+        loop {
+            let Some(timeline) = &self.timeline else {
+                return;
+            };
+            let Some(note) = timeline.notes.get(self.next_note) else {
+                return;
+            };
+            let note = *note;
             let note_start = (note.start * self.sample_rate) as u64;
             if note_start >= end {
                 break;
@@ -694,14 +717,10 @@ impl Core {
             if self.active.len() == self.active.capacity() {
                 continue;
             }
-            let Some(i) = self
-                .slots
-                .get_mut(route.slot as usize)
-                .and_then(Option::as_mut)
-            else {
+            if self.slot(route).is_none() {
                 continue;
-            };
-            i.note_on(route.channel, note.key, note.velocity);
+            }
+            self.strike(route, note.key, note.velocity);
             let note_end = ((note.end * self.sample_rate) as u64).max(note_start + 1);
             self.active.push(ActiveNote {
                 track_id: note.track_id,
@@ -729,7 +748,7 @@ impl Drop for NullClock {
 
 pub struct AudioEngine {
     shared: Arc<Shared>,
-    tx: crossbeam_channel::Sender<Command>,
+    tx: CommandTx,
     _stream: Option<cpal::Stream>,
     _null_clock: Option<NullClock>,
     sample_rate: u32,
@@ -753,9 +772,7 @@ impl AudioEngine {
             glitches: AtomicU32::new(0),
         });
         let (event_tx, events) = crossbeam_channel::unbounded();
-        // Bounded: an unbounded channel allocates on send and frees on receive,
-        // so the audio callback would call the allocator every ~31 commands.
-        let (tx, rx) = crossbeam_channel::bounded(COMMAND_CAP);
+        let (tx, rx) = command_channel(COMMAND_CAP);
         let (trash_tx, trash) = crossbeam_channel::bounded::<Retired>(8);
 
         // Try the default output device first.
@@ -905,9 +922,8 @@ impl AudioEngine {
     }
 
     /// A cloneable command sender, used by the MIDI callback to reach the audio
-    /// thread without going through the UI at 60 fps. The queue is bounded: a
-    /// driver thread should `try_send`, never block on it.
-    pub fn sender(&self) -> crossbeam_channel::Sender<Command> {
+    /// thread without going through the UI at 60 fps. Sending never blocks.
+    pub fn sender(&self) -> CommandTx {
         self.tx.clone()
     }
 
@@ -918,7 +934,7 @@ impl AudioEngine {
 
     pub fn send(&self, command: Command) {
         self.reclaim();
-        push(&self.tx, command, SEND_WAIT, || self.reclaim());
+        let _ = self.tx.send(command);
     }
 
     pub fn note_on(&self, key: u8, velocity: u8) {
@@ -971,59 +987,115 @@ impl AudioEngine {
     /// last reference to its plugin host on the UI thread.
     pub fn set_slot(&self, slot: u8, instrument: Option<Box<dyn Instrument>>) {
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
-        push(
-            &self.tx,
-            Command::SetSlot {
-                slot,
-                instrument,
-                ack: Some(ack_tx),
-            },
-            SEND_WAIT,
-            || self.reclaim(),
-        );
+        let command = Command::SetSlot {
+            slot,
+            instrument,
+            ack: Some(ack_tx),
+        };
+        if self.tx.send(command).is_err() {
+            return; // The audio thread is gone.
+        }
         // Keep freeing retired payloads while waiting: the callback may be holding
         // a retiring command (and this one behind it) until there is room.
         let deadline = Instant::now() + Duration::from_millis(750);
         while Instant::now() < deadline {
             self.reclaim();
-            if ack_rx.recv_timeout(Duration::from_millis(5)).is_ok() {
-                return;
+            match ack_rx.recv_timeout(Duration::from_millis(5)) {
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                // Acknowledged, or dropped unapplied with the audio thread.
+                _ => return,
             }
         }
     }
 }
 
-/// Commands the audio thread can have queued. The callback drains them every
-/// block, so this only fills if the device stops calling back.
+/// Commands the bounded queue holds. The callback drains it every block, so it
+/// only fills if the device stops calling back.
 const COMMAND_CAP: usize = 1024;
 
-/// How long a UI send waits for room before the command is dropped.
-const SEND_WAIT: Duration = Duration::from_millis(250);
+/// The audio thread's command queue, as the senders see it.
+///
+/// Commands go to a bounded queue, so in normal use the audio callback never
+/// calls the allocator (crossbeam's unbounded channel frees a block about every
+/// 31 messages on the receiving side). Nothing is ever dropped or blocks the
+/// sender, though: losing a note-off, pedal-up, `Stop` or `SetSlot` would leave
+/// state stuck. When the bounded queue is full, commands go to an unbounded
+/// overflow queue instead, and keep going there until the audio thread has
+/// taken them all, so each sender's commands stay in order. Only that rare case
+/// (a stalled device) touches the allocator on the audio side.
+#[derive(Clone)]
+pub struct CommandTx {
+    fast: crossbeam_channel::Sender<Command>,
+    overflow: crossbeam_channel::Sender<Command>,
+    pending: Arc<AtomicUsize>,
+}
 
-/// Queue `command`, freeing retired payloads while the queue is full (the callback
-/// may be holding commands back for room). Gives up after `wait` rather than hang
-/// the UI on a stalled device. Returns whether it was queued.
-fn push(
-    tx: &crossbeam_channel::Sender<Command>,
-    mut command: Command,
-    wait: Duration,
-    mut reclaim: impl FnMut(),
-) -> bool {
-    let deadline = Instant::now() + wait;
-    loop {
-        match tx.try_send(command) {
-            Ok(()) => return true,
-            Err(crossbeam_channel::TrySendError::Disconnected(_)) => return false,
-            Err(crossbeam_channel::TrySendError::Full(c)) => {
-                if Instant::now() >= deadline {
-                    return false;
-                }
-                command = c;
-                reclaim();
-                thread::sleep(Duration::from_millis(1));
+/// The audio thread went away; the command was not queued.
+#[derive(Debug)]
+pub struct Disconnected;
+
+impl CommandTx {
+    /// Queue `command`. Never blocks and never drops it.
+    pub fn send(&self, command: Command) -> Result<(), Disconnected> {
+        let command = if self.pending.load(Ordering::Acquire) == 0 {
+            match self.fast.try_send(command) {
+                Ok(()) => return Ok(()),
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => return Err(Disconnected),
+                Err(crossbeam_channel::TrySendError::Full(c)) => c,
             }
-        }
+        } else {
+            command
+        };
+        // Count it before it can be received, so later sends follow it here.
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        self.overflow.send(command).map_err(|_| {
+            self.pending.fetch_sub(1, Ordering::AcqRel);
+            Disconnected
+        })
     }
+}
+
+/// The audio thread's end of [`CommandTx`].
+pub(crate) struct CommandRx {
+    fast: crossbeam_channel::Receiver<Command>,
+    overflow: crossbeam_channel::Receiver<Command>,
+    pending: Arc<AtomicUsize>,
+}
+
+impl CommandRx {
+    /// The next command. Everything in the bounded queue is older than anything in
+    /// the overflow queue, so it goes first.
+    fn try_recv(&self) -> Option<Command> {
+        if let Ok(c) = self.fast.try_recv() {
+            return Some(c);
+        }
+        let c = self.overflow.try_recv().ok()?;
+        self.pending.fetch_sub(1, Ordering::AcqRel);
+        Some(c)
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.fast.is_empty() && self.overflow.is_empty()
+    }
+}
+
+fn command_channel(cap: usize) -> (CommandTx, CommandRx) {
+    let (fast_tx, fast) = crossbeam_channel::bounded(cap);
+    let (overflow_tx, overflow) = crossbeam_channel::unbounded();
+    let pending = Arc::new(AtomicUsize::new(0));
+    (
+        CommandTx {
+            fast: fast_tx,
+            overflow: overflow_tx,
+            pending: pending.clone(),
+        },
+        CommandRx {
+            fast,
+            overflow,
+            pending,
+        },
+    )
 }
 
 impl Default for AudioEngine {
@@ -1332,9 +1404,11 @@ mod tests {
             from: 0.0,
         });
         secs(&mut c, 1.5);
-        assert_eq!(*calls.lock(), ["on 60", "on 60"], "still sounding at 1.5 s");
+        // One voice per key: the re-strike ends the first, so every note-on is
+        // matched by one note-off, and the first ending at 1 s cut nothing.
+        assert_eq!(*calls.lock(), ["on 60", "off 60", "on 60"]);
         secs(&mut c, 1.0);
-        assert_eq!(*calls.lock(), ["on 60", "on 60", "off 60"]);
+        assert_eq!(*calls.lock(), ["on 60", "off 60", "on 60", "off 60"]);
     }
 
     /// Review M6: playback ending a note must not cut the same key the player is
@@ -1354,12 +1428,13 @@ mod tests {
             from: 0.0,
         });
         secs(&mut c, 1.0);
-        assert!(
-            !calls.lock().contains(&"off 60".to_string()),
-            "held key kept"
-        );
+        let count = |e: &str| calls.lock().iter().filter(|x| *x == e).count();
+        // Playback's strike ended the player's voice first (one voice per key);
+        // playback's own end at 0.5 s did not cut the key the player still holds.
+        assert_eq!(count("off 60"), 1, "{:?}", calls.lock());
         c.apply(Command::NoteOff { key: 60 });
         assert_eq!(calls.lock().last().map(String::as_str), Some("off 60"));
+        assert_eq!(count("on 60"), count("off 60"), "balanced");
 
         // The other way round: the player lets go while playback still sounds it.
         calls.lock().clear();
@@ -1368,12 +1443,33 @@ mod tests {
             velocity: 90,
         });
         c.apply(Command::NoteOff { key: 62 });
-        assert!(
-            !calls.lock().contains(&"off 62".to_string()),
-            "playback's note kept"
-        );
+        // The press re-struck playback's voice (off, on); letting go kept it.
+        assert_eq!(*calls.lock(), ["off 62", "on 62"]);
         secs(&mut c, 1.5);
-        assert_eq!(calls.lock().last().map(String::as_str), Some("off 62"));
+        assert_eq!(*calls.lock(), ["off 62", "on 62", "off 62"]);
+    }
+
+    /// Review: after AllNotesOff, a silenced playback note no longer owns its key,
+    /// so the player pressing and releasing that key does end it.
+    #[test]
+    fn all_notes_off_clears_playback_ownership() {
+        let (mut c, calls) = recorder_core();
+        c.apply(Command::Play {
+            timeline: Timeline {
+                notes: vec![long(0, 60, 0.0, 5.0)],
+                duration: 6.0,
+            },
+            from: 0.0,
+        });
+        secs(&mut c, 0.5);
+        c.apply(Command::AllNotesOff);
+        calls.lock().clear();
+        c.apply(Command::NoteOn {
+            key: 60,
+            velocity: 90,
+        });
+        c.apply(Command::NoteOff { key: 60 });
+        assert_eq!(*calls.lock(), ["on 60", "off 60"]);
     }
 
     /// Review M4: looping back to the start, seeking or pausing must not drop the
@@ -1422,67 +1518,54 @@ mod tests {
         assert!(calls.lock().contains(&"all off".to_string()));
     }
 
-    /// Review M3: the command queue is bounded. A send to a full queue frees
-    /// retired payloads while it waits, then gives up instead of hanging.
+    /// Review M3: the queue is bounded, but a full one never drops or blocks.
+    /// Overflow keeps each sender's order, and later sends follow the overflow
+    /// until the audio thread has caught up.
     #[test]
-    fn a_full_command_queue_gives_up_after_waiting() {
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        assert!(push(&tx, Command::Pause, SEND_WAIT, || {}));
-        let mut reclaimed = 0;
-        let started = Instant::now();
-        assert!(!push(
-            &tx,
-            Command::Resume,
-            Duration::from_millis(30),
-            || reclaimed += 1
-        ));
-        assert!(started.elapsed() < Duration::from_secs(1));
-        assert!(reclaimed > 0, "reclaims while waiting");
-        // Room again: it goes through.
-        rx.try_recv().unwrap();
-        assert!(push(&tx, Command::Resume, SEND_WAIT, || {}));
+    fn a_full_command_queue_keeps_every_command_in_order() {
+        let (tx, rx) = command_channel(2);
+        for v in 0..6 {
+            tx.send(Command::SetVolume(v as f32 / 10.0)).unwrap();
+        }
+        // The audio thread takes one; the next send must still queue behind the
+        // overflow, not jump ahead into the freed bounded slot.
+        let first = rx.try_recv();
+        tx.send(Command::SetVolume(0.6)).unwrap();
+        let mut got: Vec<f32> = first
+            .into_iter()
+            .chain(std::iter::from_fn(|| rx.try_recv()))
+            .map(|c| match c {
+                Command::SetVolume(v) => v,
+                _ => unreachable!(),
+            })
+            .collect();
+        got.iter_mut().for_each(|v| *v = (*v * 10.0).round());
+        assert_eq!(got, [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert!(rx.is_empty());
+        // Caught up: the bounded queue is used again.
+        tx.send(Command::Pause).unwrap();
+        assert_eq!(tx.pending.load(Ordering::Acquire), 0);
+        assert!(rx.fast.len() == 1);
     }
 
-    /// An edit while playing keeps the position and leaves sounding notes
-    /// alone; it doesn't restart the song or cut every note.
+    /// Review: a note-off sent while the queue is full is not lost, so a held key
+    /// does not stay stuck once the device calls back again.
     #[test]
-    fn an_edit_while_playing_keeps_sounding_notes() {
-        let (mut c, log) = probe_core();
-        // A held chord (60 + 64) and a later note 67.
-        let a = long(0, 60, 0.0, 1.0);
-        let b = long(1, 64, 0.0, 1.0);
-        let later = long(0, 67, 0.5, 0.6);
-        c.apply(Command::Play {
-            timeline: Timeline {
-                notes: vec![a, b, later],
-                duration: 1.0,
-            },
-            from: 0.0,
-        });
-        c.render(4800); // 0.1 s in: 60 and 64 are sounding
-        let pos = c.pos_frames;
-        log.lock().clear();
-
-        // Delete 64 and move the later note to 0.3 s.
-        let moved = long(0, 67, 0.3, 0.4);
-        c.apply(Command::Update {
-            timeline: Timeline {
-                notes: vec![a, moved],
-                duration: 1.0,
-            },
-        });
-        assert_eq!(c.pos_frames, pos, "position kept");
-        assert_eq!(
-            *log.lock(),
-            vec![(1, 64, false)],
-            "only the deleted note stops; 60 keeps ringing"
-        );
-        log.lock().clear();
-
-        // Play on past 0.5 s: the moved note sounds at its new time, once.
-        run(&mut c, 24_000);
-        let ons: Vec<u8> = log.lock().iter().filter(|e| e.2).map(|e| e.1).collect();
-        assert_eq!(ons, vec![67], "moved note plays once, nothing replays");
+    fn a_release_sent_into_a_full_queue_still_arrives() {
+        let (mut c, calls) = recorder_core();
+        let (tx, rx) = command_channel(1);
+        tx.send(Command::NoteOn {
+            key: 60,
+            velocity: 90,
+        })
+        .unwrap();
+        for _ in 0..10 {
+            tx.send(Command::SetVolume(0.5)).unwrap();
+        }
+        tx.send(Command::NoteOff { key: 60 }).unwrap();
+        c.drain(&rx);
+        assert_eq!(*calls.lock(), ["on 60", "off 60"]);
+        assert!(c.held[60].is_none());
     }
 
     /// Shortening a sounding note ends it at its new end, not the old one.
@@ -1662,7 +1745,7 @@ mod tests {
         });
         let (trash, ui) = crossbeam_channel::bounded::<Retired>(2);
         let mut c = Core::new(48_000, shared, trash);
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx, rx) = command_channel(COMMAND_CAP);
         let tl = || Timeline {
             notes: vec![long(0, 60, 0.0, 1.0)],
             duration: 1.0,
@@ -1713,7 +1796,7 @@ mod tests {
         });
         let (trash, ui) = crossbeam_channel::bounded::<Retired>(2);
         let mut c = Core::new(48_000, shared, trash);
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx, rx) = command_channel(COMMAND_CAP);
         let tl = || Timeline {
             notes: vec![long(0, 60, 0.0, 1.0)],
             duration: 1.0,
