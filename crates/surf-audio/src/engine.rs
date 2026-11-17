@@ -151,6 +151,9 @@ struct Shared {
     slot_peaks: [AtomicU32; MAX_SLOTS],
     sample_rate: AtomicU32,
     glitches: AtomicU32,
+    /// How many `TogglePlay` / `StopOrRewind` the audio thread has applied.
+    /// Stored after their effect, so a reader that sees it also sees the state.
+    transport_done: AtomicU64,
 }
 
 struct ActiveNote {
@@ -518,6 +521,7 @@ impl Core {
                     self.shared.playing.store(true, Ordering::Release);
                     self.retire(Retired::Timeline(timeline));
                 }
+                self.shared.transport_done.fetch_add(1, Ordering::Release);
             }
             Command::StopOrRewind => {
                 if self.playing {
@@ -525,6 +529,7 @@ impl Core {
                 } else {
                     self.stop_keeping_pedals();
                 }
+                self.shared.transport_done.fetch_add(1, Ordering::Release);
             }
             Command::Update { timeline } => self.update(timeline),
             Command::Pause => self.pause(),
@@ -889,6 +894,8 @@ pub struct AudioEngine {
     sample_accurate: bool,
     events: crossbeam_channel::Receiver<OutputEvent>,
     trash: crossbeam_channel::Receiver<Retired>,
+    /// How many `TogglePlay` / `StopOrRewind` were sent (see `transport_done`).
+    transport_sent: AtomicU64,
 }
 
 impl AudioEngine {
@@ -903,6 +910,7 @@ impl AudioEngine {
             slot_peaks: std::array::from_fn(|_| AtomicU32::new(0)),
             sample_rate: AtomicU32::new(48_000),
             glitches: AtomicU32::new(0),
+            transport_done: AtomicU64::new(0),
         });
         let (event_tx, events) = crossbeam_channel::unbounded();
         let (tx, mut rx) = command_channel(COMMAND_CAP);
@@ -958,6 +966,7 @@ impl AudioEngine {
                     sample_accurate: true,
                     events,
                     trash,
+                    transport_sent: AtomicU64::new(0),
                 }
             }
             Err(err) => {
@@ -1004,6 +1013,7 @@ impl AudioEngine {
                     sample_accurate: false,
                     events,
                     trash,
+                    transport_sent: AtomicU64::new(0),
                 }
             }
         }
@@ -1090,14 +1100,24 @@ impl AudioEngine {
         self.send(Command::Play { timeline, from });
     }
 
-    /// Play / Pause; see [`Command::TogglePlay`].
-    pub fn toggle_play(&self, timeline: Timeline) {
+    /// Play / Pause; see [`Command::TogglePlay`]. Returns a ticket for
+    /// [`transport_applied`](Self::transport_applied).
+    pub fn toggle_play(&self, timeline: Timeline) -> u64 {
         self.send(Command::TogglePlay { timeline });
+        self.transport_sent.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     /// Stop, or go back to the start if stopped; see [`Command::StopOrRewind`].
-    pub fn stop_or_rewind(&self) {
+    /// Returns a ticket for [`transport_applied`](Self::transport_applied).
+    pub fn stop_or_rewind(&self) -> u64 {
         self.send(Command::StopOrRewind);
+        self.transport_sent.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Whether the transport command with this ticket (and every one before
+    /// it) has been applied, so [`status`](Self::status) shows its result.
+    pub fn transport_applied(&self, ticket: u64) -> bool {
+        self.shared.transport_done.load(Ordering::Acquire) >= ticket
     }
 
     /// Replace what plays with an edited timeline; see [`Command::Update`].
@@ -1380,6 +1400,7 @@ mod tests {
             slot_peaks: std::array::from_fn(|_| AtomicU32::new(0)),
             sample_rate: AtomicU32::new(48_000),
             glitches: AtomicU32::new(0),
+            transport_done: AtomicU64::new(0),
         });
         // Tests keep the receiver alive so swapped timelines queue up.
         let (trash, keep) = crossbeam_channel::bounded::<Retired>(8);
@@ -2086,6 +2107,7 @@ mod tests {
             slot_peaks: std::array::from_fn(|_| AtomicU32::new(0)),
             sample_rate: AtomicU32::new(48_000),
             glitches: AtomicU32::new(0),
+            transport_done: AtomicU64::new(0),
         });
         let (trash, ui) = crossbeam_channel::bounded::<Retired>(2);
         let mut c = Core::new(48_000, shared, trash);
@@ -2121,6 +2143,7 @@ mod tests {
             slot_peaks: std::array::from_fn(|_| AtomicU32::new(0)),
             sample_rate: AtomicU32::new(48_000),
             glitches: AtomicU32::new(0),
+            transport_done: AtomicU64::new(0),
         });
         let (trash, ui) = crossbeam_channel::bounded::<Retired>(2);
         let mut c = Core::new(48_000, shared, trash);
@@ -2172,6 +2195,7 @@ mod tests {
             slot_peaks: std::array::from_fn(|_| AtomicU32::new(0)),
             sample_rate: AtomicU32::new(48_000),
             glitches: AtomicU32::new(0),
+            transport_done: AtomicU64::new(0),
         });
         let (trash, ui) = crossbeam_channel::bounded::<Retired>(2);
         let mut c = Core::new(48_000, shared, trash);
@@ -2285,6 +2309,7 @@ mod tests {
             slot_peaks: std::array::from_fn(|_| AtomicU32::new(0)),
             sample_rate: AtomicU32::new(48_000),
             glitches: AtomicU32::new(0),
+            transport_done: AtomicU64::new(0),
         });
         let (trash, ui) = crossbeam_channel::bounded::<Retired>(8);
         let mut c = Core::new(48_000, shared, trash);
