@@ -65,10 +65,7 @@ pub fn render(app: &SurfApp, cx: &mut Context<SurfApp>) -> impl IntoElement {
                     a.seek_bars(1.0)
                 }))
                 .child(action("t-stop", "stop", Tone::Off, cx, |a| {
-                    // Logic: Stop while stopped returns to the start.
-                    if !a.session.engine.playing {
-                        a.session.seek(0.0);
-                    }
+                    // Logic: Stop stops in place; Stop again returns to the start.
                     a.session.stop_playback();
                 }))
                 .child(action(

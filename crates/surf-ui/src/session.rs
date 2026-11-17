@@ -172,9 +172,19 @@ impl Session {
         }
     }
 
+    /// Stop, as in Logic (design §4): while playing, stop where the playhead
+    /// is; when already stopped, go back to the start. There is no cycle start
+    /// other than bar 1 yet, so "the start" is 0.
     pub fn stop_playback(&mut self) {
-        self.stop_audio_keeping_pedals();
-        self.status = "Stopped".to_string();
+        if self.audio.status().playing {
+            // Pause releases what playback was sounding and keeps the position;
+            // pedals the player holds stay down.
+            self.audio.pause();
+            self.status = "Stopped · Stop again to go back to the start".to_string();
+        } else {
+            self.stop_audio_keeping_pedals();
+            self.status = "Stopped at the start".to_string();
+        }
     }
 
     pub fn seek_relative(&mut self, delta: f64) {
@@ -1877,6 +1887,39 @@ mod tests {
             "held to the pedal: {:?}",
             notes[0]
         );
+    }
+
+    /// Wait (up to 2 s) for the engine's clock to show `ok`.
+    fn until(s: &Session, ok: impl Fn(&EngineStatus) -> bool) -> EngineStatus {
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let status = s.audio.status();
+            if ok(&status) || Instant::now() > deadline {
+                return status;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Review M24 (design §4): Stop while playing stops where the playhead is;
+    /// Stop again goes back to the start; Play then resumes from there.
+    #[test]
+    fn stop_stays_put_then_returns_to_the_start() {
+        let mut s = two_tracks();
+        s.toggle_play();
+        let playing = until(&s, |e| e.playing && e.position > 0.1);
+        assert!(playing.playing && playing.position > 0.1, "{playing:?}");
+        s.stop_playback();
+        let stopped = until(&s, |e| !e.playing);
+        assert!(!stopped.playing);
+        assert!(stopped.position > 0.1, "stays where it was: {stopped:?}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let later = s.audio.status().position;
+        assert!((later - stopped.position).abs() < 1e-9, "not moving");
+        s.stop_playback();
+        let start = until(&s, |e| e.position == 0.0);
+        assert_eq!(start.position, 0.0, "second Stop: back to the start");
+        assert!(!start.playing);
     }
 
     /// Review: Stop does not lift a pedal that is still held, so a take started
