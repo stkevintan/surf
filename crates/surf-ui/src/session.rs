@@ -87,8 +87,9 @@ pub struct Session {
     /// The `.surf` file the project was opened from or last saved to.
     pub project_path: Option<PathBuf>,
     /// The last Play or Stop sent and not yet reported: its ticket from the
-    /// engine, and which it was.
-    pending_transport: Option<(u64, Transport)>,
+    /// engine, which it was, and the status shown meanwhile. The report only
+    /// replaces that status: one set since (Recording…, an error) stays.
+    pending_transport: Option<(u64, Transport, String)>,
     /// A plugin's editor was opened since the last save or open. What happens
     /// inside it (a new Kontakt instrument) is not an undoable edit, and Surf
     /// cannot see it, so it counts as an unsaved change.
@@ -174,7 +175,7 @@ impl Session {
         // `tick` says what it did once it has (the status sampled here can be a
         // command or two behind).
         let ticket = self.audio.toggle_play(self.timeline.clone());
-        self.pending_transport = Some((ticket, Transport::Play));
+        self.await_transport(ticket, Transport::Play);
     }
 
     /// Stop, as in Logic (design §4): while playing, stop where the playhead
@@ -185,19 +186,34 @@ impl Session {
         // it, so Stop, Stop (or Stop, Play) sent quickly still work; `tick`
         // says what it did once it has.
         let ticket = self.audio.stop_or_rewind();
-        self.pending_transport = Some((ticket, Transport::Stop));
+        self.await_transport(ticket, Transport::Stop);
+    }
+
+    fn await_transport(&mut self, ticket: u64, kind: Transport) {
+        let shown = match kind {
+            Transport::Play => "Play / Pause",
+            Transport::Stop => "Stop",
+        }
+        .to_string();
+        self.status = shown.clone();
+        self.pending_transport = Some((ticket, kind, shown));
     }
 
     /// Once the last Play or Stop sent has been applied, say what it did, from
     /// the engine's state after it.
     fn report_transport(&mut self) {
-        let Some((ticket, kind)) = self.pending_transport else {
+        let Some((ticket, kind, shown)) = self.pending_transport.take() else {
             return;
         };
         if !self.audio.transport_applied(ticket) {
+            self.pending_transport = Some((ticket, kind, shown));
             return;
         }
-        self.pending_transport = None;
+        if self.status != shown {
+            // Something else spoke since (a take started, a file opened): its
+            // message is newer than this one.
+            return;
+        }
         let e = self.audio.status();
         self.status = if e.playing {
             "Playing"
@@ -1974,6 +1990,24 @@ mod tests {
             s.tick();
         }
         assert_eq!(s.status, "Stopped at the start");
+    }
+
+    /// Review (M24): a message set after Stop (a take starting) is not
+    /// overwritten when the Stop's own report comes in.
+    #[test]
+    fn a_newer_status_outlives_the_stop_report() {
+        let mut s = two_tracks();
+        s.stop_playback();
+        s.toggle_record();
+        assert!(s.status.starts_with("Recording"));
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while s.pending_transport.is_some() && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            s.tick();
+        }
+        assert!(s.pending_transport.is_none());
+        assert!(s.status.starts_with("Recording"), "{}", s.status);
+        s.toggle_record();
     }
 
     /// Review (M24): two Stops sent back to back, before the audio thread has

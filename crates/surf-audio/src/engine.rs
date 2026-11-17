@@ -294,6 +294,15 @@ impl Core {
         }
     }
 
+    /// Count a transport command as applied. The position goes out first, so a
+    /// reader that sees the count also sees where the command left the playhead.
+    fn ack_transport(&mut self) {
+        self.shared
+            .position_frames
+            .store(self.pos_frames, Ordering::Release);
+        self.shared.transport_done.fetch_add(1, Ordering::Release);
+    }
+
     fn play(&mut self, timeline: Timeline, from: f64) {
         self.release_playback();
         self.duration_frames = (timeline.duration * self.sample_rate).ceil() as u64;
@@ -521,7 +530,7 @@ impl Core {
                     self.shared.playing.store(true, Ordering::Release);
                     self.retire(Retired::Timeline(timeline));
                 }
-                self.shared.transport_done.fetch_add(1, Ordering::Release);
+                self.ack_transport();
             }
             Command::StopOrRewind => {
                 if self.playing {
@@ -529,7 +538,7 @@ impl Core {
                 } else {
                     self.stop_keeping_pedals();
                 }
-                self.shared.transport_done.fetch_add(1, Ordering::Release);
+                self.ack_transport();
             }
             Command::Update { timeline } => self.update(timeline),
             Command::Pause => self.pause(),
@@ -1641,6 +1650,13 @@ mod tests {
         assert_eq!(c.pos_frames, at, "resumed in place");
         c.apply(Command::TogglePlay { timeline: tl() });
         assert!(!c.playing, "Play again pauses");
+        // Paused near the end, Play restarts from 0 and Stop follows in the same
+        // drain, before any audio is rendered: the published position is 0.
+        c.apply(Command::Seek(9.99));
+        c.apply(Command::TogglePlay { timeline: tl() });
+        c.apply(Command::StopOrRewind);
+        assert_eq!(c.shared.transport_done.load(Ordering::Acquire), 9);
+        assert_eq!(c.shared.position_frames.load(Ordering::Acquire), 0);
     }
 
     /// Review M6: two overlapping playback notes on one key. The first ending
