@@ -83,6 +83,16 @@ pub enum Command {
         timeline: Timeline,
         from: f64,
     },
+    /// Play / Pause, decided on the audio thread so that it follows the
+    /// commands queued before it: playing, pause; stopped at the start or the
+    /// end, play `timeline` from the start; stopped elsewhere, resume.
+    TogglePlay {
+        timeline: Timeline,
+    },
+    /// Stop as in Logic, decided on the audio thread like `TogglePlay`:
+    /// playing, pause where the playhead is; stopped, go back to the start.
+    /// Pedals the player holds stay down either way.
+    StopOrRewind,
     /// Swap in an edited timeline without restarting: the position stays,
     /// notes still sounding and still in it keep sounding, and only notes
     /// that were removed or changed stop. Works while paused too, so Resume
@@ -281,6 +291,38 @@ impl Core {
         }
     }
 
+    fn play(&mut self, timeline: Timeline, from: f64) {
+        self.release_playback();
+        self.duration_frames = (timeline.duration * self.sample_rate).ceil() as u64;
+        self.pos_frames = (from.max(0.0) * self.sample_rate) as u64;
+        self.next_note = timeline.notes.partition_point(|n| n.start < from.max(0.0));
+        if let Some(old) = self.timeline.replace(timeline) {
+            self.retire(Retired::Timeline(old));
+        }
+        self.playing = true;
+        self.shared
+            .duration_frames
+            .store(self.duration_frames, Ordering::Relaxed);
+        self.shared.playing.store(true, Ordering::Release);
+    }
+
+    fn pause(&mut self) {
+        self.playing = false;
+        self.release_playback();
+        self.shared.playing.store(false, Ordering::Release);
+    }
+
+    fn stop_keeping_pedals(&mut self) {
+        let pedals = self.pedals;
+        self.stop();
+        // all_notes_off lifted the instrument's pedal: put it back down.
+        for which in [HW_PEDAL, TYPING_PEDAL] {
+            if pedals & which != 0 {
+                self.set_pedal(which, true);
+            }
+        }
+    }
+
     fn stop(&mut self) {
         self.playing = false;
         self.pos_frames = 0;
@@ -458,26 +500,34 @@ impl Core {
                     i.control_change(channel, controller, value);
                 }
             }
-            Command::Play { timeline, from } => {
-                self.release_playback();
-                self.duration_frames = (timeline.duration * self.sample_rate).ceil() as u64;
-                self.pos_frames = (from.max(0.0) * self.sample_rate) as u64;
-                self.next_note = timeline.notes.partition_point(|n| n.start < from.max(0.0));
-                if let Some(old) = self.timeline.replace(timeline) {
-                    self.retire(Retired::Timeline(old));
+            Command::Play { timeline, from } => self.play(timeline, from),
+            Command::TogglePlay { timeline } => {
+                // Near the end counts as the end, as the UI used to decide.
+                let near_end = (0.05 * self.sample_rate) as u64;
+                if self.playing {
+                    self.pause();
+                    self.retire(Retired::Timeline(timeline));
+                } else if self.timeline.is_none()
+                    || self.pos_frames == 0
+                    || self.pos_frames + near_end >= self.duration_frames
+                {
+                    self.play(timeline, 0.0);
+                } else {
+                    // The current timeline is up to date: every edit sends Update.
+                    self.playing = true;
+                    self.shared.playing.store(true, Ordering::Release);
+                    self.retire(Retired::Timeline(timeline));
                 }
-                self.playing = true;
-                self.shared
-                    .duration_frames
-                    .store(self.duration_frames, Ordering::Relaxed);
-                self.shared.playing.store(true, Ordering::Release);
+            }
+            Command::StopOrRewind => {
+                if self.playing {
+                    self.pause();
+                } else {
+                    self.stop_keeping_pedals();
+                }
             }
             Command::Update { timeline } => self.update(timeline),
-            Command::Pause => {
-                self.playing = false;
-                self.release_playback();
-                self.shared.playing.store(false, Ordering::Release);
-            }
+            Command::Pause => self.pause(),
             Command::Resume => {
                 if self.timeline.is_some() {
                     self.playing = true;
@@ -485,16 +535,7 @@ impl Core {
                 }
             }
             Command::Stop => self.stop(),
-            Command::StopKeepingPedals => {
-                let pedals = self.pedals;
-                self.stop();
-                // all_notes_off lifted the instrument's pedal: put it back down.
-                for which in [HW_PEDAL, TYPING_PEDAL] {
-                    if pedals & which != 0 {
-                        self.set_pedal(which, true);
-                    }
-                }
-            }
+            Command::StopKeepingPedals => self.stop_keeping_pedals(),
             Command::Seek(sec) => {
                 let sec = sec.max(0.0);
                 self.pos_frames = (sec * self.sample_rate) as u64;
@@ -636,6 +677,7 @@ impl Core {
             let retires = matches!(
                 command,
                 Command::Play { .. }
+                    | Command::TogglePlay { .. }
                     | Command::Update { .. }
                     | Command::SetRoutes(_)
                     | Command::SetRoutesAndInput { .. }
@@ -1046,6 +1088,16 @@ impl AudioEngine {
 
     pub fn play(&self, timeline: Timeline, from: f64) {
         self.send(Command::Play { timeline, from });
+    }
+
+    /// Play / Pause; see [`Command::TogglePlay`].
+    pub fn toggle_play(&self, timeline: Timeline) {
+        self.send(Command::TogglePlay { timeline });
+    }
+
+    /// Stop, or go back to the start if stopped; see [`Command::StopOrRewind`].
+    pub fn stop_or_rewind(&self) {
+        self.send(Command::StopOrRewind);
     }
 
     /// Replace what plays with an edited timeline; see [`Command::Update`].
@@ -1536,6 +1588,38 @@ mod tests {
 
     fn secs(c: &mut Core, s: f64) {
         run(c, (s * 48_000.0) as usize);
+    }
+
+    /// Review (M24): Stop and Play are decided in command order on the audio
+    /// thread, so quick sequences sent before the thread runs still do the
+    /// right thing.
+    #[test]
+    fn stop_and_play_follow_the_commands_before_them() {
+        let (mut c, _) = recorder_core();
+        let tl = || Timeline {
+            notes: vec![long(0, 60, 0.0, 5.0)],
+            duration: 10.0,
+        };
+        c.apply(Command::TogglePlay { timeline: tl() });
+        assert!(c.playing, "stopped at 0: play");
+        secs(&mut c, 1.0);
+        let at = c.pos_frames;
+        // Stop, Stop with nothing in between: pause in place, then the start.
+        c.apply(Command::StopOrRewind);
+        assert!(!c.playing);
+        assert_eq!(c.pos_frames, at, "first Stop stays put");
+        c.apply(Command::StopOrRewind);
+        assert_eq!(c.pos_frames, 0, "second Stop goes to the start");
+        // Play, Stop, Play: resume where the Stop left it.
+        c.apply(Command::TogglePlay { timeline: tl() });
+        secs(&mut c, 1.0);
+        let at = c.pos_frames;
+        c.apply(Command::StopOrRewind);
+        c.apply(Command::TogglePlay { timeline: tl() });
+        assert!(c.playing, "Stop then Play plays");
+        assert_eq!(c.pos_frames, at, "resumed in place");
+        c.apply(Command::TogglePlay { timeline: tl() });
+        assert!(!c.playing, "Play again pauses");
     }
 
     /// Review M6: two overlapping playback notes on one key. The first ending

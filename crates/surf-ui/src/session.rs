@@ -159,32 +159,27 @@ impl Session {
             self.status = "Nothing to play yet · open a MIDI file or record a take".to_string();
             return;
         }
-        let status = self.audio.status();
-        if status.playing {
-            self.audio.pause();
-            self.status = "Paused".to_string();
-        } else if status.position >= self.timeline.duration - 0.05 || status.position <= 0.0 {
-            self.audio.play(self.timeline.clone(), 0.0);
-            self.status = "Playing".to_string();
-        } else {
-            self.audio.resume();
-            self.status = "Playing".to_string();
-        }
+        // The audio thread decides, in order with what is still queued for it:
+        // the status sampled here can be a command or two behind.
+        let was_playing = self.audio.status().playing;
+        self.audio.toggle_play(self.timeline.clone());
+        self.status = if was_playing { "Paused" } else { "Playing" }.to_string();
     }
 
     /// Stop, as in Logic (design §4): while playing, stop where the playhead
     /// is; when already stopped, go back to the start. There is no cycle start
     /// other than bar 1 yet, so "the start" is 0.
     pub fn stop_playback(&mut self) {
-        if self.audio.status().playing {
-            // Pause releases what playback was sounding and keeps the position;
-            // pedals the player holds stay down.
-            self.audio.pause();
-            self.status = "Stopped · Stop again to go back to the start".to_string();
+        // Decided on the audio thread, in order with commands still queued for
+        // it, so Stop, Stop (or Stop, Play) sent quickly still work.
+        let was_playing = self.audio.status().playing;
+        self.audio.stop_or_rewind();
+        self.status = if was_playing {
+            "Stopped · Stop again to go back to the start"
         } else {
-            self.stop_audio_keeping_pedals();
-            self.status = "Stopped at the start".to_string();
+            "Stopped at the start"
         }
+        .to_string();
     }
 
     pub fn seek_relative(&mut self, delta: f64) {
@@ -1920,6 +1915,20 @@ mod tests {
         let start = until(&s, |e| e.position == 0.0);
         assert_eq!(start.position, 0.0, "second Stop: back to the start");
         assert!(!start.playing);
+    }
+
+    /// Review (M24): two Stops sent back to back, before the audio thread has
+    /// run either, still pause and then go back to the start.
+    #[test]
+    fn two_quick_stops_return_to_the_start() {
+        let mut s = two_tracks();
+        s.toggle_play();
+        let playing = until(&s, |e| e.playing && e.position > 0.1);
+        assert!(playing.playing, "{playing:?}");
+        s.stop_playback();
+        s.stop_playback();
+        let start = until(&s, |e| !e.playing && e.position == 0.0);
+        assert!(!start.playing && start.position == 0.0, "{start:?}");
     }
 
     /// Review: Stop does not lift a pedal that is still held, so a take started
