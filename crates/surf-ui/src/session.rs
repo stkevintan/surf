@@ -41,6 +41,13 @@ pub enum Saved {
     NoFile,
 }
 
+/// A transport command whose result the status bar reports.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    Play,
+    Stop,
+}
+
 pub struct Session {
     pub audio: AudioEngine,
     pub midi: MidiHub,
@@ -79,6 +86,10 @@ pub struct Session {
     input_track: Option<Id>,
     /// The `.surf` file the project was opened from or last saved to.
     pub project_path: Option<PathBuf>,
+    /// The last Play or Stop sent and not yet reported: its ticket from the
+    /// engine, which it was, and the status shown meanwhile. The report only
+    /// replaces that status: one set since (Recording…, an error) stays.
+    pending_transport: Option<(u64, Transport, String)>,
     /// A plugin's editor was opened since the last save or open. What happens
     /// inside it (a new Kontakt instrument) is not an undoable edit, and Surf
     /// cannot see it, so it counts as an unsaved change.
@@ -134,6 +145,7 @@ impl Session {
             render_rx: None,
             rendering: false,
             plugins_touched: false,
+            pending_transport: None,
             pending_vst: std::env::var_os("SURF_VST").map(PathBuf::from),
             plugin_scan,
             sustain: false,
@@ -159,22 +171,60 @@ impl Session {
             self.status = "Nothing to play yet · open a MIDI file or record a take".to_string();
             return;
         }
-        let status = self.audio.status();
-        if status.playing {
-            self.audio.pause();
-            self.status = "Paused".to_string();
-        } else if status.position >= self.timeline.duration - 0.05 || status.position <= 0.0 {
-            self.audio.play(self.timeline.clone(), 0.0);
-            self.status = "Playing".to_string();
-        } else {
-            self.audio.resume();
-            self.status = "Playing".to_string();
-        }
+        // The audio thread decides, in order with what is still queued for it;
+        // `tick` says what it did once it has (the status sampled here can be a
+        // command or two behind).
+        let ticket = self.audio.toggle_play(self.timeline.clone());
+        self.await_transport(ticket, Transport::Play);
     }
 
+    /// Stop, as in Logic (design §4): while playing, stop where the playhead
+    /// is; when already stopped, go back to the start. There is no cycle start
+    /// other than bar 1 yet, so "the start" is 0.
     pub fn stop_playback(&mut self) {
-        self.stop_audio_keeping_pedals();
-        self.status = "Stopped".to_string();
+        // Decided on the audio thread, in order with commands still queued for
+        // it, so Stop, Stop (or Stop, Play) sent quickly still work; `tick`
+        // says what it did once it has.
+        let ticket = self.audio.stop_or_rewind();
+        self.await_transport(ticket, Transport::Stop);
+    }
+
+    fn await_transport(&mut self, ticket: u64, kind: Transport) {
+        let shown = match kind {
+            Transport::Play => "Play / Pause",
+            Transport::Stop => "Stop",
+        }
+        .to_string();
+        self.status = shown.clone();
+        self.pending_transport = Some((ticket, kind, shown));
+    }
+
+    /// Once the last Play or Stop sent has been applied, say what it did, from
+    /// the engine's state after it.
+    fn report_transport(&mut self) {
+        let Some((ticket, kind, shown)) = self.pending_transport.take() else {
+            return;
+        };
+        if !self.audio.transport_applied(ticket) {
+            self.pending_transport = Some((ticket, kind, shown));
+            return;
+        }
+        if self.status != shown {
+            // Something else spoke since (a take started, a file opened): its
+            // message is newer than this one.
+            return;
+        }
+        let e = self.audio.status();
+        self.status = if e.playing {
+            "Playing"
+        } else if e.position <= 0.0 {
+            "Stopped at the start"
+        } else if kind == Transport::Stop {
+            "Stopped · Stop again to go back to the start"
+        } else {
+            "Paused"
+        }
+        .to_string();
     }
 
     pub fn seek_relative(&mut self, delta: f64) {
@@ -1273,6 +1323,7 @@ impl Session {
         self.poll_vst_health();
         self.poll_render();
         self.trim_live_notes(Instant::now());
+        self.report_transport();
         self.engine = self.audio.status();
         let duration = self.timeline.duration.max(self.engine.duration);
         if !self.engine.playing
@@ -1877,6 +1928,100 @@ mod tests {
             "held to the pedal: {:?}",
             notes[0]
         );
+    }
+
+    /// Wait (up to 2 s) for the engine's clock to show `ok`.
+    fn until(s: &Session, ok: impl Fn(&EngineStatus) -> bool) -> EngineStatus {
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let status = s.audio.status();
+            if ok(&status) || Instant::now() > deadline {
+                return status;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Review M24 (design §4): Stop while playing stops where the playhead is;
+    /// Stop again goes back to the start; Play then resumes from there.
+    #[test]
+    fn stop_stays_put_then_returns_to_the_start() {
+        let mut s = two_tracks();
+        s.toggle_play();
+        let playing = until(&s, |e| e.playing && e.position > 0.1);
+        assert!(playing.playing && playing.position > 0.1, "{playing:?}");
+        s.stop_playback();
+        let stopped = until(&s, |e| !e.playing);
+        assert!(!stopped.playing);
+        assert!(stopped.position > 0.1, "stays where it was: {stopped:?}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let later = s.audio.status().position;
+        assert!((later - stopped.position).abs() < 1e-9, "not moving");
+        s.stop_playback();
+        let start = until(&s, |e| e.position == 0.0);
+        assert_eq!(start.position, 0.0, "second Stop: back to the start");
+        assert!(!start.playing);
+    }
+
+    /// Review (M24): the status says what the engine did, not what the UI
+    /// guessed: resume then Stop at once pauses in place, and says so.
+    #[test]
+    fn stop_reports_what_the_engine_did() {
+        let mut s = two_tracks();
+        s.toggle_play();
+        until(&s, |e| e.playing && e.position > 0.1);
+        s.stop_playback();
+        until(&s, |e| !e.playing);
+        s.tick();
+        assert_eq!(s.status, "Stopped · Stop again to go back to the start");
+        // Resume and Stop before the audio thread runs either.
+        s.toggle_play();
+        s.stop_playback();
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while s.pending_transport.is_some() && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            s.tick();
+        }
+        assert!(s.engine.position > 0.1, "paused in place: {:?}", s.engine);
+        assert_eq!(s.status, "Stopped · Stop again to go back to the start");
+        s.stop_playback();
+        while s.pending_transport.is_some() && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            s.tick();
+        }
+        assert_eq!(s.status, "Stopped at the start");
+    }
+
+    /// Review (M24): a message set after Stop (a take starting) is not
+    /// overwritten when the Stop's own report comes in.
+    #[test]
+    fn a_newer_status_outlives_the_stop_report() {
+        let mut s = two_tracks();
+        s.stop_playback();
+        s.toggle_record();
+        assert!(s.status.starts_with("Recording"));
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while s.pending_transport.is_some() && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            s.tick();
+        }
+        assert!(s.pending_transport.is_none());
+        assert!(s.status.starts_with("Recording"), "{}", s.status);
+        s.toggle_record();
+    }
+
+    /// Review (M24): two Stops sent back to back, before the audio thread has
+    /// run either, still pause and then go back to the start.
+    #[test]
+    fn two_quick_stops_return_to_the_start() {
+        let mut s = two_tracks();
+        s.toggle_play();
+        let playing = until(&s, |e| e.playing && e.position > 0.1);
+        assert!(playing.playing, "{playing:?}");
+        s.stop_playback();
+        s.stop_playback();
+        let start = until(&s, |e| !e.playing && e.position == 0.0);
+        assert!(!start.playing && start.position == 0.0, "{start:?}");
     }
 
     /// Review: Stop does not lift a pedal that is still held, so a take started

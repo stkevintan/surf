@@ -791,13 +791,8 @@ fn actions(d: gpui::Stateful<gpui::Div>, cx: &mut Context<SurfApp>) -> gpui::Sta
     let d = on::<menu::ToggleMute>(d, cx, |a| a.toggle_selected_track(true));
     let d = on::<menu::ToggleSolo>(d, cx, |a| a.toggle_selected_track(false));
     let d = on::<menu::TogglePlay>(d, cx, |a| a.session.toggle_play());
-    // Logic: Stop while stopped returns to the start.
-    let d = on::<menu::Stop>(d, cx, |a| {
-        if !a.session.engine.playing {
-            a.session.seek(0.0);
-        }
-        a.session.stop_playback();
-    });
+    // Logic: Stop stops in place; Stop again returns to the start.
+    let d = on::<menu::Stop>(d, cx, |a| a.session.stop_playback());
     let d = on::<menu::RewindBar>(d, cx, |a| a.seek_bars(-1.0));
     let d = on::<menu::ForwardBar>(d, cx, |a| a.seek_bars(1.0));
     let d = on::<menu::ToggleRecord>(d, cx, |a| a.session.toggle_record());

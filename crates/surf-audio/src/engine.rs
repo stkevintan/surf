@@ -83,6 +83,16 @@ pub enum Command {
         timeline: Timeline,
         from: f64,
     },
+    /// Play / Pause, decided on the audio thread so that it follows the
+    /// commands queued before it: playing, pause; stopped at the start or the
+    /// end, play `timeline` from the start; stopped elsewhere, resume.
+    TogglePlay {
+        timeline: Timeline,
+    },
+    /// Stop as in Logic, decided on the audio thread like `TogglePlay`:
+    /// playing, pause where the playhead is; stopped, go back to the start.
+    /// Pedals the player holds stay down either way.
+    StopOrRewind,
     /// Swap in an edited timeline without restarting: the position stays,
     /// notes still sounding and still in it keep sounding, and only notes
     /// that were removed or changed stop. Works while paused too, so Resume
@@ -141,6 +151,9 @@ struct Shared {
     slot_peaks: [AtomicU32; MAX_SLOTS],
     sample_rate: AtomicU32,
     glitches: AtomicU32,
+    /// How many `TogglePlay` / `StopOrRewind` the audio thread has applied.
+    /// Stored after their effect, so a reader that sees it also sees the state.
+    transport_done: AtomicU64,
 }
 
 struct ActiveNote {
@@ -277,6 +290,47 @@ impl Core {
             }
             if let Some(i) = self.slot(now) {
                 i.set_sustain(now.channel, true);
+            }
+        }
+    }
+
+    /// Count a transport command as applied. The position goes out first, so a
+    /// reader that sees the count also sees where the command left the playhead.
+    fn ack_transport(&mut self) {
+        self.shared
+            .position_frames
+            .store(self.pos_frames, Ordering::Release);
+        self.shared.transport_done.fetch_add(1, Ordering::Release);
+    }
+
+    fn play(&mut self, timeline: Timeline, from: f64) {
+        self.release_playback();
+        self.duration_frames = (timeline.duration * self.sample_rate).ceil() as u64;
+        self.pos_frames = (from.max(0.0) * self.sample_rate) as u64;
+        self.next_note = timeline.notes.partition_point(|n| n.start < from.max(0.0));
+        if let Some(old) = self.timeline.replace(timeline) {
+            self.retire(Retired::Timeline(old));
+        }
+        self.playing = true;
+        self.shared
+            .duration_frames
+            .store(self.duration_frames, Ordering::Relaxed);
+        self.shared.playing.store(true, Ordering::Release);
+    }
+
+    fn pause(&mut self) {
+        self.playing = false;
+        self.release_playback();
+        self.shared.playing.store(false, Ordering::Release);
+    }
+
+    fn stop_keeping_pedals(&mut self) {
+        let pedals = self.pedals;
+        self.stop();
+        // all_notes_off lifted the instrument's pedal: put it back down.
+        for which in [HW_PEDAL, TYPING_PEDAL] {
+            if pedals & which != 0 {
+                self.set_pedal(which, true);
             }
         }
     }
@@ -458,26 +512,36 @@ impl Core {
                     i.control_change(channel, controller, value);
                 }
             }
-            Command::Play { timeline, from } => {
-                self.release_playback();
-                self.duration_frames = (timeline.duration * self.sample_rate).ceil() as u64;
-                self.pos_frames = (from.max(0.0) * self.sample_rate) as u64;
-                self.next_note = timeline.notes.partition_point(|n| n.start < from.max(0.0));
-                if let Some(old) = self.timeline.replace(timeline) {
-                    self.retire(Retired::Timeline(old));
+            Command::Play { timeline, from } => self.play(timeline, from),
+            Command::TogglePlay { timeline } => {
+                // Near the end counts as the end, as the UI used to decide.
+                let near_end = (0.05 * self.sample_rate) as u64;
+                if self.playing {
+                    self.pause();
+                    self.retire(Retired::Timeline(timeline));
+                } else if self.timeline.is_none()
+                    || self.pos_frames == 0
+                    || self.pos_frames + near_end >= self.duration_frames
+                {
+                    self.play(timeline, 0.0);
+                } else {
+                    // The current timeline is up to date: every edit sends Update.
+                    self.playing = true;
+                    self.shared.playing.store(true, Ordering::Release);
+                    self.retire(Retired::Timeline(timeline));
                 }
-                self.playing = true;
-                self.shared
-                    .duration_frames
-                    .store(self.duration_frames, Ordering::Relaxed);
-                self.shared.playing.store(true, Ordering::Release);
+                self.ack_transport();
+            }
+            Command::StopOrRewind => {
+                if self.playing {
+                    self.pause();
+                } else {
+                    self.stop_keeping_pedals();
+                }
+                self.ack_transport();
             }
             Command::Update { timeline } => self.update(timeline),
-            Command::Pause => {
-                self.playing = false;
-                self.release_playback();
-                self.shared.playing.store(false, Ordering::Release);
-            }
+            Command::Pause => self.pause(),
             Command::Resume => {
                 if self.timeline.is_some() {
                     self.playing = true;
@@ -485,16 +549,7 @@ impl Core {
                 }
             }
             Command::Stop => self.stop(),
-            Command::StopKeepingPedals => {
-                let pedals = self.pedals;
-                self.stop();
-                // all_notes_off lifted the instrument's pedal: put it back down.
-                for which in [HW_PEDAL, TYPING_PEDAL] {
-                    if pedals & which != 0 {
-                        self.set_pedal(which, true);
-                    }
-                }
-            }
+            Command::StopKeepingPedals => self.stop_keeping_pedals(),
             Command::Seek(sec) => {
                 let sec = sec.max(0.0);
                 self.pos_frames = (sec * self.sample_rate) as u64;
@@ -636,6 +691,7 @@ impl Core {
             let retires = matches!(
                 command,
                 Command::Play { .. }
+                    | Command::TogglePlay { .. }
                     | Command::Update { .. }
                     | Command::SetRoutes(_)
                     | Command::SetRoutesAndInput { .. }
@@ -847,6 +903,8 @@ pub struct AudioEngine {
     sample_accurate: bool,
     events: crossbeam_channel::Receiver<OutputEvent>,
     trash: crossbeam_channel::Receiver<Retired>,
+    /// How many `TogglePlay` / `StopOrRewind` were sent (see `transport_done`).
+    transport_sent: AtomicU64,
 }
 
 impl AudioEngine {
@@ -861,6 +919,7 @@ impl AudioEngine {
             slot_peaks: std::array::from_fn(|_| AtomicU32::new(0)),
             sample_rate: AtomicU32::new(48_000),
             glitches: AtomicU32::new(0),
+            transport_done: AtomicU64::new(0),
         });
         let (event_tx, events) = crossbeam_channel::unbounded();
         let (tx, mut rx) = command_channel(COMMAND_CAP);
@@ -916,6 +975,7 @@ impl AudioEngine {
                     sample_accurate: true,
                     events,
                     trash,
+                    transport_sent: AtomicU64::new(0),
                 }
             }
             Err(err) => {
@@ -962,6 +1022,7 @@ impl AudioEngine {
                     sample_accurate: false,
                     events,
                     trash,
+                    transport_sent: AtomicU64::new(0),
                 }
             }
         }
@@ -1046,6 +1107,26 @@ impl AudioEngine {
 
     pub fn play(&self, timeline: Timeline, from: f64) {
         self.send(Command::Play { timeline, from });
+    }
+
+    /// Play / Pause; see [`Command::TogglePlay`]. Returns a ticket for
+    /// [`transport_applied`](Self::transport_applied).
+    pub fn toggle_play(&self, timeline: Timeline) -> u64 {
+        self.send(Command::TogglePlay { timeline });
+        self.transport_sent.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Stop, or go back to the start if stopped; see [`Command::StopOrRewind`].
+    /// Returns a ticket for [`transport_applied`](Self::transport_applied).
+    pub fn stop_or_rewind(&self) -> u64 {
+        self.send(Command::StopOrRewind);
+        self.transport_sent.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Whether the transport command with this ticket (and every one before
+    /// it) has been applied, so [`status`](Self::status) shows its result.
+    pub fn transport_applied(&self, ticket: u64) -> bool {
+        self.shared.transport_done.load(Ordering::Acquire) >= ticket
     }
 
     /// Replace what plays with an edited timeline; see [`Command::Update`].
@@ -1328,6 +1409,7 @@ mod tests {
             slot_peaks: std::array::from_fn(|_| AtomicU32::new(0)),
             sample_rate: AtomicU32::new(48_000),
             glitches: AtomicU32::new(0),
+            transport_done: AtomicU64::new(0),
         });
         // Tests keep the receiver alive so swapped timelines queue up.
         let (trash, keep) = crossbeam_channel::bounded::<Retired>(8);
@@ -1536,6 +1618,45 @@ mod tests {
 
     fn secs(c: &mut Core, s: f64) {
         run(c, (s * 48_000.0) as usize);
+    }
+
+    /// Review (M24): Stop and Play are decided in command order on the audio
+    /// thread, so quick sequences sent before the thread runs still do the
+    /// right thing.
+    #[test]
+    fn stop_and_play_follow_the_commands_before_them() {
+        let (mut c, _) = recorder_core();
+        let tl = || Timeline {
+            notes: vec![long(0, 60, 0.0, 5.0)],
+            duration: 10.0,
+        };
+        c.apply(Command::TogglePlay { timeline: tl() });
+        assert!(c.playing, "stopped at 0: play");
+        secs(&mut c, 1.0);
+        let at = c.pos_frames;
+        // Stop, Stop with nothing in between: pause in place, then the start.
+        c.apply(Command::StopOrRewind);
+        assert!(!c.playing);
+        assert_eq!(c.pos_frames, at, "first Stop stays put");
+        c.apply(Command::StopOrRewind);
+        assert_eq!(c.pos_frames, 0, "second Stop goes to the start");
+        // Play, Stop, Play: resume where the Stop left it.
+        c.apply(Command::TogglePlay { timeline: tl() });
+        secs(&mut c, 1.0);
+        let at = c.pos_frames;
+        c.apply(Command::StopOrRewind);
+        c.apply(Command::TogglePlay { timeline: tl() });
+        assert!(c.playing, "Stop then Play plays");
+        assert_eq!(c.pos_frames, at, "resumed in place");
+        c.apply(Command::TogglePlay { timeline: tl() });
+        assert!(!c.playing, "Play again pauses");
+        // Paused near the end, Play restarts from 0 and Stop follows in the same
+        // drain, before any audio is rendered: the published position is 0.
+        c.apply(Command::Seek(9.99));
+        c.apply(Command::TogglePlay { timeline: tl() });
+        c.apply(Command::StopOrRewind);
+        assert_eq!(c.shared.transport_done.load(Ordering::Acquire), 9);
+        assert_eq!(c.shared.position_frames.load(Ordering::Acquire), 0);
     }
 
     /// Review M6: two overlapping playback notes on one key. The first ending
@@ -2002,6 +2123,7 @@ mod tests {
             slot_peaks: std::array::from_fn(|_| AtomicU32::new(0)),
             sample_rate: AtomicU32::new(48_000),
             glitches: AtomicU32::new(0),
+            transport_done: AtomicU64::new(0),
         });
         let (trash, ui) = crossbeam_channel::bounded::<Retired>(2);
         let mut c = Core::new(48_000, shared, trash);
@@ -2037,6 +2159,7 @@ mod tests {
             slot_peaks: std::array::from_fn(|_| AtomicU32::new(0)),
             sample_rate: AtomicU32::new(48_000),
             glitches: AtomicU32::new(0),
+            transport_done: AtomicU64::new(0),
         });
         let (trash, ui) = crossbeam_channel::bounded::<Retired>(2);
         let mut c = Core::new(48_000, shared, trash);
@@ -2088,6 +2211,7 @@ mod tests {
             slot_peaks: std::array::from_fn(|_| AtomicU32::new(0)),
             sample_rate: AtomicU32::new(48_000),
             glitches: AtomicU32::new(0),
+            transport_done: AtomicU64::new(0),
         });
         let (trash, ui) = crossbeam_channel::bounded::<Retired>(2);
         let mut c = Core::new(48_000, shared, trash);
@@ -2201,6 +2325,7 @@ mod tests {
             slot_peaks: std::array::from_fn(|_| AtomicU32::new(0)),
             sample_rate: AtomicU32::new(48_000),
             glitches: AtomicU32::new(0),
+            transport_done: AtomicU64::new(0),
         });
         let (trash, ui) = crossbeam_channel::bounded::<Retired>(8);
         let mut c = Core::new(48_000, shared, trash);
